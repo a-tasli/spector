@@ -56,6 +56,8 @@ impl SpectrogramLayer {
 fn window_conf() -> Conf {
     Conf {
         window_title: "Rusty Spectrogram".to_owned(),
+        window_width: 1024,
+        window_height: 768,
         high_dpi: true,
         window_resizable: true, 
         ..Default::default()
@@ -220,6 +222,7 @@ async fn main() {
     
     loop {
         let mut visual_changed = false;
+        let mut resize_changed = false;
         
         if is_key_pressed(KeyCode::S) { local_mel = !local_mel; visual_changed = true; }
         if is_key_pressed(KeyCode::C) { local_cmap = cycle_colormap(local_cmap); visual_changed = true; }
@@ -269,29 +272,24 @@ async fn main() {
         let sh = screen_height();
         
         // --- VIEWPORT CAMERA LOGIC ---
-        // 1. Calculate the Source Rect (The "Camera")
-        // Texture is always RTL [Old -> New]
-        // Index 0 = Oldest. Index 1023 = Newest.
-        
-        // If View=512, we want [512..1024] (The newest half)
-        let source_x = (MAX_HISTORY - current_view_len) as f32;
-        let source_w = current_view_len as f32;
-        
-        let source = Rect::new(source_x, 0.0, source_w, current_height as f32);
+        let (visible_bins, rotation, flip_x, flip_y) = match local_dir {
+            ScrollDirection::RTL => ((sw as usize).min(current_view_len), 0.0, false, false),
+            ScrollDirection::LTR => ((sw as usize).min(current_view_len), 0.0, true, false),
+            ScrollDirection::DownToUp => ((sh as usize).min(current_view_len), std::f32::consts::FRAC_PI_2, false, false),
+            ScrollDirection::UpToDown => ((sh as usize).min(current_view_len), -std::f32::consts::FRAC_PI_2, false, true),
+        };
 
-        // 2. Calculate the Dest Rect (The Screen)
-        // Adjust for aspect ratio or rotation
+        let source_x = if MAX_HISTORY > visible_bins {
+            (MAX_HISTORY - visible_bins) as f32
+        } else {
+            0.0
+        };
+
+        let source = Rect::new(source_x, 0.0, visible_bins as f32, current_height as f32);
+
         let dest_size = match local_dir {
             ScrollDirection::RTL | ScrollDirection::LTR => vec2(sw, sh),
             ScrollDirection::DownToUp | ScrollDirection::UpToDown => vec2(sh, sw),
-        };
-
-        // 3. Rotation Params
-        let (rotation, flip_x, flip_y) = match local_dir {
-            ScrollDirection::RTL => (0.0, false, false),
-            ScrollDirection::LTR => (0.0, true, false), // GPU flips the "Newest Right" image to be "Newest Left"
-            ScrollDirection::DownToUp => (std::f32::consts::FRAC_PI_2, false, false),
-            ScrollDirection::UpToDown => (-std::f32::consts::FRAC_PI_2, false, true),
         };
 
         let draw_params = DrawTextureParams {
@@ -343,11 +341,9 @@ fn paint_slice(pixels: &mut Vec<u8>, pos_index: usize, data: &[f32], settings: &
         let intensity = (magnitude * 2000.0).ln() / 8.0; 
         let c = gradient.eval_continuous(intensity.clamp(0.0, 1.0) as f64);
 
-        // Canonical RTL Paint:
-        // X = pos_index, Y = Inverted Freq
         let x = pos_index; 
         let y = (freq_bins - 1) - i; 
-        let idx = (y * MAX_HISTORY + x) * 4; // ALWAYS use MAX_HISTORY for stride
+        let idx = (y * MAX_HISTORY + x) * 4;
 
         if idx + 3 < pixels.len() {
             pixels[idx] = c.r;
@@ -458,20 +454,21 @@ fn draw_ui_overlay(mel: bool, cmap: ColorMapType, dir: ScrollDirection, fft: usi
     let res_str = format!("{} bins", fft/2);
     let hist_str = format!("{}", history);
 
+    // Removed FPS
     let stats = vec![
-        UiStat { label: "FPS",    hotkey: None,      value: get_fps().to_string(), color: GREEN },
         UiStat { label: "Scale",  hotkey: Some('S'), value: scale_str.to_string(), color: ORANGE },
         UiStat { label: "Colour", hotkey: Some('C'), value: map_str,               color: YELLOW },
         UiStat { label: "Flow",   hotkey: Some('F'), value: dir_str.to_string(),   color: SKYBLUE },
-        UiStat { label: "Res",    hotkey: Some('R'), value: res_str,               color: VIOLET },
-        UiStat { label: "Win",    hotkey: Some('W'), value: hist_str,              color: PINK },
+        UiStat { label: "Resolution",    hotkey: Some('R'), value: res_str,               color: VIOLET },
+        UiStat { label: "Window",    hotkey: Some('W'), value: hist_str,              color: PINK },
     ];
 
     let (bg_x, bg_y, bg_w, bg_h, is_vertical) = match dir {
+        // Horizontal: Full width bar at top
         ScrollDirection::RTL | ScrollDirection::LTR => (0.0, 0.0, screen_width(), 30.0, false),
         // Position at TOP-RIGHT, TIGHTER fit
         // Box Width = 220, X = Screen - 230
-        _ => (screen_width() - 170.0, 0.0, 220.0, 140.0, true),
+        _ => (screen_width() - 200.0, 0.0, 220.0, 112.0, true),
     };
 
     draw_rectangle(bg_x, bg_y, bg_w, bg_h, Color::new(0.0, 0.0, 0.0, 0.5));
@@ -479,14 +476,18 @@ fn draw_ui_overlay(mel: bool, cmap: ColorMapType, dir: ScrollDirection, fft: usi
     let mut cursor_x = bg_x + 10.0;
     let mut cursor_y = bg_y + 20.0;
 
-    // Horizontal Layout: Divide screen into equal segments
-    let segment_width = if !is_vertical { screen_width() / stats.len() as f32 } else { 0.0 };
-
     for (i, stat) in stats.iter().enumerate() {
         let full_label = format!("{}:", stat.label);
         
         if !is_vertical {
-            cursor_x = i as f32 * segment_width + 10.0;
+            // Equal spacing logic: "Label + Value" groups spaced with fixed padding
+            // We calculate the X position by summing previous widths? 
+            // Or just fixed spacing? User asked for "equally spaced from each other".
+            // Let's use a fixed padding of 40px between items.
+            
+            // NOTE: Since we are in a loop, we need to accumulate width.
+            // But immediate mode GUI makes "measuring next item" hard without two passes.
+            // Simple fix: Just add a fixed gap after drawing.
         }
 
         draw_text(&full_label, cursor_x, cursor_y, 20.0, WHITE);
@@ -503,6 +504,10 @@ fn draw_ui_overlay(mel: bool, cmap: ColorMapType, dir: ScrollDirection, fft: usi
             cursor_y += 20.0;
         } else {
             draw_text(&stat.value, cursor_x + label_width + 5.0, cursor_y, 20.0, stat.color);
+            
+            // Calculate total width of this group to advance cursor
+            let val_width = measure_text(&stat.value, None, 20, 1.0).width;
+            cursor_x += label_width + 5.0 + val_width + 40.0; // 40px Gap
         }
     }
 }
