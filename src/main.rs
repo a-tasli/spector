@@ -24,6 +24,8 @@ enum ColorMapType { Magma, Inferno, Viridis, Plasma, Turbo, Cubehelix }
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum ScrollDirection { RTL, LTR, DownToUp, UpToDown }
 
+// Added Clone so we can snapshot settings for the background thread
+#[derive(Clone)]
 struct AppSettings {
     mel_scale: bool,
     colormap: ColorMapType,
@@ -102,30 +104,44 @@ async fn main() {
         let mut rolling_audio = vec![0.0; max_fft];
         
         loop {
+            // 1. Check Redraw
             let mut redraw_needed = false;
-            {
-                if let Ok(mut s) = settings_ref.lock() {
-                    if s.redraw_flag {
-                        redraw_needed = true;
-                        s.redraw_flag = false; 
-                    }
+            // Snapshot settings so we don't need to hold the lock during the heavy loop
+            let mut current_settings = {
+                let mut s = settings_ref.lock().unwrap();
+                if s.redraw_flag {
+                    redraw_needed = true;
+                    s.redraw_flag = false; 
+                    Some(s.clone())
+                } else {
+                    None
                 }
-            }
+            };
 
+            // 2. Perform Stutter-Free Redraw
             if redraw_needed {
-                if let (Ok(mut layers), Ok(settings)) = (layers_ref.lock(), settings_ref.lock()) {
-                    for layer in layers.iter_mut() {
-                        layer.pixels.fill(0);
-                        for t in 0..HISTORY_LEN {
-                            let start = t * layer.freq_bins;
-                            let slice = &layer.history[start..start + layer.freq_bins];
-                            paint_slice(&mut layer.pixels, t, slice, &settings, layer.freq_bins, layer.fft_size);
+                if let Some(settings) = current_settings {
+                    // Iterate through layers ONE BY ONE
+                    // We lock, paint one layer, then unlock. 
+                    // This lets the UI thread render frames in between layer updates.
+                    for i in 0..RESOLUTIONS.len() {
+                        if let Ok(mut layers) = layers_ref.lock() {
+                            let layer = &mut layers[i];
+                            layer.pixels.fill(0);
+                            for t in 0..HISTORY_LEN {
+                                let start = t * layer.freq_bins;
+                                let slice = &layer.history[start..start + layer.freq_bins];
+                                paint_slice(&mut layer.pixels, t, slice, &settings, layer.freq_bins, layer.fft_size);
+                            }
                         }
+                        // Yield to let UI thread breathe
+                        thread::yield_now();
                     }
                 }
                 continue; 
             }
 
+            // 3. Audio Ingest
             let num_new = consumer.len();
             if num_new > 0 {
                 let mut temp = vec![0.0; num_new];
@@ -142,6 +158,8 @@ async fn main() {
                 continue;
             }
 
+            // 4. Parallel FFT
+            // We still lock here for the new data update, but this is much faster than a full redraw
             if let (Ok(mut layers), Ok(settings)) = (layers_ref.lock(), settings_ref.lock()) {
                 for layer in layers.iter_mut() {
                     if rolling_audio.len() < layer.fft_size { continue; }
@@ -187,10 +205,10 @@ async fn main() {
     loop {
         let mut visual_changed = false;
         
-        if is_key_pressed(KeyCode::Space) { local_mel = !local_mel; visual_changed = true; }
+        if is_key_pressed(KeyCode::S) { local_mel = !local_mel; visual_changed = true; }
         if is_key_pressed(KeyCode::C) { local_cmap = cycle_colormap(local_cmap); visual_changed = true; }
-        if is_key_pressed(KeyCode::D) { local_dir = cycle_direction(local_dir); }
-        if is_key_pressed(KeyCode::F) { current_fft_idx = (current_fft_idx + 1) % RESOLUTIONS.len(); }
+        if is_key_pressed(KeyCode::F) { local_dir = cycle_direction(local_dir); }
+        if is_key_pressed(KeyCode::R) { current_fft_idx = (current_fft_idx + 1) % RESOLUTIONS.len(); }
 
         if visual_changed {
             if let Ok(mut s) = shared_settings.lock() {
@@ -226,7 +244,6 @@ async fn main() {
         let sw = screen_width();
         let sh = screen_height();
         
-        // GPU Rotation & Flipping
         let draw_params = match local_dir {
             ScrollDirection::RTL => DrawTextureParams {
                 dest_size: Some(vec2(sw, sh)),
@@ -359,9 +376,7 @@ fn draw_note_ruler(mel_scale: bool, dir: ScrollDirection, fft_size: usize) {
         let (x, y, is_c) = match dir {
             ScrollDirection::RTL => (w, h * (1.0 - norm_pos), midi % 12 == 0),
             ScrollDirection::LTR => (0.0, h * (1.0 - norm_pos), midi % 12 == 0),
-            // UTD (Rain): High pitch on Right. Ruler Top.
             ScrollDirection::UpToDown => (w * norm_pos, 0.0, midi % 12 == 0),
-            // DTU (Fire): High pitch on Right. Ruler Bottom.
             ScrollDirection::DownToUp => (w * norm_pos, h, midi % 12 == 0),
         };
 
@@ -387,47 +402,67 @@ fn draw_note_ruler(mel_scale: bool, dir: ScrollDirection, fft_size: usize) {
     }
 }
 
+// --- UNIFIED UI SYSTEM ---
+
+struct UiStat {
+    label: &'static str,
+    hotkey: Option<char>,
+    value: String,
+    color: Color,
+}
+
 fn draw_ui_overlay(mel: bool, cmap: ColorMapType, dir: ScrollDirection, fft: usize) {
     let scale_str = if mel { "Mel" } else { "Linear" };
-    let map_str = format!("{:?}", cmap);
+    let map_str = format!("{:?}", cmap); 
     let dir_str = match dir {
-        ScrollDirection::RTL => "RTL", ScrollDirection::LTR => "LTR",
-        ScrollDirection::DownToUp => "Fire", ScrollDirection::UpToDown => "Rain",
+        ScrollDirection::RTL => "RTL", 
+        ScrollDirection::LTR => "LTR",
+        ScrollDirection::DownToUp => "Fire", 
+        ScrollDirection::UpToDown => "Rain",
     };
     let res_str = format!("{} bins ({} FFT)", fft/2, fft);
 
-    match dir {
-        ScrollDirection::RTL | ScrollDirection::LTR => {
-            // HORIZONTAL STRIP
-            // Use fixed X offsets to prevent jitter when FPS length changes
-            draw_rectangle(0.0, 0.0, screen_width(), 30.0, Color::new(0.0, 0.0, 0.0, 0.5));
-            
-            draw_text("FPS:", 10.0, 20.0, 20.0, WHITE);
-            draw_text(&get_fps().to_string(), 55.0, 20.0, 20.0, GREEN);
+    let stats = vec![
+        UiStat { label: "FPS",   hotkey: None,      value: get_fps().to_string(), color: GREEN },
+        UiStat { label: "Scale", hotkey: Some('S'), value: scale_str.to_string(), color: ORANGE },
+        UiStat { label: "Color", hotkey: Some('C'), value: map_str,               color: YELLOW },
+        UiStat { label: "Flow",  hotkey: Some('F'), value: dir_str.to_string(),   color: SKYBLUE },
+        UiStat { label: "Res",   hotkey: Some('R'), value: res_str,               color: VIOLET },
+    ];
 
-            draw_text("Scale:", 100.0, 20.0, 20.0, WHITE);
-            draw_text(scale_str, 160.0, 20.0, 20.0, ORANGE);
+    let (bg_x, bg_y, bg_w, bg_h, is_vertical) = match dir {
+        ScrollDirection::RTL | ScrollDirection::LTR => (0.0, 0.0, screen_width(), 30.0, false),
+        // Position at TOP-RIGHT for Vertical modes:
+        // X = Screen Width - Box Width - Padding
+        _ => (screen_width() - 270.0, 10.0, 260.0, 120.0, true),
+    };
 
-            draw_text("Color:", 240.0, 20.0, 20.0, WHITE);
-            draw_text(&map_str, 300.0, 20.0, 20.0, YELLOW);
+    draw_rectangle(bg_x, bg_y, bg_w, bg_h, Color::new(0.0, 0.0, 0.0, 0.5));
 
-            draw_text("Flow:", 420.0, 20.0, 20.0, WHITE);
-            draw_text(dir_str, 470.0, 20.0, 20.0, SKYBLUE);
+    let mut cursor_x = bg_x + 10.0;
+    let mut cursor_y = bg_y + 20.0;
 
-            draw_text("Res:", 550.0, 20.0, 20.0, WHITE);
-            draw_text(&res_str, 595.0, 20.0, 20.0, VIOLET);
+    for stat in stats {
+        let full_label = format!("{}:", stat.label);
+        
+        // 1. Draw Label (White)
+        draw_text(&full_label, cursor_x, cursor_y, 20.0, WHITE);
 
-            draw_text("[Space] [C] [D] [F]", screen_width() - 200.0, 20.0, 20.0, LIGHTGRAY);
-        },
-        ScrollDirection::DownToUp | ScrollDirection::UpToDown => {
-            // VERTICAL BOX (Legacy style)
-            draw_rectangle(10.0, 10.0, 260.0, 140.0, Color::new(0.0, 0.0, 0.0, 0.5));
-            draw_text(format!("FPS: {}", get_fps()).as_str(), 20.0, 30.0, 20.0, GREEN);
-            draw_text(format!("Scale: {}", scale_str).as_str(), 20.0, 50.0, 20.0, ORANGE);
-            draw_text(format!("Color: {}", map_str).as_str(), 20.0, 70.0, 20.0, YELLOW);
-            draw_text(format!("Flow: {}", dir_str).as_str(), 20.0, 90.0, 20.0, SKYBLUE);
-            draw_text(format!("Res: {}", res_str).as_str(), 20.0, 110.0, 20.0, VIOLET);
-            draw_text("[Space] [C] [D] [F]low", 20.0, 135.0, 20.0, LIGHTGRAY);
+        // 2. Draw Underline for Hotkey
+        if let Some(c) = stat.hotkey {
+            let char_dims = measure_text(&c.to_string(), None, 20, 1.0);
+            draw_line(cursor_x, cursor_y + 2.0, cursor_x + char_dims.width, cursor_y + 2.0, 1.0, WHITE);
+        }
+
+        // 3. Draw Value
+        if is_vertical {
+            let label_width = measure_text(&full_label, None, 20, 1.0).width;
+            draw_text(&stat.value, cursor_x + label_width + 10.0, cursor_y, 20.0, stat.color);
+            cursor_y += 20.0;
+        } else {
+            let label_width = measure_text(&full_label, None, 20, 1.0).width;
+            draw_text(&stat.value, cursor_x + label_width + 5.0, cursor_y, 20.0, stat.color);
+            cursor_x += 140.0; 
         }
     }
 }
