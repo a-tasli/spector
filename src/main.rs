@@ -11,11 +11,12 @@ use libpulse_binding::stream::Direction;
 use libpulse_binding::def::BufferAttr; 
 use libpulse_simple_binding::Simple;
 
-// --- PRO CONFIG ---
-const FFT_SIZE: usize = 4096;      
+// --- CONFIG ---
 const SAMPLE_RATE: u32 = 44100;
 const HISTORY_LEN: usize = 1024; 
-const HOP_SIZE: usize = 512;      
+const HOP_SIZE: usize = 512;       
+
+const RESOLUTIONS: [usize; 3] = [2048, 4096, 8192];
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum ColorMapType { Magma, Inferno, Viridis, Plasma, Turbo, Cubehelix }
@@ -26,25 +27,42 @@ enum ScrollDirection { RTL, LTR, DownToUp, UpToDown }
 struct AppSettings {
     mel_scale: bool,
     colormap: ColorMapType,
-    direction: ScrollDirection,
     redraw_flag: bool, 
+}
+
+struct SpectrogramLayer {
+    fft_size: usize,
+    freq_bins: usize,
+    pixels: Vec<u8>,
+    history: Vec<f32>,
+}
+
+impl SpectrogramLayer {
+    fn new(fft_size: usize) -> Self {
+        let bins = fft_size / 2;
+        Self {
+            fft_size,
+            freq_bins: bins,
+            pixels: vec![0u8; HISTORY_LEN * bins * 4],
+            history: vec![0.0f32; HISTORY_LEN * bins],
+        }
+    }
 }
 
 #[macroquad::main("Rusty Spectrogram")]
 async fn main() {
-    let freq_bins = FFT_SIZE / 2; // 2048
+    let mut layers = Vec::new();
+    for &size in RESOLUTIONS.iter() {
+        layers.push(SpectrogramLayer::new(size));
+    }
     
-    let shared_pixels = Arc::new(Mutex::new(vec![0u8; HISTORY_LEN * freq_bins * 4]));
-    let shared_history = Arc::new(Mutex::new(vec![0.0f32; HISTORY_LEN * freq_bins]));
-    
+    let shared_layers = Arc::new(Mutex::new(layers));
     let shared_settings = Arc::new(Mutex::new(AppSettings { 
         mel_scale: true, 
         colormap: ColorMapType::Magma,
-        direction: ScrollDirection::RTL,
         redraw_flag: false,
     }));
 
-    // Audio Setup
     let rb = HeapRb::<f32>::new(65536); 
     let (mut producer, mut consumer) = rb.split();
 
@@ -76,15 +94,14 @@ async fn main() {
     });
 
     // --- THREAD B: BRAIN ---
-    let pixels_ref = shared_pixels.clone();
-    let history_ref = shared_history.clone();
+    let layers_ref = shared_layers.clone();
     let settings_ref = shared_settings.clone();
 
     thread::spawn(move || {
-        let mut rolling_audio = vec![0.0; FFT_SIZE];
+        let max_fft = *RESOLUTIONS.iter().max().unwrap();
+        let mut rolling_audio = vec![0.0; max_fft];
         
         loop {
-            // A. Handle Redraws
             let mut redraw_needed = false;
             {
                 if let Ok(mut s) = settings_ref.lock() {
@@ -96,36 +113,26 @@ async fn main() {
             }
 
             if redraw_needed {
-                if let (Ok(mut pixels), Ok(history), Ok(settings)) = (pixels_ref.lock(), history_ref.lock(), settings_ref.lock()) {
-                    pixels.fill(0);
-                    
-                    // History is ALWAYS stored [Oldest -> Newest]
-                    for t in 0..HISTORY_LEN {
-                        let start = t * freq_bins;
-                        let spectrum_slice = &history[start..start + freq_bins];
-                        
-                        // Calculate where this history slice belongs on screen
-                        // For RTL: History[0] (Old) goes to Screen[0] (Left)
-                        // For LTR: History[0] (Old) goes to Screen[Max] (Right)
-                        let screen_pos = match settings.direction {
-                            ScrollDirection::RTL | ScrollDirection::DownToUp => t,
-                            ScrollDirection::LTR | ScrollDirection::UpToDown => (HISTORY_LEN - 1) - t,
-                        };
-                        
-                        paint_slice(&mut pixels, screen_pos, spectrum_slice, &settings, freq_bins);
+                if let (Ok(mut layers), Ok(settings)) = (layers_ref.lock(), settings_ref.lock()) {
+                    for layer in layers.iter_mut() {
+                        layer.pixels.fill(0);
+                        for t in 0..HISTORY_LEN {
+                            let start = t * layer.freq_bins;
+                            let slice = &layer.history[start..start + layer.freq_bins];
+                            paint_slice(&mut layer.pixels, t, slice, &settings, layer.freq_bins, layer.fft_size);
+                        }
                     }
                 }
                 continue; 
             }
 
-            // B. Process Audio
             let num_new = consumer.len();
             if num_new > 0 {
                 let mut temp = vec![0.0; num_new];
                 consumer.pop_slice(&mut temp);
                 rolling_audio.extend(temp);
-                if rolling_audio.len() > FFT_SIZE {
-                    let remove = rolling_audio.len() - FFT_SIZE;
+                if rolling_audio.len() > max_fft {
+                    let remove = rolling_audio.len() - max_fft;
                     rolling_audio.drain(0..remove);
                 }
             }
@@ -135,38 +142,37 @@ async fn main() {
                 continue;
             }
 
-            // C. FFT
-            let windowed = hann_window(&rolling_audio);
-            if let Ok(spectrum) = samples_fft_to_spectrum(&windowed, SAMPLE_RATE, FrequencyLimit::All, Some(&divide_by_N_sqrt)) {
-                let raw_col: Vec<f32> = spectrum.data().iter().map(|(_, v)| v.val()).collect();
-                
-                if let (Ok(mut pixels), Ok(mut history), Ok(settings)) = (pixels_ref.lock(), history_ref.lock(), settings_ref.lock()) {
-                    
-                    // 1. Update Float History (Always Shift Left: Old -> New)
-                    let h_len = history.len();
-                    history.copy_within(freq_bins..h_len, 0);
-                    let start_idx = (HISTORY_LEN - 1) * freq_bins;
-                    let copy_len = raw_col.len().min(freq_bins);
-                    history[start_idx..start_idx+copy_len].copy_from_slice(&raw_col[0..copy_len]);
+            if let (Ok(mut layers), Ok(settings)) = (layers_ref.lock(), settings_ref.lock()) {
+                for layer in layers.iter_mut() {
+                    if rolling_audio.len() < layer.fft_size { continue; }
 
-                    // 2. Scroll Pixels (Direction Aware)
-                    shift_pixels(&mut pixels, &settings.direction, freq_bins);
+                    let start_sample = rolling_audio.len() - layer.fft_size;
+                    let audio_slice = &rolling_audio[start_sample..];
 
-                    // 3. Paint New Slice (At the "New" Edge)
-                    let paint_idx = match settings.direction {
-                        ScrollDirection::RTL | ScrollDirection::DownToUp => HISTORY_LEN - 1,
-                        ScrollDirection::LTR | ScrollDirection::UpToDown => 0,
-                    };
-                    
-                    paint_slice(&mut pixels, paint_idx, &raw_col, &settings, freq_bins);
+                    let windowed = hann_window(audio_slice);
+                    if let Ok(spectrum) = samples_fft_to_spectrum(&windowed, SAMPLE_RATE, FrequencyLimit::All, Some(&divide_by_N_sqrt)) {
+                        let raw_col: Vec<f32> = spectrum.data().iter().map(|(_, v)| v.val()).collect();
+                        
+                        let h_len = layer.history.len();
+                        layer.history.copy_within(layer.freq_bins..h_len, 0);
+                        let start_idx = (HISTORY_LEN - 1) * layer.freq_bins;
+                        let copy_len = raw_col.len().min(layer.freq_bins);
+                        layer.history[start_idx..start_idx+copy_len].copy_from_slice(&raw_col[0..copy_len]);
+
+                        let p_len = layer.pixels.len();
+                        if p_len > 4 { layer.pixels.copy_within(4..p_len, 0); }
+
+                        paint_slice(&mut layer.pixels, HISTORY_LEN - 1, &raw_col, &settings, layer.freq_bins, layer.fft_size);
+                    }
                 }
             }
         }
     });
 
     // --- THREAD C: FACE ---
+    let mut current_fft_idx = 1;
     let mut current_width = HISTORY_LEN;
-    let mut current_height = freq_bins;
+    let mut current_height = RESOLUTIONS[current_fft_idx] / 2;
 
     let mut texture = Texture2D::from_image(&Image {
         width: current_width as u16, height: current_height as u16,
@@ -177,31 +183,26 @@ async fn main() {
     let mut local_mel = true;
     let mut local_cmap = ColorMapType::Magma;
     let mut local_dir = ScrollDirection::RTL;
-
+    
     loop {
-        let mut changed = false;
-        if is_key_pressed(KeyCode::Space) { local_mel = !local_mel; changed = true; }
-        if is_key_pressed(KeyCode::C) { local_cmap = cycle_colormap(local_cmap); changed = true; }
-        if is_key_pressed(KeyCode::D) { local_dir = cycle_direction(local_dir); changed = true; }
+        let mut visual_changed = false;
+        
+        if is_key_pressed(KeyCode::Space) { local_mel = !local_mel; visual_changed = true; }
+        if is_key_pressed(KeyCode::C) { local_cmap = cycle_colormap(local_cmap); visual_changed = true; }
+        if is_key_pressed(KeyCode::D) { local_dir = cycle_direction(local_dir); }
+        if is_key_pressed(KeyCode::F) { current_fft_idx = (current_fft_idx + 1) % RESOLUTIONS.len(); }
 
-        if changed {
+        if visual_changed {
             if let Ok(mut s) = shared_settings.lock() {
                 s.mel_scale = local_mel;
                 s.colormap = local_cmap;
-                s.direction = local_dir;
                 s.redraw_flag = true; 
             }
         }
 
-        // Handle Dimension Changes
-        let (req_w, req_h) = match local_dir {
-            ScrollDirection::RTL | ScrollDirection::LTR => (HISTORY_LEN, freq_bins),
-            ScrollDirection::DownToUp | ScrollDirection::UpToDown => (freq_bins, HISTORY_LEN),
-        };
-
-        if req_w != current_width || req_h != current_height {
-            current_width = req_w;
-            current_height = req_h;
+        let bins = RESOLUTIONS[current_fft_idx] / 2;
+        if bins != current_height {
+            current_height = bins;
             texture = Texture2D::from_image(&Image {
                 width: current_width as u16, height: current_height as u16,
                 bytes: vec![0; current_width * current_height * 4],
@@ -209,53 +210,65 @@ async fn main() {
             texture.set_filter(FilterMode::Linear);
         }
 
-        if let Ok(pixels) = shared_pixels.lock() {
-            let img = Image {
-                width: current_width as u16, height: current_height as u16,
-                bytes: pixels.clone(),
-            };
-            texture.update(&img);
+        if let Ok(layers) = shared_layers.lock() {
+            let layer = &layers[current_fft_idx];
+            if layer.pixels.len() == current_width * current_height * 4 {
+                let img = Image {
+                    width: current_width as u16, height: current_height as u16,
+                    bytes: layer.pixels.clone(),
+                };
+                texture.update(&img);
+            }
         }
 
         clear_background(BLACK);
-        draw_texture_ex(&texture, 0.0, 0.0, WHITE, DrawTextureParams {
-            dest_size: Some(vec2(screen_width(), screen_height())), ..Default::default()
-        });
 
-        draw_ui_overlay(local_mel, local_cmap, local_dir);
+        let sw = screen_width();
+        let sh = screen_height();
+        
+        // GPU Rotation & Flipping
+        let draw_params = match local_dir {
+            ScrollDirection::RTL => DrawTextureParams {
+                dest_size: Some(vec2(sw, sh)),
+                ..Default::default()
+            },
+            ScrollDirection::LTR => DrawTextureParams {
+                dest_size: Some(vec2(sw, sh)),
+                flip_x: true,
+                ..Default::default()
+            },
+            ScrollDirection::DownToUp => DrawTextureParams {
+                dest_size: Some(vec2(sh, sw)), 
+                rotation: std::f32::consts::FRAC_PI_2, 
+                pivot: Some(vec2(sw / 2.0, sh / 2.0)), 
+                ..Default::default()
+            },
+            ScrollDirection::UpToDown => DrawTextureParams {
+                dest_size: Some(vec2(sh, sw)), 
+                rotation: -std::f32::consts::FRAC_PI_2, 
+                pivot: Some(vec2(sw / 2.0, sh / 2.0)),
+                flip_y: true,
+                ..Default::default()
+            },
+        };
+
+        let (draw_x, draw_y) = match local_dir {
+            ScrollDirection::RTL | ScrollDirection::LTR => (0.0, 0.0),
+            _ => ( (sw - sh) / 2.0, (sh - sw) / 2.0 )
+        };
+
+        draw_texture_ex(&texture, draw_x, draw_y, WHITE, draw_params);
+
+        draw_note_ruler(local_mel, local_dir, RESOLUTIONS[current_fft_idx]);
+        draw_ui_overlay(local_mel, local_cmap, local_dir, RESOLUTIONS[current_fft_idx]);
+        
         next_frame().await
     }
 }
 
-// --- HELPER FUNCTIONS ---
+// --- HELPERS ---
 
-fn shift_pixels(pixels: &mut Vec<u8>, dir: &ScrollDirection, freq_bins: usize) {
-    let len = pixels.len();
-    match dir {
-        // Horizontal: Width is HISTORY_LEN (1024), Stride is 4
-        ScrollDirection::RTL => {
-            // New at Right. Old goes Left.
-            if len > 4 { pixels.copy_within(4..len, 0); }
-        },
-        ScrollDirection::LTR => {
-            // New at Left. Old goes Right.
-            if len > 4 { pixels.copy_within(0..len-4, 4); }
-        },
-        // Vertical: Width is FREQ_BINS (2048), Stride is FREQ_BINS * 4
-        ScrollDirection::DownToUp => {
-            // New at Bottom. Old goes Up.
-            let row_bytes = freq_bins * 4;
-            if len > row_bytes { pixels.copy_within(row_bytes..len, 0); }
-        },
-        ScrollDirection::UpToDown => {
-            // New at Top. Old goes Down.
-            let row_bytes = freq_bins * 4;
-            if len > row_bytes { pixels.copy_within(0..len-row_bytes, row_bytes); }
-        }
-    }
-}
-
-fn paint_slice(pixels: &mut Vec<u8>, pos_index: usize, data: &[f32], settings: &AppSettings, freq_bins: usize) {
+fn paint_slice(pixels: &mut Vec<u8>, pos_index: usize, data: &[f32], settings: &AppSettings, freq_bins: usize, fft_size: usize) {
     let gradient = get_gradient(settings.colormap);
     let max_freq_idx = data.len();
     let mel_min = 0.0;
@@ -267,7 +280,7 @@ fn paint_slice(pixels: &mut Vec<u8>, pos_index: usize, data: &[f32], settings: &
         let target_idx = if settings.mel_scale {
             let mel = norm_i * (mel_max - mel_min) + mel_min;
             let freq = 700.0 * (10.0f32.powf(mel / 2595.0) - 1.0);
-            let idx = freq / (SAMPLE_RATE as f32 / FFT_SIZE as f32);
+            let idx = freq / (SAMPLE_RATE as f32 / fft_size as f32); 
             idx as usize
         } else {
             (norm_i * max_freq_idx as f32) as usize
@@ -278,20 +291,9 @@ fn paint_slice(pixels: &mut Vec<u8>, pos_index: usize, data: &[f32], settings: &
         let intensity = (magnitude * 2000.0).ln() / 8.0; 
         let c = gradient.eval_continuous(intensity.clamp(0.0, 1.0) as f64);
 
-        let idx = match settings.direction {
-            // Horizontal: Time is X, Freq is Y (inverted)
-            ScrollDirection::RTL | ScrollDirection::LTR => {
-                let x = pos_index; 
-                let y = (freq_bins - 1) - i; 
-                (y * HISTORY_LEN + x) * 4
-            },
-            // Vertical: Time is Y, Freq is X
-            ScrollDirection::DownToUp | ScrollDirection::UpToDown => {
-                let y = pos_index;
-                let x = i; 
-                (y * freq_bins + x) * 4
-            }
-        };
+        let x = pos_index; 
+        let y = (freq_bins - 1) - i; 
+        let idx = (y * HISTORY_LEN + x) * 4;
 
         if idx + 3 < pixels.len() {
             pixels[idx] = c.r;
@@ -333,22 +335,99 @@ fn cycle_direction(d: ScrollDirection) -> ScrollDirection {
     }
 }
 
-fn draw_ui_overlay(mel: bool, cmap: ColorMapType, dir: ScrollDirection) {
-    draw_rectangle(0.0, 0.0, 260.0, 120.0, Color::new(0.0, 0.0, 0.0, 0.8));
-    draw_text(format!("FPS: {}", get_fps()).as_str(), 10.0, 20.0, 20.0, GREEN);
-    
-    let scale_text = if mel { "Scale: Mel" } else { "Scale: Linear" };
-    draw_text(scale_text, 10.0, 40.0, 20.0, ORANGE);
+fn freq_to_screen_pos(freq: f32, mel_scale: bool) -> f32 {
+    let max_freq = SAMPLE_RATE as f32 / 2.0;
+    if mel_scale {
+        let mel_val = 2595.0 * (1.0 + freq / 700.0).log10();
+        let mel_max = 2595.0 * (1.0 + max_freq / 700.0).log10();
+        mel_val / mel_max
+    } else {
+        freq / max_freq
+    }
+}
 
-    let map_name = format!("{:?}", cmap);
-    draw_text(&format!("Color: {}", map_name), 10.0, 60.0, 20.0, YELLOW);
+fn draw_note_ruler(mel_scale: bool, dir: ScrollDirection, fft_size: usize) {
+    let w = screen_width();
+    let h = screen_height();
+    if fft_size == 0 { return; }
 
-    let dir_name = match dir {
-        ScrollDirection::RTL => "Right -> Left",
-        ScrollDirection::LTR => "Left -> Right",
-        ScrollDirection::DownToUp => "Down -> Up",
-        ScrollDirection::UpToDown => "Up -> Down",
+    for midi in 21..109 {
+        let freq = 440.0 * 2.0f32.powf((midi as f32 - 69.0) / 12.0);
+        if freq > (SAMPLE_RATE as f32 / 2.0) { break; }
+        let norm_pos = freq_to_screen_pos(freq, mel_scale);
+        
+        let (x, y, is_c) = match dir {
+            ScrollDirection::RTL => (w, h * (1.0 - norm_pos), midi % 12 == 0),
+            ScrollDirection::LTR => (0.0, h * (1.0 - norm_pos), midi % 12 == 0),
+            // UTD (Rain): High pitch on Right. Ruler Top.
+            ScrollDirection::UpToDown => (w * norm_pos, 0.0, midi % 12 == 0),
+            // DTU (Fire): High pitch on Right. Ruler Bottom.
+            ScrollDirection::DownToUp => (w * norm_pos, h, midi % 12 == 0),
+        };
+
+        if dir == ScrollDirection::RTL || dir == ScrollDirection::LTR {
+            let tick_len = if is_c { 15.0 } else { 5.0 };
+            let start_x = if dir == ScrollDirection::RTL { x - tick_len } else { x };
+            draw_line(start_x, y, start_x + tick_len, y, 1.0, WHITE);
+            if is_c {
+                let octave = (midi / 12) - 1;
+                let text_x = if dir == ScrollDirection::RTL { x - 35.0 } else { x + 20.0 };
+                draw_text(&format!("C{}", octave), text_x, y + 4.0, 15.0, WHITE);
+            }
+        } else {
+            let tick_len = if is_c { 15.0 } else { 5.0 };
+            let start_y = if dir == ScrollDirection::DownToUp { y - tick_len } else { y };
+            draw_line(x, start_y, x, start_y + tick_len, 1.0, WHITE);
+            if is_c {
+                let octave = (midi / 12) - 1;
+                let text_y = if dir == ScrollDirection::DownToUp { y - 20.0 } else { y + 30.0 };
+                draw_text(&format!("C{}", octave), x - 5.0, text_y, 15.0, WHITE);
+            }
+        }
+    }
+}
+
+fn draw_ui_overlay(mel: bool, cmap: ColorMapType, dir: ScrollDirection, fft: usize) {
+    let scale_str = if mel { "Mel" } else { "Linear" };
+    let map_str = format!("{:?}", cmap);
+    let dir_str = match dir {
+        ScrollDirection::RTL => "RTL", ScrollDirection::LTR => "LTR",
+        ScrollDirection::DownToUp => "Fire", ScrollDirection::UpToDown => "Rain",
     };
-    draw_text(&format!("Flow: {}", dir_name), 10.0, 80.0, 20.0, SKYBLUE);
-    draw_text("[Space] Scale  [C] Color  [D] Flow", 10.0, 105.0, 20.0, LIGHTGRAY);
+    let res_str = format!("{} bins ({} FFT)", fft/2, fft);
+
+    match dir {
+        ScrollDirection::RTL | ScrollDirection::LTR => {
+            // HORIZONTAL STRIP
+            // Use fixed X offsets to prevent jitter when FPS length changes
+            draw_rectangle(0.0, 0.0, screen_width(), 30.0, Color::new(0.0, 0.0, 0.0, 0.5));
+            
+            draw_text("FPS:", 10.0, 20.0, 20.0, WHITE);
+            draw_text(&get_fps().to_string(), 55.0, 20.0, 20.0, GREEN);
+
+            draw_text("Scale:", 100.0, 20.0, 20.0, WHITE);
+            draw_text(scale_str, 160.0, 20.0, 20.0, ORANGE);
+
+            draw_text("Color:", 240.0, 20.0, 20.0, WHITE);
+            draw_text(&map_str, 300.0, 20.0, 20.0, YELLOW);
+
+            draw_text("Flow:", 420.0, 20.0, 20.0, WHITE);
+            draw_text(dir_str, 470.0, 20.0, 20.0, SKYBLUE);
+
+            draw_text("Res:", 550.0, 20.0, 20.0, WHITE);
+            draw_text(&res_str, 595.0, 20.0, 20.0, VIOLET);
+
+            draw_text("[Space] [C] [D] [F]", screen_width() - 200.0, 20.0, 20.0, LIGHTGRAY);
+        },
+        ScrollDirection::DownToUp | ScrollDirection::UpToDown => {
+            // VERTICAL BOX (Legacy style)
+            draw_rectangle(10.0, 10.0, 260.0, 140.0, Color::new(0.0, 0.0, 0.0, 0.5));
+            draw_text(format!("FPS: {}", get_fps()).as_str(), 20.0, 30.0, 20.0, GREEN);
+            draw_text(format!("Scale: {}", scale_str).as_str(), 20.0, 50.0, 20.0, ORANGE);
+            draw_text(format!("Color: {}", map_str).as_str(), 20.0, 70.0, 20.0, YELLOW);
+            draw_text(format!("Flow: {}", dir_str).as_str(), 20.0, 90.0, 20.0, SKYBLUE);
+            draw_text(format!("Res: {}", res_str).as_str(), 20.0, 110.0, 20.0, VIOLET);
+            draw_text("[Space] [C] [D] [F]low", 20.0, 135.0, 20.0, LIGHTGRAY);
+        }
+    }
 }
