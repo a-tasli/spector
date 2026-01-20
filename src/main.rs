@@ -24,7 +24,6 @@ enum ColorMapType { Magma, Inferno, Viridis, Plasma, Turbo, Cubehelix }
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum ScrollDirection { RTL, LTR, DownToUp, UpToDown }
 
-// Added Clone so we can snapshot settings for the background thread
 #[derive(Clone)]
 struct AppSettings {
     mel_scale: bool,
@@ -104,9 +103,8 @@ async fn main() {
         let mut rolling_audio = vec![0.0; max_fft];
         
         loop {
-            // 1. Check Redraw
+            // Check Redraw
             let mut redraw_needed = false;
-            // Snapshot settings so we don't need to hold the lock during the heavy loop
             let mut current_settings = {
                 let mut s = settings_ref.lock().unwrap();
                 if s.redraw_flag {
@@ -118,12 +116,8 @@ async fn main() {
                 }
             };
 
-            // 2. Perform Stutter-Free Redraw
             if redraw_needed {
                 if let Some(settings) = current_settings {
-                    // Iterate through layers ONE BY ONE
-                    // We lock, paint one layer, then unlock. 
-                    // This lets the UI thread render frames in between layer updates.
                     for i in 0..RESOLUTIONS.len() {
                         if let Ok(mut layers) = layers_ref.lock() {
                             let layer = &mut layers[i];
@@ -134,14 +128,13 @@ async fn main() {
                                 paint_slice(&mut layer.pixels, t, slice, &settings, layer.freq_bins, layer.fft_size);
                             }
                         }
-                        // Yield to let UI thread breathe
                         thread::yield_now();
                     }
                 }
                 continue; 
             }
 
-            // 3. Audio Ingest
+            // Audio Ingest
             let num_new = consumer.len();
             if num_new > 0 {
                 let mut temp = vec![0.0; num_new];
@@ -158,8 +151,7 @@ async fn main() {
                 continue;
             }
 
-            // 4. Parallel FFT
-            // We still lock here for the new data update, but this is much faster than a full redraw
+            // Parallel FFT
             if let (Ok(mut layers), Ok(settings)) = (layers_ref.lock(), settings_ref.lock()) {
                 for layer in layers.iter_mut() {
                     if rolling_audio.len() < layer.fft_size { continue; }
@@ -244,31 +236,61 @@ async fn main() {
         let sw = screen_width();
         let sh = screen_height();
         
-        let draw_params = match local_dir {
-            ScrollDirection::RTL => DrawTextureParams {
-                dest_size: Some(vec2(sw, sh)),
-                ..Default::default()
+        // --- VIEWPORT LOGIC ---
+        // Determine how much history we can show based on window dimensions
+        // If window is smaller than HISTORY_LEN, we crop.
+        // If window is larger, we show all (and stretch).
+        let (visible_bins, tex_w, tex_h, rotation, flip_x, flip_y) = match local_dir {
+            ScrollDirection::RTL => {
+                let vis = (sw as usize).min(HISTORY_LEN);
+                (vis, vis, bins, 0.0, false, false)
             },
-            ScrollDirection::LTR => DrawTextureParams {
-                dest_size: Some(vec2(sw, sh)),
-                flip_x: true,
-                ..Default::default()
+            ScrollDirection::LTR => {
+                let vis = (sw as usize).min(HISTORY_LEN);
+                (vis, vis, bins, 0.0, true, false)
             },
-            ScrollDirection::DownToUp => DrawTextureParams {
-                dest_size: Some(vec2(sh, sw)), 
-                rotation: std::f32::consts::FRAC_PI_2, 
-                pivot: Some(vec2(sw / 2.0, sh / 2.0)), 
-                ..Default::default()
+            ScrollDirection::DownToUp => {
+                let vis = (sh as usize).min(HISTORY_LEN);
+                (vis, vis, bins, std::f32::consts::FRAC_PI_2, false, false)
             },
-            ScrollDirection::UpToDown => DrawTextureParams {
-                dest_size: Some(vec2(sh, sw)), 
-                rotation: -std::f32::consts::FRAC_PI_2, 
-                pivot: Some(vec2(sw / 2.0, sh / 2.0)),
-                flip_y: true,
-                ..Default::default()
+            ScrollDirection::UpToDown => {
+                let vis = (sh as usize).min(HISTORY_LEN);
+                (vis, vis, bins, -std::f32::consts::FRAC_PI_2, false, true)
             },
         };
 
+        // Determine SOURCE RECT (What part of texture to draw)
+        // Texture is always [0..HISTORY_LEN].
+        // Newest data is at Right/End (Index 1024) for RTL/DTU.
+        // Newest data is at Left/Start (Index 0) for LTR/UTD.
+        let source_x = match local_dir {
+            // Keep Right (New), Crop Left (Old)
+            ScrollDirection::RTL | ScrollDirection::DownToUp => (HISTORY_LEN - visible_bins) as f32,
+            // Keep Left (New), Crop Right (Old)
+            ScrollDirection::LTR | ScrollDirection::UpToDown => 0.0,
+        };
+
+        let source = Rect::new(source_x, 0.0, visible_bins as f32, bins as f32);
+
+        // Determine DEST SIZE (How big on screen)
+        // If window > HISTORY_LEN, dest fills window (Stretch).
+        // If window < HISTORY_LEN, dest fills window (1:1 pixel mapping).
+        let dest_size = match local_dir {
+            ScrollDirection::RTL | ScrollDirection::LTR => vec2(sw, sh),
+            ScrollDirection::DownToUp | ScrollDirection::UpToDown => vec2(sh, sw), // Swapped for rotation
+        };
+
+        let draw_params = DrawTextureParams {
+            dest_size: Some(dest_size),
+            source: Some(source),
+            rotation,
+            flip_x,
+            flip_y,
+            pivot: if rotation != 0.0 { Some(vec2(sw/2.0, sh/2.0)) } else { None },
+            ..Default::default()
+        };
+
+        // Centering logic for rotation
         let (draw_x, draw_y) = match local_dir {
             ScrollDirection::RTL | ScrollDirection::LTR => (0.0, 0.0),
             _ => ( (sw - sh) / 2.0, (sh - sw) / 2.0 )
@@ -402,8 +424,6 @@ fn draw_note_ruler(mel_scale: bool, dir: ScrollDirection, fft_size: usize) {
     }
 }
 
-// --- UNIFIED UI SYSTEM ---
-
 struct UiStat {
     label: &'static str,
     hotkey: Option<char>,
@@ -432,8 +452,6 @@ fn draw_ui_overlay(mel: bool, cmap: ColorMapType, dir: ScrollDirection, fft: usi
 
     let (bg_x, bg_y, bg_w, bg_h, is_vertical) = match dir {
         ScrollDirection::RTL | ScrollDirection::LTR => (0.0, 0.0, screen_width(), 30.0, false),
-        // Position at TOP-RIGHT for Vertical modes:
-        // X = Screen Width - Box Width - Padding
         _ => (screen_width() - 270.0, 10.0, 260.0, 120.0, true),
     };
 
@@ -445,16 +463,13 @@ fn draw_ui_overlay(mel: bool, cmap: ColorMapType, dir: ScrollDirection, fft: usi
     for stat in stats {
         let full_label = format!("{}:", stat.label);
         
-        // 1. Draw Label (White)
         draw_text(&full_label, cursor_x, cursor_y, 20.0, WHITE);
 
-        // 2. Draw Underline for Hotkey
         if let Some(c) = stat.hotkey {
             let char_dims = measure_text(&c.to_string(), None, 20, 1.0);
             draw_line(cursor_x, cursor_y + 2.0, cursor_x + char_dims.width, cursor_y + 2.0, 1.0, WHITE);
         }
 
-        // 3. Draw Value
         if is_vertical {
             let label_width = measure_text(&full_label, None, 20, 1.0).width;
             draw_text(&stat.value, cursor_x + label_width + 10.0, cursor_y, 20.0, stat.color);
