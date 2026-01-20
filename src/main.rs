@@ -1,233 +1,210 @@
-use eframe::egui;
-use eframe::epaint::ColorImage;
-use ringbuf::{HeapRb, Consumer};
+use macroquad::prelude::*;
+use ringbuf::HeapRb; 
 use spectrum_analyzer::{samples_fft_to_spectrum, FrequencyLimit}; 
 use spectrum_analyzer::scaling::divide_by_N_sqrt;
 use spectrum_analyzer::windows::hann_window; 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
 use libpulse_binding::sample::{Spec, Format};
 use libpulse_binding::stream::Direction;
 use libpulse_binding::def::BufferAttr; 
 use libpulse_simple_binding::Simple;
 
-// --- PRO SETTINGS ---
+// --- CONFIG ---
 const FFT_SIZE: usize = 4096;      
 const SAMPLE_RATE: u32 = 44100;
-const HISTORY_LEN: usize = 512;    
-const HOP_SIZE: usize = 512;       
+const HISTORY_WIDTH: usize = 1024; 
+const HOP_SIZE: usize = 1024;      
 
-#[derive(Debug, PartialEq, Clone, Copy)]
-enum ColorMapType { Magma, Inferno, Viridis, Plasma, Turbo }
+// Settings shared between UI and Background Processor
+struct AppSettings {
+    mel_scale: bool,
+}
 
-fn main() -> Result<(), eframe::Error> {
-    env_logger::init(); 
+#[macroquad::main("Rusty Spectrogram")]
+async fn main() {
+    // 1. SHARED MEMORY
+    // The "Brain" writes to this. The "Face" reads from this.
+    // We protect it with a Mutex so they don't fight.
+    let tex_height = FFT_SIZE / 2;
+    let shared_pixels = Arc::new(Mutex::new(vec![0u8; HISTORY_WIDTH * tex_height * 4]));
+    let shared_settings = Arc::new(Mutex::new(AppSettings { mel_scale: true }));
 
-    let rb = HeapRb::<f32>::new(16384);
-    let (mut producer, consumer) = rb.split();
+    // 2. SETUP AUDIO PIPELINE
+    let rb = HeapRb::<f32>::new(65536); 
+    let (mut producer, mut consumer) = rb.split();
 
-    // --- AUDIO THREAD ---
-    std::thread::spawn(move || {
-        let default_sink = std::process::Command::new("pactl")
+    // --- THREAD A: RECORDER (Audio) ---
+    thread::spawn(move || {
+        let output = std::process::Command::new("pactl")
             .arg("get-default-sink")
             .output()
             .expect("Failed to run pactl");
-        let sink_name = String::from_utf8_lossy(&default_sink.stdout).trim().to_string();
-        let monitor_source = format!("{}.monitor", sink_name);
-        println!(">> Target: {}", monitor_source);
+        let sink_name = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let monitor = format!("{}.monitor", sink_name);
 
-        let spec = Spec {
-            format: Format::F32le,
-            channels: 1,
-            rate: SAMPLE_RATE,
-        };
-
-        let frag_size = (SAMPLE_RATE as u32 * 4 * 10) / 1000; 
+        let spec = Spec { format: Format::F32le, channels: 1, rate: SAMPLE_RATE };
+        // 20ms latency buffer (balanced for background stability)
+        let frag_size = (SAMPLE_RATE as u32 * 4 * 20) / 1000; 
         let attr = BufferAttr {
-            maxlength: u32::MAX,
-            tlength: u32::MAX,
-            prebuf: u32::MAX,
-            minreq: u32::MAX,
+            maxlength: u32::MAX, tlength: u32::MAX, prebuf: u32::MAX, minreq: u32::MAX,
             fragsize: frag_size, 
         };
 
         let s = Simple::new(
-            None, "RustySpectrogram", Direction::Record, Some(&monitor_source), 
-            "LowLatencyStream", &spec, None, Some(&attr) 
+            None, "RustySpec", Direction::Record, Some(&monitor), 
+            "Recorder", &spec, None, Some(&attr) 
         );
 
-        let stream = match s { 
-            Ok(s) => s,
-            Err(e) => panic!("PulseAudio Connection Failed: {:?}", e),
-        };
-
-        let mut buffer_bytes = [0u8; 2048]; 
-
-        loop {
-            match stream.read(&mut buffer_bytes) {
-                Ok(_) => {
-                    let float_data: &[f32] = unsafe {
-                        std::slice::from_raw_parts(
-                            buffer_bytes.as_ptr() as *const f32,
-                            buffer_bytes.len() / 4
-                        )
+        if let Ok(stream) = s {
+            let mut buf = [0u8; 4096]; 
+            loop {
+                if let Ok(_) = stream.read(&mut buf) {
+                    let floats: &[f32] = unsafe {
+                        std::slice::from_raw_parts(buf.as_ptr() as *const f32, buf.len() / 4)
                     };
-                    let _ = producer.push_slice(float_data);
-                },
-                Err(_) => {}
+                    producer.push_slice(floats);
+                }
             }
         }
     });
 
-    // --- UI SETUP ---
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1000.0, 700.0]),
-        ..Default::default()
-    };
-    
-    eframe::run_native(
-        "Rusty Spectrogram",
-        options,
-        Box::new(|cc| Box::new(SpectrogramApp::new(cc, consumer))),
-    )
-}
+    // --- THREAD B: BRAIN (FFT + Drawing) ---
+    // This thread runs FOREVER, even if the window is minimized.
+    let pixels_ref = shared_pixels.clone();
+    let settings_ref = shared_settings.clone();
 
-struct SpectrogramApp {
-    consumer: Consumer<f32, Arc<HeapRb<f32>>>,
-    rolling_window: Vec<f32>,
-    spectrogram_image: ColorImage, 
-    texture_handle: Option<egui::TextureHandle>, 
-    use_log_scale: bool,
-    current_colormap: ColorMapType, 
-}
-
-impl SpectrogramApp {
-    fn new(_cc: &eframe::CreationContext, consumer: Consumer<f32, Arc<HeapRb<f32>>>) -> Self {
-        let height = FFT_SIZE / 2;
-        let image = ColorImage::new([HISTORY_LEN, height], egui::Color32::BLACK);
-
-        Self {
-            consumer,
-            rolling_window: vec![0.0; FFT_SIZE],
-            spectrogram_image: image,
-            texture_handle: None, 
-            use_log_scale: true,
-            current_colormap: ColorMapType::Magma,
-        }
-    }
-
-    fn update_spectrogram(&mut self, spectrum_data: &[(f32, f32)]) {
-        let width = self.spectrogram_image.width();
-        let height = self.spectrogram_image.height();
-        let len = self.spectrogram_image.pixels.len();
-        let pixels = &mut self.spectrogram_image.pixels;
+    thread::spawn(move || {
+        let mut rolling_audio = vec![0.0; FFT_SIZE];
         
-        pixels.copy_within(1..len, 0);
+        loop {
+            // A. Consume Audio
+            let num_new = consumer.len();
+            if num_new > 0 {
+                let mut temp = vec![0.0; num_new];
+                consumer.pop_slice(&mut temp);
+                rolling_audio.extend(temp);
+                
+                if rolling_audio.len() > FFT_SIZE {
+                    let remove = rolling_audio.len() - FFT_SIZE;
+                    rolling_audio.drain(0..remove);
+                }
+            }
 
-        let max_freq_idx = spectrum_data.len();
-        
-        let gradient = match self.current_colormap {
-            ColorMapType::Magma => colorous::MAGMA,
-            ColorMapType::Inferno => colorous::INFERNO,
-            ColorMapType::Viridis => colorous::VIRIDIS,
-            ColorMapType::Plasma => colorous::PLASMA,
-            ColorMapType::Turbo => colorous::TURBO,
-        };
+            // B. Wait for HOP_SIZE (Flow Control)
+            if num_new < HOP_SIZE {
+                thread::sleep(Duration::from_millis(1));
+                continue;
+            }
 
-        let min_log = 1.0f32.ln();
-        let max_log = (max_freq_idx as f32).ln();
-        let log_range = max_log - min_log;
+            // C. The Math
+            let windowed = hann_window(&rolling_audio);
+            let spectrum = samples_fft_to_spectrum(
+                &windowed, SAMPLE_RATE, FrequencyLimit::All, Some(&divide_by_N_sqrt)
+            ).unwrap();
+            let raw_data = spectrum.data();
+            let max_freq_idx = raw_data.len();
 
-        for y in 0..height {
-            let normalized_y = 1.0 - (y as f32 / height as f32);
-            
-            let freq_idx = if self.use_log_scale {
-                let log_pos = min_log + (normalized_y * log_range);
-                log_pos.exp() as usize
-            } else {
-                (normalized_y * max_freq_idx as f32) as usize
-            };
+            // D. Update the Pixel Buffer (Lock -> Write -> Unlock)
+            {
+                let mut pixels = pixels_ref.lock().unwrap();
+                let settings = settings_ref.lock().unwrap();
 
-            let idx = freq_idx.min(max_freq_idx - 1);
-            let magnitude = spectrum_data[idx].1;
-            let intensity = (magnitude * 1000.0).ln() / 8.0; 
-            let color = gradient.eval_continuous(intensity.clamp(0.0, 1.0) as f64);
-            
-            pixels[(width - 1) + y * width] = 
-                egui::Color32::from_rgb(color.r, color.g, color.b);
-        }
-    }
-}
+                // Shift Image Left
+                let len = pixels.len();
+                pixels.copy_within(4..len, 0);
 
-impl eframe::App for SpectrogramApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        let num_new = self.consumer.len();
-        if num_new > 0 {
-            let mut new_samples = vec![0.0; num_new];
-            self.consumer.pop_slice(&mut new_samples);
-            self.rolling_window.extend(new_samples);
-            
-            if self.rolling_window.len() > FFT_SIZE {
-                let remove = self.rolling_window.len() - FFT_SIZE;
-                self.rolling_window.drain(0..remove);
+                // Pre-calc Mel constants if needed
+                let mel_min = 0.0;
+                let mel_max = 2595.0 * (1.0 + (SAMPLE_RATE as f32 / 2.0) / 700.0).log10();
+                
+                // Draw new column
+                for y in 0..tex_height {
+                    let norm_y = 1.0 - (y as f32 / tex_height as f32); // 0.0 = bottom, 1.0 = top
+                    
+                    let target_freq_idx = if settings.mel_scale {
+                        // Inverse Mel Scale Formula
+                        let mel = norm_y * (mel_max - mel_min) + mel_min;
+                        let freq = 700.0 * (10.0f32.powf(mel / 2595.0) - 1.0);
+                        let idx = freq / (SAMPLE_RATE as f32 / FFT_SIZE as f32);
+                        idx as usize
+                    } else {
+                        // Linear
+                        (norm_y * max_freq_idx as f32) as usize
+                    };
+
+                    let safe_idx = target_freq_idx.min(max_freq_idx - 1);
+                    // Fast approximate lookup
+                    let (_, val) = raw_data.iter().nth(safe_idx).unwrap();
+                    let magnitude = val.val();
+
+                    // Coloring (Magma-ish)
+                    let intensity = (magnitude * 2000.0).ln() / 8.0; 
+                    let c = colorous::MAGMA.eval_continuous(intensity.clamp(0.0, 1.0) as f64);
+
+                    let idx = (y * HISTORY_WIDTH + (HISTORY_WIDTH - 1)) * 4;
+                    pixels[idx] = c.r;
+                    pixels[idx+1] = c.g;
+                    pixels[idx+2] = c.b;
+                    pixels[idx+3] = 255;
+                }
             }
         }
+    });
 
-        let mut updates = 0;
-        // Limit updates to prevent hanging
-        while updates < 3 && num_new >= HOP_SIZE && self.rolling_window.len() == FFT_SIZE {
-             if updates == 0 && num_new < HOP_SIZE { break; } 
+    // --- THREAD C: THE FACE (Rendering) ---
+    // Init Texture
+    let texture = Texture2D::from_image(&Image {
+        width: HISTORY_WIDTH as u16,
+        height: tex_height as u16,
+        bytes: vec![0; HISTORY_WIDTH * tex_height * 4],
+    });
+    texture.set_filter(FilterMode::Linear);
+    
+    let mut local_mel = true;
 
-            let windowed_data = hann_window(&self.rolling_window);
-            let spectrum = samples_fft_to_spectrum(
-                &windowed_data,
-                SAMPLE_RATE,
-                FrequencyLimit::All,
-                Some(&divide_by_N_sqrt),
-            ).unwrap();
-            
-            let raw_data: Vec<(f32, f32)> = spectrum.data().iter()
-                .map(|(freq, val)| (freq.val(), val.val()))
-                .collect();
-
-            self.update_spectrogram(&raw_data);
-            updates += 1;
-            if updates >= 1 { break; } 
+    loop {
+        // 1. Sync Settings (UI -> Thread B)
+        {
+            let mut s = shared_settings.lock().unwrap();
+            s.mel_scale = local_mel;
         }
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.heading("Spectrogram");
-                ui.separator();
-                ui.checkbox(&mut self.use_log_scale, "Log Scale");
-                
-                egui::ComboBox::from_label("Colormap")
-                .selected_text(format!("{:?}", self.current_colormap).split("::").last().unwrap())
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.current_colormap, ColorMapType::Magma, "Magma");
-                    ui.selectable_value(&mut self.current_colormap, ColorMapType::Inferno, "Inferno");
-                    ui.selectable_value(&mut self.current_colormap, ColorMapType::Viridis, "Viridis");
-                    ui.selectable_value(&mut self.current_colormap, ColorMapType::Plasma, "Plasma");
-                    ui.selectable_value(&mut self.current_colormap, ColorMapType::Turbo, "Turbo");
-                });
-            });
+        // 2. Upload Pixels (Thread B -> GPU)
+        {
+            let pixels = shared_pixels.lock().unwrap();
+            let img = Image {
+                width: HISTORY_WIDTH as u16,
+                height: tex_height as u16,
+                bytes: pixels.clone(),
+            };
+            texture.update(&img);
+        }
 
-            // 1. Get or Create Texture
-            let texture = self.texture_handle.get_or_insert_with(|| {
-                ctx.load_texture(
-                    "spectrogram",
-                    self.spectrogram_image.clone(),
-                    egui::TextureOptions::NEAREST
-                )
-            });
+        // 3. Draw
+        clear_background(BLACK);
+        draw_texture_ex(
+            &texture,
+            0.0, 0.0, WHITE,
+            DrawTextureParams {
+                dest_size: Some(vec2(screen_width(), screen_height())),
+                ..Default::default()
+            },
+        );
 
-            // 2. Update Texture (Requires Clone due to API limits, but still lighter on GPU)
-            texture.set(self.spectrogram_image.clone(), egui::TextureOptions::NEAREST);
-
-            // 3. Draw (Convert mutable ref to immutable ref using &*)
-            ui.image(&*texture);
-        });
+        // UI Overlay
+        draw_rectangle(0.0, 0.0, 220.0, 80.0, Color::new(0.0, 0.0, 0.0, 0.8));
+        draw_text(format!("FPS: {}", get_fps()).as_str(), 10.0, 20.0, 20.0, GREEN);
         
-        ctx.request_repaint_after(std::time::Duration::from_millis(16));
+        let scale_text = if local_mel { "Scale: Mel (Standard)" } else { "Scale: Linear" };
+        draw_text(scale_text, 10.0, 45.0, 20.0, ORANGE);
+        draw_text("[Space] Toggle Scale", 10.0, 65.0, 20.0, LIGHTGRAY);
+
+        if is_key_pressed(KeyCode::Space) {
+            local_mel = !local_mel;
+        }
+
+        next_frame().await
     }
 }

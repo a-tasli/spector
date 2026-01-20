@@ -4,11 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-eframe = "0.27"
-ringbuf = "0.3"
-spectrum-analyzer = "1.5"
-colorous = "1.0"
-log = "0.4"
-env_logger = "0.11"
-libpulse-binding = "2.28"        # The raw bindings
-libpulse-simple-binding = "2.28" # The simple recorder
+macroquad = "0.4"          # The Game Engine (Fast & Light)
+ringbuf = "0.3"            # Thread Bridge
+spectrum-analyzer = "1.5"  # FFT Math
+colorous = "1.0"           # Pro Colormaps
+libpulse-binding = "2.28"  # Audio Driver
+libpulse-simple-binding = "2.28"
