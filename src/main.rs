@@ -18,6 +18,10 @@ const HOP_SIZE: usize = 512;
 const RESOLUTIONS: [usize; 3] = [2048, 4096, 8192];
 const MAX_HISTORY: usize = 1024; 
 
+// The history bins will be scaled to match this target pixel width on screen.
+// 2048.0 means 1024 bins are stretched 2x to fill 2048 pixels.
+const TARGET_DISPLAY_WIDTH: f32 = 2048.0; 
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum ColorMapType { Magma, Inferno, Viridis, Plasma, Turbo, Cubehelix }
 
@@ -264,27 +268,64 @@ async fn main() {
         let sh = screen_height();
         
         // --- VIEWPORT & SOURCE RECT LOGIC ---
-        // Calculate visible history based on scrolling axis dimension
-        let (visible_bins, rotation, flip_x, flip_y) = match local_dir {
-            ScrollDirection::RTL => ((sw as usize).min(current_view_len), 0.0, false, false),
-            ScrollDirection::LTR => ((sw as usize).min(current_view_len), 0.0, true, false),
-            ScrollDirection::DownToUp => ((sh as usize).min(current_view_len), std::f32::consts::FRAC_PI_2, false, false),
-            ScrollDirection::UpToDown => ((sh as usize).min(current_view_len), -std::f32::consts::FRAC_PI_2, false, true),
+
+        // 1. Identify "Flow" (Time) and "Static" (Freq) screen dimensions
+        let (screen_time_dim, screen_freq_dim) = match local_dir {
+            ScrollDirection::RTL | ScrollDirection::LTR => (sw, sh),
+            ScrollDirection::DownToUp | ScrollDirection::UpToDown => (sh, sw),
         };
 
-        // Source Rect: Crop the "Oldest" (Left) part if window is small.
-        // Texture is always [Old -> New] (Left -> Right).
-        // To show "Newest" data, we start reading from (Total - Visible).
-        let source_x = (MAX_HISTORY - visible_bins) as f32;
-        
-        let source = Rect::new(source_x, 0.0, visible_bins as f32, current_height as f32);
+        // 2. Determine Scale Factor based on Target and Current View Mode
+        //    Logic: We want 'current_view_len' (e.g., 1024 or 512) to cover 'TARGET_DISPLAY_WIDTH' pixels.
+        //    This creates a constant density relative to the target width.
+        let scale_factor = TARGET_DISPLAY_WIDTH / (current_view_len as f32);
 
-        // Dest Size: Fills the screen dimension on the scrolling axis.
-        // If sw > MAX_HISTORY, it stretches.
-        // If sw < MAX_HISTORY, it stays 1:1 (because we set visible_bins = sw).
-        let dest_size = match local_dir {
-            ScrollDirection::RTL | ScrollDirection::LTR => vec2(sw, sh),
-            ScrollDirection::DownToUp | ScrollDirection::UpToDown => vec2(sh, sw), // Swapped for rotation
+        // 3. Calculate how many texture pixels are needed to fill the current screen
+        let needed_source_w = screen_time_dim / scale_factor;
+
+        // 4. Calculate final Source and Dest rects
+        let (final_source_w, final_dest_w) = if needed_source_w <= current_view_len as f32 {
+            // Screen is small: Fill the screen, crop the source.
+            (needed_source_w, screen_time_dim)
+        } else {
+            // Screen is larger than Target: Show all data, STRETCH to fill screen.
+            // We NO LONGER cap at TARGET_DISPLAY_WIDTH.
+            (current_view_len as f32, screen_time_dim)
+        };
+
+        // 5. Source Rect
+        //    Grab the NEWEST 'final_source_w' pixels.
+        //    Texture writes Left->Right (Old->New). Newest is at MAX_HISTORY.
+        let source_x = (MAX_HISTORY as f32) - final_source_w;
+        let source = Rect::new(source_x, 0.0, final_source_w, current_height as f32);
+
+        // 6. Dest Size
+        //    Time axis = final_dest_w (Screen Width)
+        //    Freq axis = screen_freq_dim (Always stretches to fill)
+        let dest_size = vec2(final_dest_w, screen_freq_dim);
+
+        // 7. Rotation & Centering
+        let (rotation, flip_x, flip_y) = match local_dir {
+            ScrollDirection::RTL => (0.0, false, false),
+            ScrollDirection::LTR => (0.0, true, false),
+            ScrollDirection::DownToUp => (std::f32::consts::FRAC_PI_2, false, false),
+            ScrollDirection::UpToDown => (-std::f32::consts::FRAC_PI_2, false, true),
+        };
+
+        // Centering Logic
+        // Since final_dest_w is now always screen_time_dim, dest_size matches the screen.
+        // Thus offsets will be 0.0, effectively removing "centering" for the stretch case.
+        let (draw_x, draw_y, pivot) = match local_dir {
+            ScrollDirection::RTL | ScrollDirection::LTR => (
+                (sw - dest_size.x) / 2.0, 
+                0.0, 
+                None 
+            ),
+            _ => ( 
+                (sw - dest_size.x) / 2.0, 
+                (sh - dest_size.y) / 2.0, 
+                Some(vec2(sw/2.0, sh/2.0)) 
+            ),
         };
 
         let draw_params = DrawTextureParams {
@@ -293,13 +334,8 @@ async fn main() {
             rotation,
             flip_x,
             flip_y,
-            pivot: if rotation != 0.0 { Some(vec2(sw/2.0, sh/2.0)) } else { None },
+            pivot,
             ..Default::default()
-        };
-
-        let (draw_x, draw_y) = match local_dir {
-            ScrollDirection::RTL | ScrollDirection::LTR => (0.0, 0.0),
-            _ => ( (sw - sh) / 2.0, (sh - sw) / 2.0 )
         };
 
         draw_texture_ex(&texture, draw_x, draw_y, WHITE, draw_params);
