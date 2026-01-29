@@ -203,7 +203,7 @@ async fn main() {
     // --- THREAD C: FACE ---
     let mut current_fft_idx = 1;
     let mut current_view_len = MAX_HISTORY;
-    let mut current_width = current_view_len; // Was using history_len before, updated logic
+    // let mut current_width = current_view_len;
     let mut current_height = RESOLUTIONS[current_fft_idx] / 2;
 
     let mut texture = Texture2D::from_image(&Image {
