@@ -202,10 +202,10 @@ async fn main() {
 
     // --- THREAD C: FACE ---
     let mut current_fft_idx = 1;
-    let mut current_view_len = MAX_HISTORY; // 1024 or 512
+    let mut current_view_len = MAX_HISTORY;
+    let mut current_width = current_view_len; // Was using history_len before, updated logic
     let mut current_height = RESOLUTIONS[current_fft_idx] / 2;
 
-    // Texture is always MAX_HISTORY wide
     let mut texture = Texture2D::from_image(&Image {
         width: MAX_HISTORY as u16, height: current_height as u16,
         bytes: vec![0; MAX_HISTORY * current_height * 4],
@@ -226,7 +226,7 @@ async fn main() {
         
         // Window Toggle [W] - Client side only state change
         if is_key_pressed(KeyCode::W) {
-            current_view_len = if current_view_len == 1024 { 512 } else { 1024 };
+            current_view_len = if current_view_len == MAX_HISTORY { 512 } else { MAX_HISTORY };
         }
 
         if visual_changed {
@@ -263,30 +263,28 @@ async fn main() {
         let sw = screen_width();
         let sh = screen_height();
         
-        // --- VIEWPORT CAMERA LOGIC ---
-        // 1. Calculate the Source Rect (The "Camera")
-        // Texture is always RTL [Old -> New]
-        // Index 0 = Oldest. Index 1023 = Newest.
-        
-        // If View=512, we want [512..1024] (The newest half)
-        let source_x = (MAX_HISTORY - current_view_len) as f32;
-        let source_w = current_view_len as f32;
-        
-        let source = Rect::new(source_x, 0.0, source_w, current_height as f32);
-
-        // 2. Calculate the Dest Rect (The Screen)
-        // Adjust for aspect ratio or rotation
-        let dest_size = match local_dir {
-            ScrollDirection::RTL | ScrollDirection::LTR => vec2(sw, sh),
-            ScrollDirection::DownToUp | ScrollDirection::UpToDown => vec2(sh, sw),
+        // --- VIEWPORT & SOURCE RECT LOGIC ---
+        // Calculate visible history based on scrolling axis dimension
+        let (visible_bins, rotation, flip_x, flip_y) = match local_dir {
+            ScrollDirection::RTL => ((sw as usize).min(current_view_len), 0.0, false, false),
+            ScrollDirection::LTR => ((sw as usize).min(current_view_len), 0.0, true, false),
+            ScrollDirection::DownToUp => ((sh as usize).min(current_view_len), std::f32::consts::FRAC_PI_2, false, false),
+            ScrollDirection::UpToDown => ((sh as usize).min(current_view_len), -std::f32::consts::FRAC_PI_2, false, true),
         };
 
-        // 3. Rotation Params
-        let (rotation, flip_x, flip_y) = match local_dir {
-            ScrollDirection::RTL => (0.0, false, false),
-            ScrollDirection::LTR => (0.0, true, false), 
-            ScrollDirection::DownToUp => (std::f32::consts::FRAC_PI_2, false, false),
-            ScrollDirection::UpToDown => (-std::f32::consts::FRAC_PI_2, false, true),
+        // Source Rect: Crop the "Oldest" (Left) part if window is small.
+        // Texture is always [Old -> New] (Left -> Right).
+        // To show "Newest" data, we start reading from (Total - Visible).
+        let source_x = (MAX_HISTORY - visible_bins) as f32;
+        
+        let source = Rect::new(source_x, 0.0, visible_bins as f32, current_height as f32);
+
+        // Dest Size: Fills the screen dimension on the scrolling axis.
+        // If sw > MAX_HISTORY, it stretches.
+        // If sw < MAX_HISTORY, it stays 1:1 (because we set visible_bins = sw).
+        let dest_size = match local_dir {
+            ScrollDirection::RTL | ScrollDirection::LTR => vec2(sw, sh),
+            ScrollDirection::DownToUp | ScrollDirection::UpToDown => vec2(sh, sw), // Swapped for rotation
         };
 
         let draw_params = DrawTextureParams {
