@@ -16,11 +16,11 @@ const SAMPLE_RATE: u32 = 44100;
 const HOP_SIZE: usize = 512;       
 
 const RESOLUTIONS: [usize; 3] = [2048, 4096, 8192];
-const MAX_HISTORY: usize = 1024; 
+const MAX_HISTORY: usize = 1260; 
 
 // The history bins will be scaled to match this target pixel width on screen.
 // 2048.0 means 1024 bins are stretched 2x to fill 2048 pixels.
-const TARGET_DISPLAY_WIDTH: f32 = 2048.0; 
+const TARGET_DISPLAY_WIDTH: f32 = 2520.0; 
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum ColorMapType { Magma, Inferno, Viridis, Plasma, Turbo, Cubehelix }
@@ -230,7 +230,7 @@ async fn main() {
         
         // Window Toggle [W] - Client side only state change
         if is_key_pressed(KeyCode::W) {
-            current_view_len = if current_view_len == MAX_HISTORY { 512 } else { MAX_HISTORY };
+            current_view_len = if current_view_len == MAX_HISTORY { MAX_HISTORY / 2 } else { MAX_HISTORY };
         }
 
         if visual_changed {
