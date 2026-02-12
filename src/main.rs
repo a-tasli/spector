@@ -1,26 +1,26 @@
 use macroquad::prelude::*;
-use ringbuf::HeapRb; 
-use spectrum_analyzer::{samples_fft_to_spectrum, FrequencyLimit}; 
+use ringbuf::HeapRb;
+use spectrum_analyzer::{samples_fft_to_spectrum, FrequencyLimit};
 use spectrum_analyzer::scaling::divide_by_N_sqrt;
-use spectrum_analyzer::windows::hann_window; 
+use spectrum_analyzer::windows::hann_window;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 use libpulse_binding::sample::{Spec, Format};
 use libpulse_binding::stream::Direction;
-use libpulse_binding::def::BufferAttr; 
+use libpulse_binding::def::BufferAttr;
 use libpulse_simple_binding::Simple;
 
 // --- CONFIG ---
 const SAMPLE_RATE: u32 = 44100;
-const HOP_SIZE: usize = 512;       
+const HOP_SIZE: usize = 512;
 
 const RESOLUTIONS: [usize; 3] = [2048, 4096, 8192];
-const MAX_HISTORY: usize = 1260; 
+const MAX_HISTORY: usize = 1260; // Matches target width for 1:1 pixel mapping potential
 
 // The history bins will be scaled to match this target pixel width on screen.
 // 2048.0 means 1024 bins are stretched 2x to fill 2048 pixels.
-const TARGET_DISPLAY_WIDTH: f32 = 2520.0; 
+const TARGET_DISPLAY_WIDTH: f32 = 2520.0;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum ColorMapType { Magma, Inferno, Viridis, Plasma, Turbo, Cubehelix }
@@ -32,14 +32,15 @@ enum ScrollDirection { RTL, LTR, DownToUp, UpToDown }
 struct AppSettings {
     mel_scale: bool,
     colormap: ColorMapType,
-    redraw_flag: bool, 
+    redraw_flag: bool,
 }
 
 struct SpectrogramLayer {
     fft_size: usize,
     freq_bins: usize,
     pixels: Vec<u8>,
-    history: Vec<f32>,
+    head: usize,         // Ring buffer write head
+    total_updates: u64,  // For smooth scrolling synchronization
 }
 
 impl SpectrogramLayer {
@@ -49,7 +50,8 @@ impl SpectrogramLayer {
             fft_size,
             freq_bins: bins,
             pixels: vec![0u8; MAX_HISTORY * bins * 4],
-            history: vec![0.0f32; MAX_HISTORY * bins],
+            head: 0,
+            total_updates: 0,
         }
     }
 }
@@ -60,7 +62,7 @@ fn window_conf() -> Conf {
         window_width: 1024,
         window_height: 768,
         high_dpi: true,
-        window_resizable: true, 
+        window_resizable: true,
         ..Default::default()
     }
 }
@@ -71,15 +73,15 @@ async fn main() {
     for &size in RESOLUTIONS.iter() {
         layers.push(SpectrogramLayer::new(size));
     }
-    
+
     let shared_layers = Arc::new(Mutex::new(layers));
-    let shared_settings = Arc::new(Mutex::new(AppSettings { 
-        mel_scale: true, 
+    let shared_settings = Arc::new(Mutex::new(AppSettings {
+        mel_scale: true,
         colormap: ColorMapType::Magma,
         redraw_flag: false,
     }));
 
-    let rb = HeapRb::<f32>::new(65536); 
+    let rb = HeapRb::<f32>::new(65536);
     let (mut producer, mut consumer) = rb.split();
 
     // --- THREAD A: RECORDER ---
@@ -92,14 +94,14 @@ async fn main() {
         let monitor = format!("{}.monitor", sink_name);
 
         let spec = Spec { format: Format::F32le, channels: 1, rate: SAMPLE_RATE };
-        let frag_size = (SAMPLE_RATE as u32 * 4 * 20) / 1000; 
+        let frag_size = (SAMPLE_RATE as u32 * 4 * 20) / 1000;
         let attr = BufferAttr {
             maxlength: u32::MAX, tlength: u32::MAX, prebuf: u32::MAX, minreq: u32::MAX,
-            fragsize: frag_size, 
+            fragsize: frag_size,
         };
 
         if let Ok(stream) = Simple::new(None, "RustySpec", Direction::Record, Some(&monitor), "Recorder", &spec, None, Some(&attr)) {
-            let mut buf = [0u8; 4096]; 
+            let mut buf = [0u8; 4096];
             loop {
                 if let Ok(_) = stream.read(&mut buf) {
                     let floats: &[f32] = unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const f32, buf.len() / 4) };
@@ -117,6 +119,13 @@ async fn main() {
         let max_fft = *RESOLUTIONS.iter().max().unwrap();
         let mut rolling_audio = vec![0.0; max_fft];
         
+        let mut pending_buffer = Vec::with_capacity(4096);
+
+        // Store float history to enable "redraws" (color changes) on existing data
+        let mut float_history: Vec<Vec<f32>> = RESOLUTIONS.iter().map(|&size| {
+            vec![0.0f32; MAX_HISTORY * (size / 2)]
+        }).collect();
+
         loop {
             // 1. Check Flags
             let mut redraw_needed = false;
@@ -126,7 +135,7 @@ async fn main() {
                 let mut s = settings_ref.lock().unwrap();
                 if s.redraw_flag {
                     redraw_needed = true;
-                    s.redraw_flag = false; 
+                    s.redraw_flag = false;
                     current_settings = Some(s.clone());
                 }
             }
@@ -134,22 +143,16 @@ async fn main() {
             // 2. Handle Redraw
             if redraw_needed {
                 if let Some(settings) = current_settings {
-                    for i in 0..RESOLUTIONS.len() {
-                        if let Ok(mut layers) = layers_ref.lock() {
-                            let layer = &mut layers[i];
-                            layer.pixels.fill(0);
-                            
-                            // Re-paint entire MAX_HISTORY in Canonical RTL order
+                    if let Ok(mut layers) = layers_ref.lock() {
+                        for (i, layer) in layers.iter_mut().enumerate() {
                             for t in 0..MAX_HISTORY {
                                 let start = t * layer.freq_bins;
-                                let slice = &layer.history[start..start + layer.freq_bins];
-                                paint_slice(&mut layer.pixels, t, slice, &settings, layer.freq_bins, layer.fft_size);
+                                let slice = &float_history[i][start..start + layer.freq_bins];
+                                paint_column_in_place(&mut layer.pixels, t, slice, &settings, layer.freq_bins, layer.fft_size);
                             }
                         }
-                        thread::yield_now();
                     }
                 }
-                continue; 
             }
 
             // 3. Audio Ingest
@@ -157,57 +160,63 @@ async fn main() {
             if num_new > 0 {
                 let mut temp = vec![0.0; num_new];
                 consumer.pop_slice(&mut temp);
-                rolling_audio.extend(temp);
+                pending_buffer.extend(temp);
+            }
+
+            // Process ALL available chunks of HOP_SIZE
+            while pending_buffer.len() >= HOP_SIZE {
+                let chunk: Vec<f32> = pending_buffer.drain(0..HOP_SIZE).collect();
+                
+                rolling_audio.extend(chunk);
                 if rolling_audio.len() > max_fft {
                     let remove = rolling_audio.len() - max_fft;
                     rolling_audio.drain(0..remove);
                 }
-            }
 
-            if num_new < HOP_SIZE {
-                thread::sleep(Duration::from_millis(1));
-                continue;
-            }
+                // 4. Processing
+                if let (Ok(mut layers), Ok(settings)) = (layers_ref.lock(), settings_ref.lock()) {
+                    for (i, layer) in layers.iter_mut().enumerate() {
+                        if rolling_audio.len() < layer.fft_size { continue; }
 
-            // 4. Processing
-            if let (Ok(mut layers), Ok(settings)) = (layers_ref.lock(), settings_ref.lock()) {
-                for layer in layers.iter_mut() {
-                    if rolling_audio.len() < layer.fft_size { continue; }
+                        let start_sample = rolling_audio.len() - layer.fft_size;
+                        let audio_slice = &rolling_audio[start_sample..];
+                        let windowed = hann_window(audio_slice);
 
-                    let start_sample = rolling_audio.len() - layer.fft_size;
-                    let audio_slice = &rolling_audio[start_sample..];
+                        if let Ok(spectrum) = samples_fft_to_spectrum(&windowed, SAMPLE_RATE, FrequencyLimit::All, Some(&divide_by_N_sqrt)) {
+                            let raw_col: Vec<f32> = spectrum.data().iter().map(|(_, v)| v.val()).collect();
 
-                    let windowed = hann_window(audio_slice);
-                    if let Ok(spectrum) = samples_fft_to_spectrum(&windowed, SAMPLE_RATE, FrequencyLimit::All, Some(&divide_by_N_sqrt)) {
-                        let raw_col: Vec<f32> = spectrum.data().iter().map(|(_, v)| v.val()).collect();
-                        
-                        // Always shift FULL history (MAX_HISTORY)
-                        // Canonical RTL: Shift Left, Write End.
-                        let h_total_len = layer.history.len();
-                        layer.history.copy_within(layer.freq_bins..h_total_len, 0);
-                        
-                        let start_idx = (MAX_HISTORY - 1) * layer.freq_bins;
-                        let copy_len = raw_col.len().min(layer.freq_bins);
-                        if start_idx + copy_len <= layer.history.len() {
-                            layer.history[start_idx..start_idx+copy_len].copy_from_slice(&raw_col[0..copy_len]);
+                            let head_idx = layer.head;
+
+                            // Save Floats
+                            let float_start = head_idx * layer.freq_bins;
+                            let copy_len = raw_col.len().min(layer.freq_bins);
+                            if float_start + copy_len <= float_history[i].len() {
+                                float_history[i][float_start..float_start+copy_len].copy_from_slice(&raw_col[0..copy_len]);
+                            }
+
+                            // Paint Pixels
+                            paint_column_in_place(&mut layer.pixels, head_idx, &raw_col, &settings, layer.freq_bins, layer.fft_size);
+
+                            // Advance Head
+                            layer.head = (layer.head + 1) % MAX_HISTORY;
+                            layer.total_updates += 1;
                         }
-
-                        // Shift Pixels
-                        let p_len = layer.pixels.len();
-                        if p_len > 4 { layer.pixels.copy_within(4..p_len, 0); }
-
-                        // Paint Newest Slice at the end
-                        paint_slice(&mut layer.pixels, MAX_HISTORY - 1, &raw_col, &settings, layer.freq_bins, layer.fft_size);
                     }
                 }
+            }
+            
+            if pending_buffer.len() < HOP_SIZE {
+                thread::sleep(Duration::from_millis(1));
             }
         }
     });
 
     // --- THREAD C: FACE ---
     let mut current_fft_idx = 1;
-    let mut current_view_len = MAX_HISTORY;
-    // let mut current_width = current_view_len;
+    let mut last_fft_idx = 1; 
+    
+    // Zoom State
+    let mut current_view_len = MAX_HISTORY; 
     let mut current_height = RESOLUTIONS[current_fft_idx] / 2;
 
     let mut texture = Texture2D::from_image(&Image {
@@ -215,20 +224,22 @@ async fn main() {
         bytes: vec![0; MAX_HISTORY * current_height * 4],
     });
     texture.set_filter(FilterMode::Linear);
-    
+
     let mut local_mel = true;
     let mut local_cmap = ColorMapType::Magma;
     let mut local_dir = ScrollDirection::RTL;
-    
+
+    // Smooth Scroll State
+    let mut smooth_head_pos: f64 = 0.0;
+
     loop {
         let mut visual_changed = false;
-        
+
         if is_key_pressed(KeyCode::S) { local_mel = !local_mel; visual_changed = true; }
         if is_key_pressed(KeyCode::C) { local_cmap = cycle_colormap(local_cmap); visual_changed = true; }
         if is_key_pressed(KeyCode::F) { local_dir = cycle_direction(local_dir); }
         if is_key_pressed(KeyCode::R) { current_fft_idx = (current_fft_idx + 1) % RESOLUTIONS.len(); }
-        
-        // Window Toggle [W] - Client side only state change
+
         if is_key_pressed(KeyCode::W) {
             current_view_len = if current_view_len == MAX_HISTORY { MAX_HISTORY / 2 } else { MAX_HISTORY };
         }
@@ -237,7 +248,7 @@ async fn main() {
             if let Ok(mut s) = shared_settings.lock() {
                 s.mel_scale = local_mel;
                 s.colormap = local_cmap;
-                s.redraw_flag = true; 
+                s.redraw_flag = true;
             }
         }
 
@@ -251,117 +262,227 @@ async fn main() {
             texture.set_filter(FilterMode::Linear);
         }
 
+        let mut actual_total_updates = 0u64;
+
         if let Ok(layers) = shared_layers.lock() {
             let layer = &layers[current_fft_idx];
-            if layer.pixels.len() == MAX_HISTORY * current_height * 4 {
-                let img = Image {
-                    width: MAX_HISTORY as u16, height: current_height as u16,
-                    bytes: layer.pixels.clone(),
-                };
-                texture.update(&img);
-            }
+            actual_total_updates = layer.total_updates;
+            
+            let img = Image {
+                width: MAX_HISTORY as u16, height: current_height as u16,
+                bytes: layer.pixels.clone(),
+            };
+            texture.update(&img);
+        }
+
+        if current_fft_idx != last_fft_idx {
+            smooth_head_pos = actual_total_updates as f64;
+            last_fft_idx = current_fft_idx;
         }
 
         clear_background(BLACK);
-
         let sw = screen_width();
         let sh = screen_height();
-        
-        // --- VIEWPORT & SOURCE RECT LOGIC ---
 
-        // 1. Identify "Flow" (Time) and "Static" (Freq) screen dimensions
+        // --- SMOOTH SCROLL LERP ---
+        let target_pos = actual_total_updates as f64;
+        smooth_head_pos += (target_pos - smooth_head_pos) * 0.15;
+        if (target_pos - smooth_head_pos).abs() > 50.0 {
+            smooth_head_pos = target_pos; 
+        }
+        
+        let head_offset = (smooth_head_pos % MAX_HISTORY as f64) as f32;
+
+        // --- VIEWPORT & CROP LOGIC ---
         let (screen_time_dim, screen_freq_dim) = match local_dir {
             ScrollDirection::RTL | ScrollDirection::LTR => (sw, sh),
             ScrollDirection::DownToUp | ScrollDirection::UpToDown => (sh, sw),
         };
 
-        // 2. Determine Scale Factor based on Target and Current View Mode
-        //    Logic: We want 'current_view_len' (e.g., 1024 or 512) to cover 'TARGET_DISPLAY_WIDTH' pixels.
-        //    This creates a constant density relative to the target width.
         let scale_factor = TARGET_DISPLAY_WIDTH / (current_view_len as f32);
-
-        // 3. Calculate how many texture pixels are needed to fill the current screen
         let needed_source_w = screen_time_dim / scale_factor;
 
-        // 4. Calculate final Source and Dest rects
         let (final_source_w, final_dest_w) = if needed_source_w <= current_view_len as f32 {
-            // Screen is small: Fill the screen, crop the source.
             (needed_source_w, screen_time_dim)
         } else {
-            // Screen is larger than Target: Show all data, STRETCH to fill screen.
-            // We NO LONGER cap at TARGET_DISPLAY_WIDTH.
             (current_view_len as f32, screen_time_dim)
         };
 
-        // 5. Source Rect
-        //    Grab the NEWEST 'final_source_w' pixels.
-        //    Texture writes Left->Right (Old->New). Newest is at MAX_HISTORY.
-        let source_x = (MAX_HISTORY as f32) - final_source_w;
-        let source = Rect::new(source_x, 0.0, final_source_w, current_height as f32);
+        let start_pos_unwrapped = head_offset - final_source_w;
+        let tex_w = MAX_HISTORY as f32;
+        let tex_h = current_height as f32;
 
-        // 6. Dest Size
-        //    Time axis = final_dest_w (Screen Width)
-        //    Freq axis = screen_freq_dim (Always stretches to fill)
-        let dest_size = vec2(final_dest_w, screen_freq_dim);
-
-        // 7. Rotation & Centering
-        let (rotation, flip_x, flip_y) = match local_dir {
-            ScrollDirection::RTL => (0.0, false, false),
-            ScrollDirection::LTR => (0.0, true, false),
-            ScrollDirection::DownToUp => (std::f32::consts::FRAC_PI_2, false, false),
-            ScrollDirection::UpToDown => (-std::f32::consts::FRAC_PI_2, false, true),
+        // --- RENDERING ---
+        let is_horizontal = match local_dir {
+            ScrollDirection::RTL | ScrollDirection::LTR => true,
+            _ => false
         };
 
-        // Centering Logic
-        // Since final_dest_w is now always screen_time_dim, dest_size matches the screen.
-        // Thus offsets will be 0.0, effectively removing "centering" for the stretch case.
-        let (draw_x, draw_y, pivot) = match local_dir {
-            ScrollDirection::RTL | ScrollDirection::LTR => (
-                (sw - dest_size.x) / 2.0, 
-                0.0, 
-                None 
-            ),
-            _ => ( 
-                (sw - dest_size.x) / 2.0, 
-                (sh - dest_size.y) / 2.0, 
-                Some(vec2(sw/2.0, sh/2.0)) 
-            ),
+        // Determine segments based on wrap-around
+        let (src1, src2) = if start_pos_unwrapped < 0.0 {
+            let overflow = start_pos_unwrapped.abs();
+            let s1 = Rect::new(tex_w - overflow, 0.0, overflow, tex_h);
+            let s2 = Rect::new(0.0, 0.0, head_offset, tex_h);
+            (Some(s1), Some(s2))
+        } else {
+            let s1 = Rect::new(start_pos_unwrapped, 0.0, final_source_w, tex_h);
+            (Some(s1), None)
         };
 
-        let draw_params = DrawTextureParams {
-            dest_size: Some(dest_size),
-            source: Some(source),
-            rotation,
-            flip_x,
-            flip_y,
-            pivot,
-            ..Default::default()
-        };
+        let dst1_len = src1.map(|r| r.w * scale_factor).unwrap_or(0.0);
+        let dst2_len = src2.map(|r| r.w * scale_factor).unwrap_or(0.0);
+        
+        // Center the visualization in the time axis
+        let total_draw_len = dst1_len + dst2_len;
+        let start_pos_screen = (screen_time_dim - total_draw_len) / 2.0;
 
-        draw_texture_ex(&texture, draw_x, draw_y, WHITE, draw_params);
+        if is_horizontal {
+            // --- HORIZONTAL MODE ---
+            let is_ltr = local_dir == ScrollDirection::LTR;
+            let flip_x = is_ltr;
+
+            if is_ltr {
+                // LTR: Swap order -> Draw s2 (New/Left) then s1 (Old/Right)
+                if let Some(s2) = src2 {
+                    draw_texture_ex(&texture, start_pos_screen, 0.0, WHITE, DrawTextureParams {
+                        dest_size: Some(vec2(dst2_len, sh)),
+                        source: Some(s2),
+                        flip_x,
+                        ..Default::default()
+                    });
+                }
+
+                if let Some(s1) = src1 {
+                    // Draw s1 after s2
+                    draw_texture_ex(&texture, start_pos_screen + dst2_len, 0.0, WHITE, DrawTextureParams {
+                        dest_size: Some(vec2(dst1_len, sh)), 
+                        source: Some(s1),
+                        flip_x,
+                        ..Default::default()
+                    });
+                }
+            } else {
+                // RTL (Standard): Draw s1 (Old/Left) then s2 (New/Right)
+                if let Some(s1) = src1 {
+                    draw_texture_ex(&texture, start_pos_screen, 0.0, WHITE, DrawTextureParams {
+                        dest_size: Some(vec2(dst1_len, sh)), 
+                        source: Some(s1),
+                        flip_x,
+                        ..Default::default()
+                    });
+                }
+
+                if let Some(s2) = src2 {
+                    draw_texture_ex(&texture, start_pos_screen + dst1_len, 0.0, WHITE, DrawTextureParams {
+                        dest_size: Some(vec2(dst2_len, sh)),
+                        source: Some(s2),
+                        flip_x,
+                        ..Default::default()
+                    });
+                }
+            }
+
+        } else {
+            // --- VERTICAL MODE ---
+            // Manual rotation math to prevent scaling bugs.
+            
+            let is_fire = local_dir == ScrollDirection::DownToUp;
+
+            if is_fire {
+                // DownToUp (Fire)
+                // Newest data appears at Bottom, pushes Up.
+                // Time axis: Top (Old) -> Bottom (New).
+                // Rotation: 90 deg (PI/2).
+                
+                // Seg1 (Old) first.
+                if let Some(s1) = src1 {
+                    let h = dst1_len;
+                    let x = (sw - h) / 2.0;
+                    let y = start_pos_screen + (h - sw) / 2.0;
+                    
+                    draw_texture_ex(&texture, x, y, WHITE, DrawTextureParams {
+                        dest_size: Some(vec2(h, sw)),
+                        source: Some(s1),
+                        rotation: std::f32::consts::FRAC_PI_2,
+                        ..Default::default()
+                    });
+                }
+                
+                // Seg2 (New) second.
+                if let Some(s2) = src2 {
+                    let h = dst2_len;
+                    let y_offset = start_pos_screen + dst1_len;
+                    
+                    let x = (sw - h) / 2.0;
+                    let y = y_offset + (h - sw) / 2.0;
+
+                    draw_texture_ex(&texture, x, y, WHITE, DrawTextureParams {
+                        dest_size: Some(vec2(h, sw)),
+                        source: Some(s2),
+                        rotation: std::f32::consts::FRAC_PI_2,
+                        ..Default::default()
+                    });
+                }
+            } else {
+                // UpToDown (Rain)
+                // Newest at Top. Oldest at Bottom.
+                // Seg2 (New) first (Top). Seg1 (Old) second (Bottom).
+                // Rotation: -90 deg (-PI/2). FlipY: True.
+
+                if let Some(s2) = src2 {
+                    let h = dst2_len;
+                    let x = (sw - h) / 2.0;
+                    let y = start_pos_screen + (h - sw) / 2.0;
+
+                    draw_texture_ex(&texture, x, y, WHITE, DrawTextureParams {
+                        dest_size: Some(vec2(h, sw)),
+                        source: Some(s2),
+                        rotation: -std::f32::consts::FRAC_PI_2,
+                        flip_y: true,
+                        ..Default::default()
+                    });
+                }
+
+                if let Some(s1) = src1 {
+                    let h = dst1_len;
+                    let y_offset = start_pos_screen + dst2_len;
+                    
+                    let x = (sw - h) / 2.0;
+                    let y = y_offset + (h - sw) / 2.0;
+
+                    draw_texture_ex(&texture, x, y, WHITE, DrawTextureParams {
+                        dest_size: Some(vec2(h, sw)),
+                        source: Some(s1),
+                        rotation: -std::f32::consts::FRAC_PI_2,
+                        flip_y: true,
+                        ..Default::default()
+                    });
+                }
+            }
+        }
 
         draw_note_ruler(local_mel, local_dir, RESOLUTIONS[current_fft_idx]);
         draw_ui_overlay(local_mel, local_cmap, local_dir, RESOLUTIONS[current_fft_idx], current_view_len);
-        
+
         next_frame().await
     }
 }
 
 // --- HELPERS ---
-
-fn paint_slice(pixels: &mut Vec<u8>, pos_index: usize, data: &[f32], settings: &AppSettings, freq_bins: usize, fft_size: usize) {
+fn paint_column_in_place(pixels: &mut Vec<u8>, col_idx: usize, data: &[f32], settings: &AppSettings, freq_bins: usize, fft_size: usize) {
     let gradient = get_gradient(settings.colormap);
     let max_freq_idx = data.len();
     let mel_min = 0.0;
     let mel_max = 2595.0 * (1.0 + (SAMPLE_RATE as f32 / 2.0) / 700.0).log10();
 
+    let x_offset = col_idx * 4;
+
     for i in 0..freq_bins {
         let norm_i = i as f32 / freq_bins as f32;
-        
         let target_idx = if settings.mel_scale {
             let mel = norm_i * (mel_max - mel_min) + mel_min;
             let freq = 700.0 * (10.0f32.powf(mel / 2595.0) - 1.0);
-            let idx = freq / (SAMPLE_RATE as f32 / fft_size as f32); 
+            let idx = freq / (SAMPLE_RATE as f32 / fft_size as f32);
             idx as usize
         } else {
             (norm_i * max_freq_idx as f32) as usize
@@ -369,12 +490,11 @@ fn paint_slice(pixels: &mut Vec<u8>, pos_index: usize, data: &[f32], settings: &
 
         let safe_idx = target_idx.min(max_freq_idx - 1);
         let magnitude = data[safe_idx];
-        let intensity = (magnitude * 2000.0).ln() / 8.0; 
+        let intensity = (magnitude * 2000.0).ln() / 8.0;
         let c = gradient.eval_continuous(intensity.clamp(0.0, 1.0) as f64);
 
-        let x = pos_index; 
-        let y = (freq_bins - 1) - i; 
-        let idx = (y * MAX_HISTORY + x) * 4;
+        let y = (freq_bins - 1) - i;
+        let idx = (y * MAX_HISTORY * 4) + x_offset;
 
         if idx + 3 < pixels.len() {
             pixels[idx] = c.r;
@@ -495,8 +615,6 @@ fn draw_ui_overlay(mel: bool, cmap: ColorMapType, dir: ScrollDirection, fft: usi
 
     let (bg_x, bg_y, bg_w, bg_h, is_vertical) = match dir {
         ScrollDirection::RTL | ScrollDirection::LTR => (0.0, 0.0, screen_width(), 30.0, false),
-        // Position at TOP-RIGHT, TIGHTER fit
-        // Box Width = 220, X = Screen - 230
         _ => (screen_width() - 200.0, 0.0, 220.0, 112.0, true),
     };
 
@@ -508,11 +626,6 @@ fn draw_ui_overlay(mel: bool, cmap: ColorMapType, dir: ScrollDirection, fft: usi
     for stat in stats {
         let full_label = format!("{}:", stat.label);
         
-        if !is_vertical {
-            // Horizontal padding logic (40px)
-            // Just draw, then increment. No fixed segment math.
-        }
-
         draw_text(&full_label, cursor_x, cursor_y, 20.0, WHITE);
 
         if let Some(c) = stat.hotkey {
