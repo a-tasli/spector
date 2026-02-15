@@ -95,7 +95,8 @@ async fn main() {
         let monitor = format!("{}.monitor", sink_name);
 
         let spec = Spec { format: Format::F32le, channels: 1, rate: SAMPLE_RATE };
-        let frag_size = (SAMPLE_RATE as u32 * 4 * 20) / 1000;
+        // Reduced frag_size to 10ms (was 20ms) to improve input latency
+        let frag_size = (SAMPLE_RATE as u32 * 4 * 10) / 1000;
         let attr = BufferAttr {
             maxlength: u32::MAX, tlength: u32::MAX, prebuf: u32::MAX, minreq: u32::MAX,
             fragsize: frag_size,
@@ -271,16 +272,22 @@ async fn main() {
             let layer = &layers[current_fft_idx];
             actual_total_updates = layer.total_updates;
             
+            // --- JUMP FIX: Relative Offset Logic ---
+            // When switching resolutions, we offset smooth_head_pos by the exact difference
+            // between the new and old layer heads. This preserves the visual phase/lag
+            // so the spectrogram doesn't jump backwards or forwards.
+            if current_fft_idx != last_fft_idx {
+                let prev_updates = layers[last_fft_idx].total_updates;
+                let diff = actual_total_updates as f64 - prev_updates as f64;
+                smooth_head_pos += diff;
+                last_fft_idx = current_fft_idx;
+            }
+
             let img = Image {
                 width: MAX_HISTORY as u16, height: current_height as u16,
                 bytes: layer.pixels.clone(),
             };
             texture.update(&img);
-        }
-
-        if current_fft_idx != last_fft_idx {
-            smooth_head_pos = actual_total_updates as f64;
-            last_fft_idx = current_fft_idx;
         }
 
         clear_background(BLACK);
@@ -289,7 +296,11 @@ async fn main() {
 
         // --- SMOOTH SCROLL LERP ---
         let target_pos = actual_total_updates as f64;
-        smooth_head_pos += (target_pos - smooth_head_pos) * 0.15;
+        
+        // Tuned for lower visual latency (0.15 -> 0.5)
+        // Higher value = snappier, less lag, less "floaty"
+        smooth_head_pos += (target_pos - smooth_head_pos) * 0.5;
+
         if (target_pos - smooth_head_pos).abs() > 50.0 {
             smooth_head_pos = target_pos; 
         }
