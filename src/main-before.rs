@@ -16,11 +16,10 @@ const SAMPLE_RATE: u32 = 44100;
 const HOP_SIZE: usize = 512;
 
 const RESOLUTIONS: [usize; 3] = [2048, 4096, 8192];
-const MAX_HISTORY: usize = 2520; 
+const MAX_HISTORY: usize = 1260; // Matches target width for 1:1 pixel mapping potential
 
-// Target Width is freely settable.
-// The Jitter fix (Source Snapping) below ensures this doesn't cause shimmering
-// even if this doesn't match MAX_HISTORY 1:1.
+// The history bins will be scaled to match this target pixel width on screen.
+// 2048.0 means 1024 bins are stretched 2x to fill 2048 pixels.
 const TARGET_DISPLAY_WIDTH: f32 = 2520.0;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -224,8 +223,6 @@ async fn main() {
         width: MAX_HISTORY as u16, height: current_height as u16,
         bytes: vec![0; MAX_HISTORY * current_height * 4],
     });
-    
-    // Keep Linear for smooth gradients, but we snap coordinates to fix jitter.
     texture.set_filter(FilterMode::Linear);
 
     let mut local_mel = true;
@@ -294,14 +291,7 @@ async fn main() {
             smooth_head_pos = target_pos; 
         }
         
-        // --- JITTER FIX: COORDINATE SNAPPING ---
-        // Instead of using floating point modulo directly for the slice,
-        // we floor the head position. This snaps the "Source" texture lookup
-        // to integer boundaries.
-        // The "Destination" (Screen) rects remain floats, allowing smooth sub-pixel motion across the screen,
-        // but the texture sampler is locked to the grid, preventing interpolation shimmer.
-        let head_snapped = (smooth_head_pos % MAX_HISTORY as f64).floor() as f32;
-        let head_offset = head_snapped;
+        let head_offset = (smooth_head_pos % MAX_HISTORY as f64) as f32;
 
         // --- VIEWPORT & CROP LOGIC ---
         let (screen_time_dim, screen_freq_dim) = match local_dir {
@@ -318,10 +308,7 @@ async fn main() {
             (current_view_len as f32, screen_time_dim)
         };
 
-        // Also floor the source width to prevent flickering at the trailing edge
-        let final_source_w_snapped = final_source_w.round();
-
-        let start_pos_unwrapped = head_offset - final_source_w_snapped;
+        let start_pos_unwrapped = head_offset - final_source_w;
         let tex_w = MAX_HISTORY as f32;
         let tex_h = current_height as f32;
 
@@ -338,11 +325,10 @@ async fn main() {
             let s2 = Rect::new(0.0, 0.0, head_offset, tex_h);
             (Some(s1), Some(s2))
         } else {
-            let s1 = Rect::new(start_pos_unwrapped, 0.0, final_source_w_snapped, tex_h);
+            let s1 = Rect::new(start_pos_unwrapped, 0.0, final_source_w, tex_h);
             (Some(s1), None)
         };
 
-        // Destination Lengths (Screen Space) - These remain floats for smooth movement
         let dst1_len = src1.map(|r| r.w * scale_factor).unwrap_or(0.0);
         let dst2_len = src2.map(|r| r.w * scale_factor).unwrap_or(0.0);
         
@@ -398,7 +384,7 @@ async fn main() {
 
         } else {
             // --- VERTICAL MODE ---
-            // Manual rotation math from main-before.rs (preserved)
+            // Manual rotation math to prevent scaling bugs.
             
             let is_fire = local_dir == ScrollDirection::DownToUp;
 
