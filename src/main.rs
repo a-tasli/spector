@@ -16,11 +16,11 @@ const SAMPLE_RATE: u32 = 44100;
 const HOP_SIZE: usize = 512;
 
 const RESOLUTIONS: [usize; 3] = [2048, 4096, 8192];
+
+// REVERTED: Back to 1260 to save CPU (20MB vs 40MB texture upload per frame).
+// The coordinate snapping logic below prevents jitter even with this smaller buffer.
 const MAX_HISTORY: usize = 2520; 
 
-// Target Width is freely settable.
-// The Jitter fix (Source Snapping) below ensures this doesn't cause shimmering
-// even if this doesn't match MAX_HISTORY 1:1.
 const TARGET_DISPLAY_WIDTH: f32 = 2520.0;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -96,7 +96,7 @@ async fn main() {
 
         let spec = Spec { format: Format::F32le, channels: 1, rate: SAMPLE_RATE };
         // Reduced frag_size to 10ms (was 20ms) to improve input latency
-        let frag_size = (SAMPLE_RATE as u32 * 4 * 10) / 1000;
+        let frag_size = (SAMPLE_RATE as u32 * 4 * 15) / 1000;
         let attr = BufferAttr {
             maxlength: u32::MAX, tlength: u32::MAX, prebuf: u32::MAX, minreq: u32::MAX,
             fragsize: frag_size,
