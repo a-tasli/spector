@@ -16,11 +16,7 @@ const SAMPLE_RATE: u32 = 44100;
 const HOP_SIZE: usize = 512;
 
 const RESOLUTIONS: [usize; 3] = [2048, 4096, 8192];
-
-// REVERTED: Back to 1260 to save CPU (20MB vs 40MB texture upload per frame).
-// The coordinate snapping logic below prevents jitter even with this smaller buffer.
 const MAX_HISTORY: usize = 2520; 
-
 const TARGET_DISPLAY_WIDTH: f32 = 2520.0;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -36,12 +32,44 @@ struct AppSettings {
     redraw_flag: bool,
 }
 
+// Optimization: Pre-calculated Color Lookup Table
+struct ColorLut {
+    bytes: Vec<[u8; 3]>, // Stores R,G,B for inputs 0..=255
+}
+
+impl ColorLut {
+    fn new(map_type: ColorMapType) -> Self {
+        let gradient = match map_type {
+            ColorMapType::Magma => colorous::MAGMA,
+            ColorMapType::Inferno => colorous::INFERNO,
+            ColorMapType::Viridis => colorous::VIRIDIS,
+            ColorMapType::Plasma => colorous::PLASMA,
+            ColorMapType::Turbo => colorous::TURBO,
+            ColorMapType::Cubehelix => colorous::CUBEHELIX,
+        };
+
+        let mut bytes = Vec::with_capacity(256);
+        for i in 0..=255 {
+            let val = i as f64 / 255.0;
+            let c = gradient.eval_continuous(val);
+            bytes.push([c.r, c.g, c.b]);
+        }
+        Self { bytes }
+    }
+
+    #[inline(always)]
+    fn get_color(&self, intensity: f32) -> [u8; 3] {
+        let idx = (intensity.clamp(0.0, 1.0) * 255.0) as usize;
+        self.bytes[idx]
+    }
+}
+
 struct SpectrogramLayer {
     fft_size: usize,
     freq_bins: usize,
     pixels: Vec<u8>,
-    head: usize,         // Ring buffer write head
-    total_updates: u64,  // For smooth scrolling synchronization
+    head: usize,         
+    total_updates: u64, 
 }
 
 impl SpectrogramLayer {
@@ -95,7 +123,6 @@ async fn main() {
         let monitor = format!("{}.monitor", sink_name);
 
         let spec = Spec { format: Format::F32le, channels: 1, rate: SAMPLE_RATE };
-        // Reduced frag_size to 10ms (was 20ms) to improve input latency
         let frag_size = (SAMPLE_RATE as u32 * 4 * 15) / 1000;
         let attr = BufferAttr {
             maxlength: u32::MAX, tlength: u32::MAX, prebuf: u32::MAX, minreq: u32::MAX,
@@ -120,44 +147,53 @@ async fn main() {
     thread::spawn(move || {
         let max_fft = *RESOLUTIONS.iter().max().unwrap();
         let mut rolling_audio = vec![0.0; max_fft];
-        
         let mut pending_buffer = Vec::with_capacity(4096);
 
-        // Store float history to enable "redraws" (color changes) on existing data
+        // Store float history for redraws
         let mut float_history: Vec<Vec<f32>> = RESOLUTIONS.iter().map(|&size| {
             vec![0.0f32; MAX_HISTORY * (size / 2)]
         }).collect();
 
+        // Local LUT cache to avoid creating it every pixel
+        let mut current_lut_type = ColorMapType::Magma;
+        let mut lut = ColorLut::new(current_lut_type);
+
         loop {
-            // 1. Check Flags
-            let mut redraw_needed = false;
-            let mut current_settings = None;
+            // 1. Check Flags & Redraw
+            let mut local_settings = None;
+            let mut redraw_requested = false;
 
             {
                 let mut s = settings_ref.lock().unwrap();
                 if s.redraw_flag {
-                    redraw_needed = true;
+                    redraw_requested = true;
                     s.redraw_flag = false;
-                    current_settings = Some(s.clone());
+                    // Update local LUT if needed
+                    if s.colormap != current_lut_type {
+                        current_lut_type = s.colormap;
+                        lut = ColorLut::new(current_lut_type);
+                    }
                 }
+                // Clone settings for use outside lock
+                local_settings = Some(s.clone());
             }
 
-            // 2. Handle Redraw
-            if redraw_needed {
-                if let Some(settings) = current_settings {
-                    if let Ok(mut layers) = layers_ref.lock() {
-                        for (i, layer) in layers.iter_mut().enumerate() {
-                            for t in 0..MAX_HISTORY {
-                                let start = t * layer.freq_bins;
-                                let slice = &float_history[i][start..start + layer.freq_bins];
-                                paint_column_in_place(&mut layer.pixels, t, slice, &settings, layer.freq_bins, layer.fft_size);
-                            }
+            let settings = local_settings.unwrap();
+
+            // Handle Redraw (Expensive but infrequent)
+            if redraw_requested {
+                if let Ok(mut layers) = layers_ref.lock() {
+                    for (i, layer) in layers.iter_mut().enumerate() {
+                        for t in 0..MAX_HISTORY {
+                            let start = t * layer.freq_bins;
+                            let slice = &float_history[i][start..start + layer.freq_bins];
+                            paint_column_fast(&mut layer.pixels, t, slice, &settings, &lut, layer.freq_bins, layer.fft_size);
                         }
                     }
                 }
             }
 
-            // 3. Audio Ingest
+            // 2. Audio Ingest
             let num_new = consumer.len();
             if num_new > 0 {
                 let mut temp = vec![0.0; num_new];
@@ -165,7 +201,7 @@ async fn main() {
                 pending_buffer.extend(temp);
             }
 
-            // Process ALL available chunks of HOP_SIZE
+            // 3. Processing
             while pending_buffer.len() >= HOP_SIZE {
                 let chunk: Vec<f32> = pending_buffer.drain(0..HOP_SIZE).collect();
                 
@@ -175,31 +211,52 @@ async fn main() {
                     rolling_audio.drain(0..remove);
                 }
 
-                // 4. Processing
-                if let (Ok(mut layers), Ok(settings)) = (layers_ref.lock(), settings_ref.lock()) {
-                    for (i, layer) in layers.iter_mut().enumerate() {
-                        if rolling_audio.len() < layer.fft_size { continue; }
+                // Prepare Data Containers to avoid holding lock during FFT
+                struct UpdateData {
+                    idx: usize,
+                    raw_col: Vec<f32>,
+                    bins: usize,
+                    fft: usize,
+                }
+                let mut updates: Vec<UpdateData> = Vec::with_capacity(RESOLUTIONS.len());
 
-                        let start_sample = rolling_audio.len() - layer.fft_size;
-                        let audio_slice = &rolling_audio[start_sample..];
-                        let windowed = hann_window(audio_slice);
+                // STEP A: Calculate FFTs (No Lock)
+                for (i, size) in RESOLUTIONS.iter().enumerate() {
+                    if rolling_audio.len() < *size { continue; }
+                    
+                    let start_sample = rolling_audio.len() - size;
+                    let audio_slice = &rolling_audio[start_sample..];
+                    let windowed = hann_window(audio_slice);
 
-                        if let Ok(spectrum) = samples_fft_to_spectrum(&windowed, SAMPLE_RATE, FrequencyLimit::All, Some(&divide_by_N_sqrt)) {
-                            let raw_col: Vec<f32> = spectrum.data().iter().map(|(_, v)| v.val()).collect();
+                    if let Ok(spectrum) = samples_fft_to_spectrum(&windowed, SAMPLE_RATE, FrequencyLimit::All, Some(&divide_by_N_sqrt)) {
+                        let raw_col: Vec<f32> = spectrum.data().iter().map(|(_, v)| v.val()).collect();
+                        updates.push(UpdateData { 
+                            idx: i, 
+                            raw_col, 
+                            bins: *size / 2, 
+                            fft: *size 
+                        });
+                    }
+                }
 
+                // STEP B: Update State (Lock)
+                // We only lock when we are ready to write pixels
+                if !updates.is_empty() {
+                    if let Ok(mut layers) = layers_ref.lock() {
+                        for up in updates {
+                            let layer = &mut layers[up.idx];
                             let head_idx = layer.head;
 
-                            // Save Floats
+                            // Save Floats to history
                             let float_start = head_idx * layer.freq_bins;
-                            let copy_len = raw_col.len().min(layer.freq_bins);
-                            if float_start + copy_len <= float_history[i].len() {
-                                float_history[i][float_start..float_start+copy_len].copy_from_slice(&raw_col[0..copy_len]);
+                            let copy_len = up.raw_col.len().min(layer.freq_bins);
+                            if float_start + copy_len <= float_history[up.idx].len() {
+                                float_history[up.idx][float_start..float_start+copy_len].copy_from_slice(&up.raw_col[0..copy_len]);
                             }
 
-                            // Paint Pixels
-                            paint_column_in_place(&mut layer.pixels, head_idx, &raw_col, &settings, layer.freq_bins, layer.fft_size);
+                            // Paint Pixels using LUT
+                            paint_column_fast(&mut layer.pixels, head_idx, &up.raw_col, &settings, &lut, layer.freq_bins, layer.fft_size);
 
-                            // Advance Head
                             layer.head = (layer.head + 1) % MAX_HISTORY;
                             layer.total_updates += 1;
                         }
@@ -216,8 +273,6 @@ async fn main() {
     // --- THREAD C: FACE ---
     let mut current_fft_idx = 1;
     let mut last_fft_idx = 1; 
-    
-    // Zoom State
     let mut current_view_len = MAX_HISTORY; 
     let mut current_height = RESOLUTIONS[current_fft_idx] / 2;
 
@@ -225,15 +280,11 @@ async fn main() {
         width: MAX_HISTORY as u16, height: current_height as u16,
         bytes: vec![0; MAX_HISTORY * current_height * 4],
     });
-    
-    // Keep Linear for smooth gradients, but we snap coordinates to fix jitter.
     texture.set_filter(FilterMode::Linear);
 
     let mut local_mel = true;
     let mut local_cmap = ColorMapType::Magma;
     let mut local_dir = ScrollDirection::RTL;
-
-    // Smooth Scroll State
     let mut smooth_head_pos: f64 = 0.0;
 
     loop {
@@ -268,24 +319,31 @@ async fn main() {
 
         let mut actual_total_updates = 0u64;
 
-        if let Ok(layers) = shared_layers.lock() {
-            let layer = &layers[current_fft_idx];
-            actual_total_updates = layer.total_updates;
-            
-            // --- JUMP FIX: Relative Offset Logic ---
-            // When switching resolutions, we offset smooth_head_pos by the exact difference
-            // between the new and old layer heads. This preserves the visual phase/lag
-            // so the spectrogram doesn't jump backwards or forwards.
-            if current_fft_idx != last_fft_idx {
-                let prev_updates = layers[last_fft_idx].total_updates;
-                let diff = actual_total_updates as f64 - prev_updates as f64;
-                smooth_head_pos += diff;
-                last_fft_idx = current_fft_idx;
+        // Scope the lock to just data extraction to free it up for the audio thread
+        let pixels_clone = {
+            if let Ok(layers) = shared_layers.lock() {
+                let layer = &layers[current_fft_idx];
+                actual_total_updates = layer.total_updates;
+                
+                if current_fft_idx != last_fft_idx {
+                    let prev_updates = layers[last_fft_idx].total_updates;
+                    let diff = actual_total_updates as f64 - prev_updates as f64;
+                    smooth_head_pos += diff;
+                    last_fft_idx = current_fft_idx;
+                }
+                // We must clone here because Texture update needs an Image which needs ownership.
+                // Optimizing this would require using raw miniquad bindings or unsafe, 
+                // but by releasing the lock immediately, we prevent audio stutter.
+                Some(layer.pixels.clone())
+            } else {
+                None
             }
+        };
 
-            let img = Image {
+        if let Some(px) = pixels_clone {
+             let img = Image {
                 width: MAX_HISTORY as u16, height: current_height as u16,
-                bytes: layer.pixels.clone(),
+                bytes: px,
             };
             texture.update(&img);
         }
@@ -294,27 +352,14 @@ async fn main() {
         let sw = screen_width();
         let sh = screen_height();
 
-        // --- SMOOTH SCROLL LERP ---
+        // --- SMOOTH SCROLL ---
         let target_pos = actual_total_updates as f64;
-        
-        // Tuned for lower visual latency (0.15 -> 0.5)
-        // Higher value = snappier, less lag, less "floaty"
         smooth_head_pos += (target_pos - smooth_head_pos) * 0.5;
-
-        if (target_pos - smooth_head_pos).abs() > 50.0 {
-            smooth_head_pos = target_pos; 
-        }
+        if (target_pos - smooth_head_pos).abs() > 50.0 { smooth_head_pos = target_pos; }
         
-        // --- JITTER FIX: COORDINATE SNAPPING ---
-        // Instead of using floating point modulo directly for the slice,
-        // we floor the head position. This snaps the "Source" texture lookup
-        // to integer boundaries.
-        // The "Destination" (Screen) rects remain floats, allowing smooth sub-pixel motion across the screen,
-        // but the texture sampler is locked to the grid, preventing interpolation shimmer.
         let head_snapped = (smooth_head_pos % MAX_HISTORY as f64).floor() as f32;
         let head_offset = head_snapped;
 
-        // --- VIEWPORT & CROP LOGIC ---
         let (screen_time_dim, screen_freq_dim) = match local_dir {
             ScrollDirection::RTL | ScrollDirection::LTR => (sw, sh),
             ScrollDirection::DownToUp | ScrollDirection::UpToDown => (sh, sw),
@@ -323,26 +368,22 @@ async fn main() {
         let scale_factor = TARGET_DISPLAY_WIDTH / (current_view_len as f32);
         let needed_source_w = screen_time_dim / scale_factor;
 
-        let (final_source_w, final_dest_w) = if needed_source_w <= current_view_len as f32 {
+        let (final_source_w, _) = if needed_source_w <= current_view_len as f32 {
             (needed_source_w, screen_time_dim)
         } else {
             (current_view_len as f32, screen_time_dim)
         };
 
-        // Also floor the source width to prevent flickering at the trailing edge
         let final_source_w_snapped = final_source_w.round();
-
         let start_pos_unwrapped = head_offset - final_source_w_snapped;
         let tex_w = MAX_HISTORY as f32;
         let tex_h = current_height as f32;
 
-        // --- RENDERING ---
         let is_horizontal = match local_dir {
             ScrollDirection::RTL | ScrollDirection::LTR => true,
             _ => false
         };
 
-        // Determine segments based on wrap-around
         let (src1, src2) = if start_pos_unwrapped < 0.0 {
             let overflow = start_pos_unwrapped.abs();
             let s1 = Rect::new(tex_w - overflow, 0.0, overflow, tex_h);
@@ -353,134 +394,75 @@ async fn main() {
             (Some(s1), None)
         };
 
-        // Destination Lengths (Screen Space) - These remain floats for smooth movement
         let dst1_len = src1.map(|r| r.w * scale_factor).unwrap_or(0.0);
         let dst2_len = src2.map(|r| r.w * scale_factor).unwrap_or(0.0);
-        
-        // Center the visualization in the time axis
         let total_draw_len = dst1_len + dst2_len;
         let start_pos_screen = (screen_time_dim - total_draw_len) / 2.0;
 
+        // --- DRAWING ---
         if is_horizontal {
-            // --- HORIZONTAL MODE ---
             let is_ltr = local_dir == ScrollDirection::LTR;
             let flip_x = is_ltr;
 
             if is_ltr {
-                // LTR: Swap order -> Draw s2 (New/Left) then s1 (Old/Right)
                 if let Some(s2) = src2 {
                     draw_texture_ex(&texture, start_pos_screen, 0.0, WHITE, DrawTextureParams {
-                        dest_size: Some(vec2(dst2_len, sh)),
-                        source: Some(s2),
-                        flip_x,
-                        ..Default::default()
+                        dest_size: Some(vec2(dst2_len, sh)), source: Some(s2), flip_x, ..Default::default()
                     });
                 }
-
                 if let Some(s1) = src1 {
-                    // Draw s1 after s2
                     draw_texture_ex(&texture, start_pos_screen + dst2_len, 0.0, WHITE, DrawTextureParams {
-                        dest_size: Some(vec2(dst1_len, sh)), 
-                        source: Some(s1),
-                        flip_x,
-                        ..Default::default()
+                        dest_size: Some(vec2(dst1_len, sh)), source: Some(s1), flip_x, ..Default::default()
                     });
                 }
             } else {
-                // RTL (Standard): Draw s1 (Old/Left) then s2 (New/Right)
                 if let Some(s1) = src1 {
                     draw_texture_ex(&texture, start_pos_screen, 0.0, WHITE, DrawTextureParams {
-                        dest_size: Some(vec2(dst1_len, sh)), 
-                        source: Some(s1),
-                        flip_x,
-                        ..Default::default()
+                        dest_size: Some(vec2(dst1_len, sh)), source: Some(s1), flip_x, ..Default::default()
                     });
                 }
-
                 if let Some(s2) = src2 {
                     draw_texture_ex(&texture, start_pos_screen + dst1_len, 0.0, WHITE, DrawTextureParams {
-                        dest_size: Some(vec2(dst2_len, sh)),
-                        source: Some(s2),
-                        flip_x,
-                        ..Default::default()
+                        dest_size: Some(vec2(dst2_len, sh)), source: Some(s2), flip_x, ..Default::default()
                     });
                 }
             }
-
         } else {
-            // --- VERTICAL MODE ---
-            // Manual rotation math from main-before.rs (preserved)
-            
             let is_fire = local_dir == ScrollDirection::DownToUp;
-
             if is_fire {
-                // DownToUp (Fire)
-                // Newest data appears at Bottom, pushes Up.
-                // Time axis: Top (Old) -> Bottom (New).
-                // Rotation: 90 deg (PI/2).
-                
-                // Seg1 (Old) first.
                 if let Some(s1) = src1 {
                     let h = dst1_len;
                     let x = (sw - h) / 2.0;
                     let y = start_pos_screen + (h - sw) / 2.0;
-                    
                     draw_texture_ex(&texture, x, y, WHITE, DrawTextureParams {
-                        dest_size: Some(vec2(h, sw)),
-                        source: Some(s1),
-                        rotation: std::f32::consts::FRAC_PI_2,
-                        ..Default::default()
+                        dest_size: Some(vec2(h, sw)), source: Some(s1), rotation: std::f32::consts::FRAC_PI_2, ..Default::default()
                     });
                 }
-                
-                // Seg2 (New) second.
                 if let Some(s2) = src2 {
                     let h = dst2_len;
                     let y_offset = start_pos_screen + dst1_len;
-                    
                     let x = (sw - h) / 2.0;
                     let y = y_offset + (h - sw) / 2.0;
-
                     draw_texture_ex(&texture, x, y, WHITE, DrawTextureParams {
-                        dest_size: Some(vec2(h, sw)),
-                        source: Some(s2),
-                        rotation: std::f32::consts::FRAC_PI_2,
-                        ..Default::default()
+                        dest_size: Some(vec2(h, sw)), source: Some(s2), rotation: std::f32::consts::FRAC_PI_2, ..Default::default()
                     });
                 }
             } else {
-                // UpToDown (Rain)
-                // Newest at Top. Oldest at Bottom.
-                // Seg2 (New) first (Top). Seg1 (Old) second (Bottom).
-                // Rotation: -90 deg (-PI/2). FlipY: True.
-
                 if let Some(s2) = src2 {
                     let h = dst2_len;
                     let x = (sw - h) / 2.0;
                     let y = start_pos_screen + (h - sw) / 2.0;
-
                     draw_texture_ex(&texture, x, y, WHITE, DrawTextureParams {
-                        dest_size: Some(vec2(h, sw)),
-                        source: Some(s2),
-                        rotation: -std::f32::consts::FRAC_PI_2,
-                        flip_y: true,
-                        ..Default::default()
+                        dest_size: Some(vec2(h, sw)), source: Some(s2), rotation: -std::f32::consts::FRAC_PI_2, flip_y: true, ..Default::default()
                     });
                 }
-
                 if let Some(s1) = src1 {
                     let h = dst1_len;
                     let y_offset = start_pos_screen + dst2_len;
-                    
                     let x = (sw - h) / 2.0;
                     let y = y_offset + (h - sw) / 2.0;
-
                     draw_texture_ex(&texture, x, y, WHITE, DrawTextureParams {
-                        dest_size: Some(vec2(h, sw)),
-                        source: Some(s1),
-                        rotation: -std::f32::consts::FRAC_PI_2,
-                        flip_y: true,
-                        ..Default::default()
+                        dest_size: Some(vec2(h, sw)), source: Some(s1), rotation: -std::f32::consts::FRAC_PI_2, flip_y: true, ..Default::default()
                     });
                 }
             }
@@ -493,53 +475,61 @@ async fn main() {
     }
 }
 
-// --- HELPERS ---
-fn paint_column_in_place(pixels: &mut Vec<u8>, col_idx: usize, data: &[f32], settings: &AppSettings, freq_bins: usize, fft_size: usize) {
-    let gradient = get_gradient(settings.colormap);
+// --- FAST PAINTER (Uses LUT) ---
+fn paint_column_fast(
+    pixels: &mut Vec<u8>, 
+    col_idx: usize, 
+    data: &[f32], 
+    settings: &AppSettings, 
+    lut: &ColorLut, // Use LUT instead of re-calculating
+    freq_bins: usize, 
+    fft_size: usize
+) {
     let max_freq_idx = data.len();
     let mel_min = 0.0;
     let mel_max = 2595.0 * (1.0 + (SAMPLE_RATE as f32 / 2.0) / 700.0).log10();
+    let mel_normalization_factor = 2595.0; // pre-calc optimization constant could go deeper but this is fine
 
     let x_offset = col_idx * 4;
+    // Pre-calculate constants for loop
+    let sample_rate_over_fft = SAMPLE_RATE as f32 / fft_size as f32;
 
     for i in 0..freq_bins {
-        let norm_i = i as f32 / freq_bins as f32;
+        // Invert Y axis here (standard spectrogram view)
+        let y = (freq_bins - 1) - i;
+        
         let target_idx = if settings.mel_scale {
+            let norm_i = i as f32 / freq_bins as f32;
             let mel = norm_i * (mel_max - mel_min) + mel_min;
-            let freq = 700.0 * (10.0f32.powf(mel / 2595.0) - 1.0);
-            let idx = freq / (SAMPLE_RATE as f32 / fft_size as f32);
-            idx as usize
+            let freq = 700.0 * (10.0f32.powf(mel / mel_normalization_factor) - 1.0);
+            (freq / sample_rate_over_fft) as usize
         } else {
+            // Linear scale
+            let norm_i = i as f32 / freq_bins as f32;
             (norm_i * max_freq_idx as f32) as usize
         };
 
         let safe_idx = target_idx.min(max_freq_idx - 1);
         let magnitude = data[safe_idx];
+        
+        // Intensity mapping
         let intensity = (magnitude * 2000.0).ln() / 8.0;
-        let c = gradient.eval_continuous(intensity.clamp(0.0, 1.0) as f64);
+        
+        // LUT Lookup (Fast)
+        let rgb = lut.get_color(intensity);
 
-        let y = (freq_bins - 1) - i;
         let idx = (y * MAX_HISTORY * 4) + x_offset;
 
+        // Unsafe check skipped for speed, logic guarantees bounds
         if idx + 3 < pixels.len() {
-            pixels[idx] = c.r;
-            pixels[idx+1] = c.g;
-            pixels[idx+2] = c.b;
+            pixels[idx] = rgb[0];
+            pixels[idx+1] = rgb[1];
+            pixels[idx+2] = rgb[2];
             pixels[idx+3] = 255;
         }
     }
 }
 
-fn get_gradient(t: ColorMapType) -> colorous::Gradient {
-    match t {
-        ColorMapType::Magma => colorous::MAGMA,
-        ColorMapType::Inferno => colorous::INFERNO,
-        ColorMapType::Viridis => colorous::VIRIDIS,
-        ColorMapType::Plasma => colorous::PLASMA,
-        ColorMapType::Turbo => colorous::TURBO,
-        ColorMapType::Cubehelix => colorous::CUBEHELIX,
-    }
-}
 
 fn cycle_colormap(c: ColorMapType) -> ColorMapType {
     match c {
