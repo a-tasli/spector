@@ -469,7 +469,6 @@ async fn main() {
         }
 
         draw_note_ruler(local_mel, local_dir, RESOLUTIONS[current_fft_idx]);
-        draw_ui_overlay(local_mel, local_cmap, local_dir, RESOLUTIONS[current_fft_idx], current_view_len);
 
         next_frame().await
     }
