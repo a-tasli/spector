@@ -19,17 +19,23 @@ const RESOLUTIONS: [usize; 3] = [2048, 4096, 8192];
 const MAX_HISTORY: usize = 2520; 
 const TARGET_DISPLAY_WIDTH: f32 = 2520.0;
 
+const DRAW_UI: bool = true;
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum ColorMapType { Magma, Inferno, Viridis, Plasma, Turbo, Cubehelix }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-enum ScrollDirection { RTL, LTR, DownToUp, UpToDown }
+enum ScrollDirection { RTL, LTR, DTU, UTD }
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum AudioSource { SinkMonitor, Microphone }
 
 #[derive(Clone)]
 struct AppSettings {
     mel_scale: bool,
     colormap: ColorMapType,
     redraw_flag: bool,
+    audio_source: AudioSource,
 }
 
 // Optimization: Pre-calculated Color Lookup Table
@@ -108,34 +114,72 @@ async fn main() {
         mel_scale: true,
         colormap: ColorMapType::Magma,
         redraw_flag: false,
+        audio_source: AudioSource::SinkMonitor,
     }));
 
     let rb = HeapRb::<f32>::new(65536);
     let (mut producer, mut consumer) = rb.split();
 
     // --- THREAD A: RECORDER ---
+    let shared_settings_recorder = shared_settings.clone();
+    
     thread::spawn(move || {
-        let output = std::process::Command::new("pactl")
-            .arg("get-default-sink")
-            .output()
-            .expect("pactl failed");
-        let sink_name = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let monitor = format!("{}.monitor", sink_name);
+        let mut current_source = AudioSource::SinkMonitor;
 
-        let spec = Spec { format: Format::F32le, channels: 1, rate: SAMPLE_RATE };
-        let frag_size = (SAMPLE_RATE as u32 * 4 * 15) / 1000;
-        let attr = BufferAttr {
-            maxlength: u32::MAX, tlength: u32::MAX, prebuf: u32::MAX, minreq: u32::MAX,
-            fragsize: frag_size,
+        let open_stream = |source: AudioSource| -> Option<Simple> {
+            let device_name = match source {
+                AudioSource::SinkMonitor => {
+                    if let Ok(output) = std::process::Command::new("pactl").arg("get-default-sink").output() {
+                        let sink_name = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                        format!("{}.monitor", sink_name)
+                    } else {
+                        return None;
+                    }
+                },
+                AudioSource::Microphone => {
+                    if let Ok(output) = std::process::Command::new("pactl").arg("get-default-source").output() {
+                        String::from_utf8_lossy(&output.stdout).trim().to_string()
+                    } else {
+                        return None;
+                    }
+                }
+            };
+
+            let spec = Spec { format: Format::F32le, channels: 1, rate: SAMPLE_RATE };
+            let frag_size = (SAMPLE_RATE as u32 * 4 * 15) / 1000;
+            let attr = BufferAttr {
+                maxlength: u32::MAX, tlength: u32::MAX, prebuf: u32::MAX, minreq: u32::MAX,
+                fragsize: frag_size,
+            };
+
+            Simple::new(None, "spector", Direction::Record, Some(&device_name), "Recorder", &spec, None, Some(&attr)).ok()
         };
 
-        if let Ok(stream) = Simple::new(None, "RustySpec", Direction::Record, Some(&monitor), "Recorder", &spec, None, Some(&attr)) {
-            let mut buf = [0u8; 4096];
-            loop {
-                if let Ok(_) = stream.read(&mut buf) {
+        let mut stream = open_stream(current_source);
+        let mut buf = [0u8; 4096];
+
+        loop {
+            // Check for hot-swaps without blocking the audio loop tightly
+            if let Ok(settings) = shared_settings_recorder.try_lock() {
+                if settings.audio_source != current_source {
+                    current_source = settings.audio_source;
+                    stream = open_stream(current_source);
+                }
+            }
+
+            if let Some(ref s) = stream {
+                if let Ok(_) = s.read(&mut buf) {
                     let floats: &[f32] = unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const f32, buf.len() / 4) };
                     producer.push_slice(floats);
+                } else {
+                    // Read failed (device might have disconnected), back off and attempt to reopen
+                    thread::sleep(Duration::from_millis(100));
+                    stream = open_stream(current_source);
                 }
+            } else {
+                // If stream initialization failed, wait and retry
+                thread::sleep(Duration::from_millis(100));
+                stream = open_stream(current_source);
             }
         }
     });
@@ -285,25 +329,37 @@ async fn main() {
     let mut local_mel = true;
     let mut local_cmap = ColorMapType::Magma;
     let mut local_dir = ScrollDirection::RTL;
+    let mut local_source = AudioSource::SinkMonitor;
     let mut smooth_head_pos: f64 = 0.0;
 
     loop {
         let mut visual_changed = false;
+        let mut source_changed = false;
 
         if is_key_pressed(KeyCode::S) { local_mel = !local_mel; visual_changed = true; }
         if is_key_pressed(KeyCode::C) { local_cmap = cycle_colormap(local_cmap); visual_changed = true; }
         if is_key_pressed(KeyCode::F) { local_dir = cycle_direction(local_dir); }
         if is_key_pressed(KeyCode::R) { current_fft_idx = (current_fft_idx + 1) % RESOLUTIONS.len(); }
+        if is_key_pressed(KeyCode::X) { 
+            local_source = match local_source {
+                AudioSource::SinkMonitor => AudioSource::Microphone,
+                AudioSource::Microphone => AudioSource::SinkMonitor,
+            };
+            source_changed = true; 
+        }
 
         if is_key_pressed(KeyCode::W) {
             current_view_len = if current_view_len == MAX_HISTORY { MAX_HISTORY / 2 } else { MAX_HISTORY };
         }
 
-        if visual_changed {
+        if visual_changed || source_changed {
             if let Ok(mut s) = shared_settings.lock() {
                 s.mel_scale = local_mel;
                 s.colormap = local_cmap;
-                s.redraw_flag = true;
+                s.audio_source = local_source;
+                if visual_changed {
+                    s.redraw_flag = true;
+                }
             }
         }
 
@@ -362,7 +418,7 @@ async fn main() {
 
         let (screen_time_dim, screen_freq_dim) = match local_dir {
             ScrollDirection::RTL | ScrollDirection::LTR => (sw, sh),
-            ScrollDirection::DownToUp | ScrollDirection::UpToDown => (sh, sw),
+            ScrollDirection::DTU | ScrollDirection::UTD => (sh, sw),
         };
 
         let scale_factor = TARGET_DISPLAY_WIDTH / (current_view_len as f32);
@@ -428,7 +484,7 @@ async fn main() {
                 }
             }
         } else {
-            let is_fire = local_dir == ScrollDirection::DownToUp;
+            let is_fire = local_dir == ScrollDirection::DTU;
             if is_fire {
                 if let Some(s1) = src1 {
                     let h = dst1_len;
@@ -469,7 +525,8 @@ async fn main() {
         }
 
         draw_note_ruler(local_mel, local_dir, RESOLUTIONS[current_fft_idx]);
-        draw_ui_overlay(local_mel, local_cmap, local_dir, RESOLUTIONS[current_fft_idx], current_view_len);
+
+        if DRAW_UI { draw_ui_overlay(local_mel, local_cmap, local_dir, RESOLUTIONS[current_fft_idx], current_view_len, local_source); }
 
         next_frame().await
     }
@@ -545,9 +602,9 @@ fn cycle_colormap(c: ColorMapType) -> ColorMapType {
 fn cycle_direction(d: ScrollDirection) -> ScrollDirection {
     match d {
         ScrollDirection::RTL => ScrollDirection::LTR,
-        ScrollDirection::LTR => ScrollDirection::DownToUp,
-        ScrollDirection::DownToUp => ScrollDirection::UpToDown,
-        ScrollDirection::UpToDown => ScrollDirection::RTL,
+        ScrollDirection::LTR => ScrollDirection::DTU,
+        ScrollDirection::DTU => ScrollDirection::UTD,
+        ScrollDirection::UTD => ScrollDirection::RTL,
     }
 }
 
@@ -575,8 +632,8 @@ fn draw_note_ruler(mel_scale: bool, dir: ScrollDirection, fft_size: usize) {
         let (x, y, is_c) = match dir {
             ScrollDirection::RTL => (w, h * (1.0 - norm_pos), midi % 12 == 0),
             ScrollDirection::LTR => (0.0, h * (1.0 - norm_pos), midi % 12 == 0),
-            ScrollDirection::UpToDown => (w * norm_pos, 0.0, midi % 12 == 0),
-            ScrollDirection::DownToUp => (w * norm_pos, h, midi % 12 == 0),
+            ScrollDirection::UTD => (w * norm_pos, 0.0, midi % 12 == 0),
+            ScrollDirection::DTU => (w * norm_pos, h, midi % 12 == 0),
         };
 
         if dir == ScrollDirection::RTL || dir == ScrollDirection::LTR {
@@ -590,11 +647,11 @@ fn draw_note_ruler(mel_scale: bool, dir: ScrollDirection, fft_size: usize) {
             }
         } else {
             let tick_len = if is_c { 15.0 } else { 5.0 };
-            let start_y = if dir == ScrollDirection::DownToUp { y - tick_len } else { y };
+            let start_y = if dir == ScrollDirection::DTU { y - tick_len } else { y };
             draw_line(x, start_y, x, start_y + tick_len, 1.0, WHITE);
             if is_c {
                 let octave = (midi / 12) - 1;
-                let text_y = if dir == ScrollDirection::DownToUp { y - 20.0 } else { y + 30.0 };
+                let text_y = if dir == ScrollDirection::DTU { y - 20.0 } else { y + 30.0 };
                 draw_text(&format!("C{}", octave), x - 5.0, text_y, 15.0, WHITE);
             }
         }
@@ -608,17 +665,21 @@ struct UiStat {
     color: Color,
 }
 
-fn draw_ui_overlay(mel: bool, cmap: ColorMapType, dir: ScrollDirection, fft: usize, history: usize) {
+fn draw_ui_overlay(mel: bool, cmap: ColorMapType, dir: ScrollDirection, fft: usize, history: usize, source: AudioSource) {
     let scale_str = if mel { "Mel" } else { "Linear" };
     let map_str = format!("{:?}", cmap); 
     let dir_str = match dir {
         ScrollDirection::RTL => "RTL", 
         ScrollDirection::LTR => "LTR",
-        ScrollDirection::DownToUp => "Fire", 
-        ScrollDirection::UpToDown => "Rain",
+        ScrollDirection::DTU => "Fire", 
+        ScrollDirection::UTD => "Rain",
     };
     let res_str = format!("{} bins", fft/2);
     let hist_str = format!("{}", history);
+    let src_str = match source {
+        AudioSource::SinkMonitor => "Sink",
+        AudioSource::Microphone => "Mic",
+    };
 
     let stats = vec![
         UiStat { label: "Scale",  hotkey: Some('S'), value: scale_str.to_string(), color: ORANGE },
@@ -626,11 +687,12 @@ fn draw_ui_overlay(mel: bool, cmap: ColorMapType, dir: ScrollDirection, fft: usi
         UiStat { label: "Flow",   hotkey: Some('F'), value: dir_str.to_string(),   color: SKYBLUE },
         UiStat { label: "Res",    hotkey: Some('R'), value: res_str,               color: VIOLET },
         UiStat { label: "Win",    hotkey: Some('W'), value: hist_str,              color: PINK },
+        UiStat { label: "X Source",     hotkey: Some('X'), value: src_str.to_string(),   color: GREEN },
     ];
 
     let (bg_x, bg_y, bg_w, bg_h, is_vertical) = match dir {
         ScrollDirection::RTL | ScrollDirection::LTR => (0.0, 0.0, screen_width(), 35.0, false),
-        _ => (screen_width() - 220.0, 0.0, 220.0, 130.0, true),
+        _ => (screen_width() - 220.0, 0.0, 220.0, 155.0, true), // Adjusted box height to accommodate the 6th item
     };
 
     draw_rectangle(bg_x, bg_y, bg_w, bg_h, Color::new(0.0, 0.0, 0.0, 0.6));
