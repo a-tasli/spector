@@ -24,8 +24,6 @@ const RESOLUTIONS: [usize; 3] = [2048, 4096, 8192];
 // How many pixel columns of history to store in RAM/VRAM.
 const MAX_HISTORY: usize = 2520; 
 const TARGET_DISPLAY_WIDTH: f32 = 2520.0;
-// Massive window used specifically to isolate ultra-low sub-bass frequencies without muddying the rest.
-const BASS_WINDOW: usize = 32768; 
 
 const DRAW_UI: bool = true;
 
@@ -122,7 +120,6 @@ struct CrossfadeInstruction {
     b_8192: usize, w_8192: f32,
     b_4096: usize, w_4096: f32,
     b_2048: usize, w_2048: f32,
-    b_bass: usize, w_bass: f32,
 }
 
 fn build_crossfade_map() -> Vec<CrossfadeInstruction> {
@@ -130,7 +127,6 @@ fn build_crossfade_map() -> Vec<CrossfadeInstruction> {
     let mut map = Vec::with_capacity(bins);
     
     // Frequency resolution (Hz per bin) for each FFT size
-    let freq_res_bass = (SAMPLE_RATE as f32 / 8.0) / 4096.0; 
     let freq_res_8192 = SAMPLE_RATE as f32 / 8192.0; 
     let freq_res_4096 = SAMPLE_RATE as f32 / 4096.0; 
     let freq_res_2048 = SAMPLE_RATE as f32 / 2048.0; 
@@ -142,23 +138,14 @@ fn build_crossfade_map() -> Vec<CrossfadeInstruction> {
         // Find corresponding bins in the smaller FFTs
         let bin_4096 = ((freq / freq_res_4096) as usize).min(2047);
         let bin_2048 = ((freq / freq_res_2048) as usize).min(1023);
-        let bin_bass = ((freq / freq_res_bass) as usize).min(2047);
 
         let mut inst = CrossfadeInstruction {
             b_8192: bin, w_8192: 0.0,
             b_4096: bin_4096, w_4096: 0.0,
             b_2048: bin_2048, w_2048: 0.0,
-            b_bass: bin_bass, w_bass: 0.0,
         };
 
-        // Define crossover frequency bands using SQRT_2 for equal-power crossfading
-        if freq < 60.0 {
-            inst.w_bass = std::f32::consts::SQRT_2; // Sub-bass exclusively uses the decimated bass FFT
-        } else if freq < 100.0 {
-            let t = (freq - 60.0) / 40.0;
-            inst.w_bass = std::f32::consts::SQRT_2 * (1.0 - t);
-            inst.w_8192 = 1.0 * t;
-        } else if freq < 200.0 {
+        if freq < 200.0 {
             inst.w_8192 = 1.0;
         } else if freq < 300.0 {
             let t = (freq - 200.0) / 100.0;
@@ -308,9 +295,8 @@ async fn main() {
 
     thread::spawn(move || {
         let max_fft = *RESOLUTIONS.iter().max().unwrap();
-        let audio_buffer_size = BASS_WINDOW.max(max_fft);
         
-        let mut rolling_audio = vec![0.0; audio_buffer_size];
+        let mut rolling_audio = vec![0.0; max_fft];
         let mut pending_buffer = Vec::with_capacity(4096);
 
         // Keep a history of pure floating-point FFT magnitudes to allow instant recoloring
@@ -329,8 +315,6 @@ async fn main() {
             vec![0.0; RESOLUTIONS[2] / 2],
             vec![0.0; RESOLUTIONS[2] / 2], // Composite buffer
         ];
-        let mut bass_col = vec![0.0; 4096 / 2];
-        let mut downsampled = vec![0.0; 4096];
         let crossfade_map = build_crossfade_map();
 
         loop {
@@ -380,29 +364,14 @@ async fn main() {
             while pending_buffer.len() >= HOP_SIZE {
                 let chunk: Vec<f32> = pending_buffer.drain(0..HOP_SIZE).collect();
                 
-                rolling_audio.extend(chunk);
-                if rolling_audio.len() > audio_buffer_size {
-                    let remove = rolling_audio.len() - audio_buffer_size;
+                rolling_audio.extend(&chunk);
+                
+                if rolling_audio.len() > max_fft {
+                    let remove = rolling_audio.len() - max_fft;
                     rolling_audio.drain(0..remove);
                 }
 
                 let mut computed_all = true;
-
-                // WAVECANDY TRICK: Sub-bass Decimation
-                // Standard FFTs can't resolve sub-bass without massive latency. 
-                // We downsample the audio by 8x, then run a smaller FFT to get extreme low-end accuracy.
-                if rolling_audio.len() >= BASS_WINDOW {
-                    let bass_slice = &rolling_audio[rolling_audio.len() - BASS_WINDOW..];
-                    for (i, chunk) in bass_slice.chunks_exact(8).enumerate() {
-                        downsampled[i] = chunk.iter().sum::<f32>() / 8.0; // Naive decimation
-                    }
-                    let windowed = hann_window(&downsampled);
-                    if let Ok(spectrum) = samples_fft_to_spectrum(&windowed, SAMPLE_RATE / 8, FrequencyLimit::All, Some(&divide_by_N_sqrt)) {
-                        for (out, val) in bass_col.iter_mut().zip(spectrum.data().iter()) {
-                            *out = val.1.val();
-                        }
-                    } else { computed_all = false; }
-                } else { computed_all = false; }
 
                 // Process Standard Multi-Resolution FFTs
                 for (i, size) in RESOLUTIONS.iter().enumerate() {
@@ -421,13 +390,12 @@ async fn main() {
 
                 // Compile everything into the final pixels
                 if computed_all {
-                    // Blend all 4 FFTs based on pre-calculated weights
+                    // Blend all 3 FFTs based on pre-calculated weights
                     for (bin, inst) in crossfade_map.iter().enumerate() {
                         local_cols[3][bin] = 
                             local_cols[2][inst.b_8192] * inst.w_8192 +
                             local_cols[1][inst.b_4096] * inst.w_4096 +
-                            local_cols[0][inst.b_2048] * inst.w_2048 +
-                            bass_col[inst.b_bass]      * inst.w_bass;
+                            local_cols[0][inst.b_2048] * inst.w_2048;
                     }
 
                     // Update Shared State (Lock briefly)
