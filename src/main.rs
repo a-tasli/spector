@@ -19,7 +19,6 @@ const SAMPLE_RATE: u32 = 44100;
 const HOP_SIZE: usize = 512;
 
 // The different FFT window sizes used for the multi-resolution composite. 
-// Smaller = better time accuracy; Larger = better frequency accuracy.
 const RESOLUTIONS: [usize; 3] = [2048, 4096, 8192];
 // How many pixel columns of history to store in RAM/VRAM.
 const MAX_HISTORY: usize = 2520; 
@@ -46,8 +45,6 @@ struct AppSettings {
 }
 
 // Optimization: Pre-calculated Color Lookup Table (LUT)
-// Evaluates the continuous color gradient once at startup so the hot render loop 
-// only performs a cheap array index lookup per pixel.
 struct ColorLut {
     bytes: Vec<[u8; 3]>,
 }
@@ -80,8 +77,6 @@ impl ColorLut {
 }
 
 // Optimization: Pre-calculated Logarithmic (Mel) and Linear Coordinate Maps
-// Maps a physical on-screen Y-pixel directly to the correct FFT frequency bin.
-// Prevents calculating logarithmic scales for thousands of pixels every frame.
 #[derive(Clone)]
 struct YToBinMap {
     mel_map: Vec<usize>,
@@ -99,13 +94,11 @@ impl YToBinMap {
         let sample_rate_over_fft = SAMPLE_RATE as f32 / fft_size as f32;
 
         for i in 0..freq_bins {
-            // Calculate Mel (perceptual) bin index
             let norm_i = i as f32 / freq_bins as f32;
             let mel = norm_i * (mel_max - mel_min) + mel_min;
             let freq = 700.0 * (10.0f32.powf(mel / mel_normalization_factor) - 1.0);
             mel_map[i] = ((freq / sample_rate_over_fft) as usize).min(freq_bins - 1);
             
-            // Calculate Linear bin index
             linear_map[i] = ((i as f32 / freq_bins as f32) * freq_bins as f32) as usize;
         }
 
@@ -114,7 +107,6 @@ impl YToBinMap {
 }
 
 // Optimization: Pre-calculated Branchless Crossfade Map
-// Dictates how to blend the 3 standard FFTs + Bass FFT into a single composite view.
 #[derive(Clone, Copy)]
 struct CrossfadeInstruction {
     b_8192: usize, w_8192: f32,
@@ -126,16 +118,13 @@ fn build_crossfade_map() -> Vec<CrossfadeInstruction> {
     let bins = RESOLUTIONS[2] / 2;
     let mut map = Vec::with_capacity(bins);
     
-    // Frequency resolution (Hz per bin) for each FFT size
     let freq_res_8192 = SAMPLE_RATE as f32 / 8192.0; 
     let freq_res_4096 = SAMPLE_RATE as f32 / 4096.0; 
     let freq_res_2048 = SAMPLE_RATE as f32 / 2048.0; 
 
-    // Build blending weights for every vertical pixel/bin
     for bin in 0..bins {
         let freq = bin as f32 * freq_res_8192;
         
-        // Find corresponding bins in the smaller FFTs
         let bin_4096 = ((freq / freq_res_4096) as usize).min(2047);
         let bin_2048 = ((freq / freq_res_2048) as usize).min(1023);
 
@@ -145,33 +134,34 @@ fn build_crossfade_map() -> Vec<CrossfadeInstruction> {
             b_2048: bin_2048, w_2048: 0.0,
         };
 
+        // Linear fade between the raw FFT outputs without artificial multipliers.
+        // This ensures the high-frequency overtones remain identical to the raw 2048 mode.
         if freq < 200.0 {
             inst.w_8192 = 1.0;
         } else if freq < 300.0 {
             let t = (freq - 200.0) / 100.0;
-            inst.w_8192 = 1.0 * (1.0 - t);
-            inst.w_4096 = std::f32::consts::SQRT_2 * t;
+            inst.w_8192 = 1.0 - t;
+            inst.w_4096 = t;
         } else if freq < 1200.0 {
-            inst.w_4096 = std::f32::consts::SQRT_2;
+            inst.w_4096 = 1.0;
         } else if freq < 2000.0 {
             let t = (freq - 1200.0) / 800.0;
-            inst.w_4096 = std::f32::consts::SQRT_2 * (1.0 - t);
-            inst.w_2048 = 2.0 * t;
+            inst.w_4096 = 1.0 - t;
+            inst.w_2048 = t;
         } else {
-            inst.w_2048 = 2.0; // High frequencies exclusively use the small 2048 window
+            inst.w_2048 = 1.0; 
         }
         map.push(inst);
     }
     map
 }
 
-/// Represents the historical pixel state for one specific FFT resolution.
 struct SpectrogramLayer {
     fft_size: usize,
     freq_bins: usize,
-    pixels: Vec<u8>,     // Flattened RGBA buffer
-    head: usize,         // Current write index (column) in the ring buffer
-    total_updates: u64,  // Monotonically increasing counter to sync CPU/GPU state
+    pixels: Vec<u8>,     
+    head: usize,         
+    total_updates: u64,  
     y_map: YToBinMap,
 }
 
@@ -202,12 +192,11 @@ fn window_conf() -> Conf {
 
 #[macroquad::main(window_conf)]
 async fn main() {
-    // Setup 4 layers: The 3 raw resolutions + 1 Composite layer
     let mut layers = Vec::new();
     for &size in RESOLUTIONS.iter() {
         layers.push(SpectrogramLayer::new(size));
     }
-    layers.push(SpectrogramLayer::new(RESOLUTIONS[2])); // Composite layer uses largest height
+    layers.push(SpectrogramLayer::new(RESOLUTIONS[2])); 
 
     let shared_layers = Arc::new(Mutex::new(layers));
     let shared_settings = Arc::new(Mutex::new(AppSettings {
@@ -217,7 +206,6 @@ async fn main() {
         audio_source: AudioSource::SinkMonitor,
     }));
 
-    // Lock-free ring buffer for passing raw f32 audio from Recorder thread to Brain thread
     let rb = HeapRb::<f32>::new(65536);
     let (mut producer, mut consumer) = rb.split();
 
@@ -229,13 +217,12 @@ async fn main() {
     thread::spawn(move || {
         let mut current_source = AudioSource::SinkMonitor;
 
-        // Helper to dynamically find and connect to PulseAudio sources using `pactl`
         let open_stream = |source: AudioSource| -> Option<Simple> {
             let device_name = match source {
                 AudioSource::SinkMonitor => {
                     if let Ok(output) = std::process::Command::new("pactl").arg("get-default-sink").output() {
                         let sink_name = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                        format!("{}.monitor", sink_name) // Append .monitor to capture system output
+                        format!("{}.monitor", sink_name) 
                     } else {
                         return None;
                     }
@@ -250,7 +237,7 @@ async fn main() {
             };
 
             let spec = Spec { format: Format::F32le, channels: 1, rate: SAMPLE_RATE };
-            let frag_size = (SAMPLE_RATE as u32 * 4 * 15) / 1000; // ~15ms fragments
+            let frag_size = (SAMPLE_RATE as u32 * 4 * 15) / 1000; 
             let attr = BufferAttr {
                 maxlength: u32::MAX, tlength: u32::MAX, prebuf: u32::MAX, minreq: u32::MAX,
                 fragsize: frag_size,
@@ -263,7 +250,6 @@ async fn main() {
         let mut buf = [0u8; 4096];
 
         loop {
-            // Check if the user swapped input sources via UI
             if let Ok(settings) = shared_settings_recorder.try_lock() {
                 if settings.audio_source != current_source {
                     current_source = settings.audio_source;
@@ -271,7 +257,6 @@ async fn main() {
                 }
             }
 
-            // Read raw bytes from PulseAudio, cast to f32, and push to lock-free consumer
             if let Some(ref s) = stream {
                 if let Ok(_) = s.read(&mut buf) {
                     let floats: &[f32] = unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const f32, buf.len() / 4) };
@@ -299,7 +284,6 @@ async fn main() {
         let mut rolling_audio = vec![0.0; max_fft];
         let mut pending_buffer = Vec::with_capacity(4096);
 
-        // Keep a history of pure floating-point FFT magnitudes to allow instant recoloring
         let mut float_history: Vec<Vec<f32>> = (0..=RESOLUTIONS.len()).map(|i| {
             let size = if i < RESOLUTIONS.len() { RESOLUTIONS[i] } else { RESOLUTIONS[2] };
             vec![0.0f32; MAX_HISTORY * (size / 2)]
@@ -308,12 +292,11 @@ async fn main() {
         let mut current_lut_type = ColorMapType::Magma;
         let mut lut = ColorLut::new(current_lut_type);
 
-        // Optimization: Pre-allocate hot loop buffers to avoid memory allocation during FFT crunching
         let mut local_cols = vec![
             vec![0.0; RESOLUTIONS[0] / 2],
             vec![0.0; RESOLUTIONS[1] / 2],
             vec![0.0; RESOLUTIONS[2] / 2],
-            vec![0.0; RESOLUTIONS[2] / 2], // Composite buffer
+            vec![0.0; RESOLUTIONS[2] / 2], 
         ];
         let crossfade_map = build_crossfade_map();
 
@@ -337,7 +320,6 @@ async fn main() {
 
             let settings = local_settings.unwrap();
 
-            // Handle Full Redraw (e.g., Color map change or Log/Linear scale flip)
             if redraw_requested {
                 if let Ok(mut layers) = layers_ref.lock() {
                     for (i, layer) in layers.iter_mut().enumerate() {
@@ -346,7 +328,6 @@ async fn main() {
                             let slice = &float_history[i][start..start + layer.freq_bins];
                             paint_column_fast(&mut layer.pixels, t, slice, settings.mel_scale, &lut, &layer.y_map, layer.freq_bins);
                         }
-                        // Signal to the Face thread that a massive change occurred, forcing a full GPU upload
                         layer.total_updates += (MAX_HISTORY * 2) as u64; 
                     }
                 }
@@ -360,7 +341,7 @@ async fn main() {
                 pending_buffer.extend(temp);
             }
 
-            // 3. Processing Hot Loop (Runs whenever enough audio is buffered)
+            // 3. Processing Hot Loop
             while pending_buffer.len() >= HOP_SIZE {
                 let chunk: Vec<f32> = pending_buffer.drain(0..HOP_SIZE).collect();
                 
@@ -388,9 +369,7 @@ async fn main() {
                     } else { computed_all = false; }
                 }
 
-                // Compile everything into the final pixels
                 if computed_all {
-                    // Blend all 3 FFTs based on pre-calculated weights
                     for (bin, inst) in crossfade_map.iter().enumerate() {
                         local_cols[3][bin] = 
                             local_cols[2][inst.b_8192] * inst.w_8192 +
@@ -398,23 +377,19 @@ async fn main() {
                             local_cols[0][inst.b_2048] * inst.w_2048;
                     }
 
-                    // Update Shared State (Lock briefly)
                     if let Ok(mut layers) = layers_ref.lock() {
                         for i in 0..=RESOLUTIONS.len() {
                             let layer = &mut layers[i];
                             let head_idx = layer.head;
 
-                            // Save float history for instant recoloring
                             let float_start = head_idx * layer.freq_bins;
                             let copy_len = local_cols[i].len().min(layer.freq_bins);
                             if float_start + copy_len <= float_history[i].len() {
                                 float_history[i][float_start..float_start+copy_len].copy_from_slice(&local_cols[i][0..copy_len]);
                             }
 
-                            // Convert raw float magnitudes to RGB pixels
                             paint_column_fast(&mut layer.pixels, head_idx, &local_cols[i], settings.mel_scale, &lut, &layer.y_map, layer.freq_bins);
 
-                            // Advance ring buffer
                             layer.head = (layer.head + 1) % MAX_HISTORY;
                             layer.total_updates += 1;
                         }
@@ -422,7 +397,6 @@ async fn main() {
                 }
             }
             
-            // Yield briefly if starving
             if pending_buffer.len() < HOP_SIZE {
                 thread::sleep(Duration::from_millis(1));
             }
@@ -436,7 +410,6 @@ async fn main() {
     let mut last_fft_idx = 3; 
     let mut current_view_len = MAX_HISTORY; 
     
-    // Setup GPU RenderTargets. We treat VRAM as a 2D ring buffer texture.
     let mut render_targets = Vec::new();
     for i in 0..=RESOLUTIONS.len() {
         let size = if i < RESOLUTIONS.len() { RESOLUTIONS[i] } else { RESOLUTIONS[2] };
@@ -459,7 +432,6 @@ async fn main() {
         let mut visual_changed = false;
         let mut source_changed = false;
 
-        // Input Handling
         if is_key_pressed(KeyCode::S) { local_mel = !local_mel; visual_changed = true; }
         if is_key_pressed(KeyCode::C) { local_cmap = cycle_colormap(local_cmap); visual_changed = true; }
         if is_key_pressed(KeyCode::F) { local_dir = cycle_direction(local_dir); }
@@ -495,7 +467,6 @@ async fn main() {
         let mut delta_images: Vec<(f32, Image)> = Vec::new();
 
         {
-            // Acquire lock to read pixel updates from Brain thread
             if let Ok(layers) = shared_layers.lock() {
                 let layer = &layers[current_fft_idx];
                 actual_total_updates = layer.total_updates;
@@ -505,9 +476,7 @@ async fn main() {
                 
                 let full_redraw_threshold = (MAX_HISTORY / 2) as u64;
 
-                // VRAM Synchronization Logic
                 if diff >= full_redraw_threshold {
-                    // Hot Path 1: Mass update (e.g., UI change). Copies full state to CPU buffer once.
                     let expected_len = layer.pixels.len();
                     if local_pixels_buffer.len() < expected_len {
                         local_pixels_buffer.resize(expected_len, 0);
@@ -515,14 +484,11 @@ async fn main() {
                     local_pixels_buffer[..expected_len].copy_from_slice(&layer.pixels);
                     full_redraw_needed = true;
                 } else if diff > 0 {
-                    // Hot Path 2: Continuous Pipeline (60 FPS). Extracts ONLY the new micro-strip of data.
-                    // This prevents sending 20MB of texture data to the GPU every single frame.
                     let diff_usize = diff as usize;
                     let head = layer.head;
                     let height = layer.freq_bins;
 
                     if head >= diff_usize {
-                        // Normal case: data is contiguous
                         let start_x = head - diff_usize;
                         let mut img = Image { width: diff as u16, height: height as u16, bytes: vec![0; diff_usize * height * 4] };
                         for y in 0..height {
@@ -533,7 +499,6 @@ async fn main() {
                         }
                         delta_images.push((start_x as f32, img));
                     } else {
-                        // Wrapping case: data crosses the ring buffer boundary. Split into two images.
                         let part1_len = diff_usize - head;
                         let start_x = MAX_HISTORY - part1_len;
                         
@@ -559,7 +524,6 @@ async fn main() {
                     }
                 }
                 
-                // Track visual drift when switching between multi-resolution modes
                 if current_fft_idx != last_fft_idx {
                     let prev_mode_updates = layers[last_fft_idx].total_updates;
                     let diff_from_last = actual_total_updates as f64 - prev_mode_updates as f64;
@@ -569,7 +533,6 @@ async fn main() {
             }
         }
 
-        // Apply VRAM Ring Buffer update commands outside the lock
         if full_redraw_needed {
             let img = Image {
                 width: MAX_HISTORY as u16, height: current_height as u16,
@@ -577,7 +540,6 @@ async fn main() {
             };
             let tex = Texture2D::from_image(&img);
             
-            // Standard pixel-perfect camera for drawing to RenderTarget (Y points down for proper 1:1 orientation)
             let cam = Camera2D {
                 render_target: Some(render_targets[current_fft_idx].clone()),
                 zoom: vec2(2.0 / MAX_HISTORY as f32, -2.0 / current_height as f32),
@@ -597,10 +559,9 @@ async fn main() {
             };
             set_camera(&cam);
             
-            // Draw only the new micro-strips onto the VRAM texture
             for (x, img) in delta_images {
                 let tex = Texture2D::from_image(&img);
-                tex.set_filter(FilterMode::Nearest); // Crisp pixel pasting
+                tex.set_filter(FilterMode::Nearest); 
                 draw_texture(&tex, x, 0.0, WHITE);
             }
             set_default_camera();
@@ -611,7 +572,6 @@ async fn main() {
         let sw = screen_width();
         let sh = screen_height();
 
-        // Smooth camera panning logic so the waterfall moves smoothly instead of stuttering
         let target_pos = actual_total_updates as f64;
         let diff = target_pos - smooth_head_pos;
         let dt = get_frame_time() as f64;
@@ -619,7 +579,6 @@ async fn main() {
         smooth_head_pos += diff * (15.0 * dt).min(1.0); 
         if diff.abs() > 50.0 { smooth_head_pos = target_pos; } 
         
-        // Use rem_euclid for perfect bounds safety when mathematical inflation pushes tracking negative
         let head_snapped = (smooth_head_pos.rem_euclid(MAX_HISTORY as f64)).floor() as f32;
         let head_offset = head_snapped;
 
@@ -647,13 +606,10 @@ async fn main() {
             _ => false
         };
 
-        // Texture Unwrapping Logic:
-        // Because the texture is a ring buffer, the "view window" might cross the end of the texture
-        // and wrap around to 0. We slice it into up to two `src` rects to handle this natively.
         let (src1, src2) = if start_pos_unwrapped < 0.0 {
             let overflow = start_pos_unwrapped.abs();
-            let s1 = Rect::new(tex_w - overflow, 0.0, overflow, tex_h); // Tail end of texture
-            let s2 = Rect::new(0.0, 0.0, head_offset, tex_h);           // Head end of texture
+            let s1 = Rect::new(tex_w - overflow, 0.0, overflow, tex_h);
+            let s2 = Rect::new(0.0, 0.0, head_offset, tex_h);
             (Some(s1), Some(s2))
         } else {
             let s1 = Rect::new(start_pos_unwrapped, 0.0, final_source_w_snapped, tex_h);
@@ -667,8 +623,6 @@ async fn main() {
 
         let texture_to_draw = &render_targets[current_fft_idx].texture;
 
-        // --- FINAL DRAW CALLS ---
-        // Based on the direction, we stitch the two texture slices (src1, src2) together on screen.
         if is_horizontal {
             let is_ltr = local_dir == ScrollDirection::LTR;
             let flip_x = is_ltr;
@@ -745,9 +699,6 @@ async fn main() {
     }
 }
 
-// --- FAST PAINTER ---
-// Blits a vertical column of FFT data directly into a 1D pixel array.
-// Avoids `f32.log()` and `f32.pow()` by utilizing the pre-calculated Map and LUT.
 #[inline(always)]
 fn paint_column_fast(
     pixels: &mut [u8], 
@@ -763,7 +714,6 @@ fn paint_column_fast(
     for i in 0..freq_bins {
         let y = i;
         
-        // Instant array lookups instead of calculating logarithmic math for every pixel
         let target_idx = if use_mel { y_map.mel_map[i] } else { y_map.linear_map[i] };
         
         let magnitude = data[target_idx];
@@ -778,8 +728,6 @@ fn paint_column_fast(
         pixels[idx+3] = 255;
     }
 }
-
-// Below are standard UI and Math helper functions
 
 fn cycle_colormap(c: ColorMapType) -> ColorMapType {
     match c {
