@@ -15,6 +15,7 @@ use libpulse_simple_binding::Simple;
 const SAMPLE_RATE: u32 = 44100;
 const HOP_SIZE: usize = 512;
 
+// The different FFT window sizes used for the multi-resolution composite. 
 const RESOLUTIONS: [usize; 3] = [2048, 4096, 8192];
 const MAX_HISTORY: usize = 2520; 
 const TARGET_DISPLAY_WIDTH: f32 = 2520.0;
@@ -32,7 +33,7 @@ struct AppSettings {
     redraw_flag: bool,
 }
 
-// Optimization: Pre-calculated Color Lookup Table
+// Optimization: Pre-calculated Color Lookup Table (LUT)
 struct ColorLut {
     bytes: Vec<[u8; 3]>, // Stores R,G,B for inputs 0..=255
 }
@@ -64,12 +65,93 @@ impl ColorLut {
     }
 }
 
+// Optimization: Pre-calculated Logarithmic (Mel) and Linear Coordinate Maps
+#[derive(Clone)]
+struct YToBinMap {
+    mel_map: Vec<usize>,
+    linear_map: Vec<usize>,
+}
+
+impl YToBinMap {
+    fn generate(freq_bins: usize, fft_size: usize) -> Self {
+        let mut mel_map = vec![0; freq_bins];
+        let mut linear_map = vec![0; freq_bins];
+        
+        let mel_min = 0.0;
+        let mel_max = 2595.0 * (1.0 + (SAMPLE_RATE as f32 / 2.0) / 700.0).log10();
+        let mel_normalization_factor = 2595.0;
+        let sample_rate_over_fft = SAMPLE_RATE as f32 / fft_size as f32;
+
+        for i in 0..freq_bins {
+            let norm_i = i as f32 / freq_bins as f32;
+            let mel = norm_i * (mel_max - mel_min) + mel_min;
+            let freq = 700.0 * (10.0f32.powf(mel / mel_normalization_factor) - 1.0);
+            mel_map[i] = ((freq / sample_rate_over_fft) as usize).min(freq_bins - 1);
+            
+            linear_map[i] = ((i as f32 / freq_bins as f32) * freq_bins as f32) as usize;
+        }
+
+        Self { mel_map, linear_map }
+    }
+}
+
+// Optimization: Pre-calculated Branchless Crossfade Map
+#[derive(Clone, Copy)]
+struct CrossfadeInstruction {
+    b_8192: usize, w_8192: f32,
+    b_4096: usize, w_4096: f32,
+    b_2048: usize, w_2048: f32,
+}
+
+fn build_crossfade_map() -> Vec<CrossfadeInstruction> {
+    let bins = RESOLUTIONS[2] / 2;
+    let mut map = Vec::with_capacity(bins);
+    
+    let freq_res_8192 = SAMPLE_RATE as f32 / 8192.0; 
+    let freq_res_4096 = SAMPLE_RATE as f32 / 4096.0; 
+    let freq_res_2048 = SAMPLE_RATE as f32 / 2048.0; 
+
+    for bin in 0..bins {
+        let freq = bin as f32 * freq_res_8192;
+        
+        let bin_4096 = ((freq / freq_res_4096) as usize).min(2047);
+        let bin_2048 = ((freq / freq_res_2048) as usize).min(1023);
+
+        let mut inst = CrossfadeInstruction {
+            b_8192: bin, w_8192: 0.0,
+            b_4096: bin_4096, w_4096: 0.0,
+            b_2048: bin_2048, w_2048: 0.0,
+        };
+
+        // Linear fade between the raw FFT outputs without artificial multipliers.
+        // This ensures the high-frequency overtones remain identical to the raw 2048 mode.
+        if freq < 200.0 {
+            inst.w_8192 = 1.0;
+        } else if freq < 300.0 {
+            let t = (freq - 200.0) / 100.0;
+            inst.w_8192 = 1.0 - t;
+            inst.w_4096 = t;
+        } else if freq < 1200.0 {
+            inst.w_4096 = 1.0;
+        } else if freq < 2000.0 {
+            let t = (freq - 1200.0) / 800.0;
+            inst.w_4096 = 1.0 - t;
+            inst.w_2048 = t;
+        } else {
+            inst.w_2048 = 1.0; 
+        }
+        map.push(inst);
+    }
+    map
+}
+
 struct SpectrogramLayer {
     fft_size: usize,
     freq_bins: usize,
-    pixels: Vec<u8>,
+    pixels: Vec<u8>,     
     head: usize,         
-    total_updates: u64, 
+    total_updates: u64,  
+    y_map: YToBinMap,
 }
 
 impl SpectrogramLayer {
@@ -102,6 +184,7 @@ async fn main() {
     for &size in RESOLUTIONS.iter() {
         layers.push(SpectrogramLayer::new(size));
     }
+    layers.push(SpectrogramLayer::new(RESOLUTIONS[2])); 
 
     let shared_layers = Arc::new(Mutex::new(layers));
     let shared_settings = Arc::new(Mutex::new(AppSettings {
@@ -122,17 +205,48 @@ async fn main() {
         let sink_name = String::from_utf8_lossy(&output.stdout).trim().to_string();
         let monitor = format!("{}.monitor", sink_name);
 
-        let spec = Spec { format: Format::F32le, channels: 1, rate: SAMPLE_RATE };
-        let frag_size = (SAMPLE_RATE as u32 * 4 * 15) / 1000;
-        let attr = BufferAttr {
-            maxlength: u32::MAX, tlength: u32::MAX, prebuf: u32::MAX, minreq: u32::MAX,
-            fragsize: frag_size,
+        let open_stream = |source: AudioSource| -> Option<Simple> {
+            let device_name = match source {
+                AudioSource::SinkMonitor => {
+                    if let Ok(output) = std::process::Command::new("pactl").arg("get-default-sink").output() {
+                        let sink_name = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                        format!("{}.monitor", sink_name) 
+                    } else {
+                        return None;
+                    }
+                },
+                AudioSource::Microphone => {
+                    if let Ok(output) = std::process::Command::new("pactl").arg("get-default-source").output() {
+                        String::from_utf8_lossy(&output.stdout).trim().to_string()
+                    } else {
+                        return None;
+                    }
+                }
+            };
+
+            let spec = Spec { format: Format::F32le, channels: 1, rate: SAMPLE_RATE };
+            let frag_size = (SAMPLE_RATE as u32 * 4 * 15) / 1000; 
+            let attr = BufferAttr {
+                maxlength: u32::MAX, tlength: u32::MAX, prebuf: u32::MAX, minreq: u32::MAX,
+                fragsize: frag_size,
+            };
+
+            Simple::new(None, "spector-bg", Direction::Record, Some(&device_name), "Recorder", &spec, None, Some(&attr)).ok()
         };
 
-        if let Ok(stream) = Simple::new(None, "RustySpec", Direction::Record, Some(&monitor), "Recorder", &spec, None, Some(&attr)) {
-            let mut buf = [0u8; 4096];
-            loop {
-                if let Ok(_) = stream.read(&mut buf) {
+        let mut stream = open_stream(current_source);
+        let mut buf = [0u8; 4096];
+
+        loop {
+            if let Ok(settings) = shared_settings_recorder.try_lock() {
+                if settings.audio_source != current_source {
+                    current_source = settings.audio_source;
+                    stream = open_stream(current_source);
+                }
+            }
+
+            if let Some(ref s) = stream {
+                if let Ok(_) = s.read(&mut buf) {
                     let floats: &[f32] = unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const f32, buf.len() / 4) };
                     producer.push_slice(floats);
                 }
@@ -149,14 +263,22 @@ async fn main() {
         let mut rolling_audio = vec![0.0; max_fft];
         let mut pending_buffer = Vec::with_capacity(4096);
 
-        // Store float history for redraws
-        let mut float_history: Vec<Vec<f32>> = RESOLUTIONS.iter().map(|&size| {
+        let mut float_history: Vec<Vec<f32>> = (0..=RESOLUTIONS.len()).map(|i| {
+            let size = if i < RESOLUTIONS.len() { RESOLUTIONS[i] } else { RESOLUTIONS[2] };
             vec![0.0f32; MAX_HISTORY * (size / 2)]
         }).collect();
 
         // Local LUT cache to avoid creating it every pixel
         let mut current_lut_type = ColorMapType::Magma;
         let mut lut = ColorLut::new(current_lut_type);
+
+        let mut local_cols = vec![
+            vec![0.0; RESOLUTIONS[0] / 2],
+            vec![0.0; RESOLUTIONS[1] / 2],
+            vec![0.0; RESOLUTIONS[2] / 2],
+            vec![0.0; RESOLUTIONS[2] / 2], 
+        ];
+        let crossfade_map = build_crossfade_map();
 
         loop {
             // 1. Check Flags & Redraw
@@ -180,7 +302,6 @@ async fn main() {
 
             let settings = local_settings.unwrap();
 
-            // Handle Redraw (Expensive but infrequent)
             if redraw_requested {
                 if let Ok(mut layers) = layers_ref.lock() {
                     for (i, layer) in layers.iter_mut().enumerate() {
@@ -189,6 +310,7 @@ async fn main() {
                             let slice = &float_history[i][start..start + layer.freq_bins];
                             paint_column_fast(&mut layer.pixels, t, slice, &settings, &lut, layer.freq_bins, layer.fft_size);
                         }
+                        layer.total_updates += (MAX_HISTORY * 2) as u64; 
                     }
                 }
             }
@@ -201,7 +323,7 @@ async fn main() {
                 pending_buffer.extend(temp);
             }
 
-            // 3. Processing
+            // 3. Processing Hot Loop
             while pending_buffer.len() >= HOP_SIZE {
                 let chunk: Vec<f32> = pending_buffer.drain(0..HOP_SIZE).collect();
                 
@@ -239,23 +361,26 @@ async fn main() {
                     }
                 }
 
-                // STEP B: Update State (Lock)
-                // We only lock when we are ready to write pixels
-                if !updates.is_empty() {
+                if computed_all {
+                    for (bin, inst) in crossfade_map.iter().enumerate() {
+                        local_cols[3][bin] = 
+                            local_cols[2][inst.b_8192] * inst.w_8192 +
+                            local_cols[1][inst.b_4096] * inst.w_4096 +
+                            local_cols[0][inst.b_2048] * inst.w_2048;
+                    }
+
                     if let Ok(mut layers) = layers_ref.lock() {
                         for up in updates {
                             let layer = &mut layers[up.idx];
                             let head_idx = layer.head;
 
-                            // Save Floats to history
                             let float_start = head_idx * layer.freq_bins;
                             let copy_len = up.raw_col.len().min(layer.freq_bins);
                             if float_start + copy_len <= float_history[up.idx].len() {
                                 float_history[up.idx][float_start..float_start+copy_len].copy_from_slice(&up.raw_col[0..copy_len]);
                             }
 
-                            // Paint Pixels using LUT
-                            paint_column_fast(&mut layer.pixels, head_idx, &up.raw_col, &settings, &lut, layer.freq_bins, layer.fft_size);
+                            paint_column_fast(&mut layer.pixels, head_idx, &local_cols[i], settings.mel_scale, &lut, &layer.y_map, layer.freq_bins);
 
                             layer.head = (layer.head + 1) % MAX_HISTORY;
                             layer.total_updates += 1;
@@ -274,13 +399,15 @@ async fn main() {
     let mut current_fft_idx = 1;
     let mut last_fft_idx = 1; 
     let mut current_view_len = MAX_HISTORY; 
-    let mut current_height = RESOLUTIONS[current_fft_idx] / 2;
-
-    let mut texture = Texture2D::from_image(&Image {
-        width: MAX_HISTORY as u16, height: current_height as u16,
-        bytes: vec![0; MAX_HISTORY * current_height * 4],
-    });
-    texture.set_filter(FilterMode::Linear);
+    
+    let mut render_targets = Vec::new();
+    for i in 0..=RESOLUTIONS.len() {
+        let size = if i < RESOLUTIONS.len() { RESOLUTIONS[i] } else { RESOLUTIONS[2] };
+        let rt = render_target(MAX_HISTORY as u32, (size / 2) as u32);
+        rt.texture.set_filter(FilterMode::Linear);
+        render_targets.push(rt);
+    }
+    let mut last_rendered_updates = vec![0u64; RESOLUTIONS.len() + 1];
 
     let mut local_mel = true;
     let mut local_cmap = ColorMapType::Magma;
@@ -319,11 +446,63 @@ async fn main() {
 
         let mut actual_total_updates = 0u64;
 
-        // Scope the lock to just data extraction to free it up for the audio thread
-        let pixels_clone = {
+        {
             if let Ok(layers) = shared_layers.lock() {
                 let layer = &layers[current_fft_idx];
                 actual_total_updates = layer.total_updates;
+                
+                let prev_updates = last_rendered_updates[current_fft_idx];
+                let diff = if actual_total_updates > prev_updates { actual_total_updates - prev_updates } else { 0 };
+                
+                let full_redraw_threshold = (MAX_HISTORY / 2) as u64;
+
+                if diff >= full_redraw_threshold {
+                    let expected_len = layer.pixels.len();
+                    if local_pixels_buffer.len() < expected_len {
+                        local_pixels_buffer.resize(expected_len, 0);
+                    }
+                    local_pixels_buffer[..expected_len].copy_from_slice(&layer.pixels);
+                    full_redraw_needed = true;
+                } else if diff > 0 {
+                    let diff_usize = diff as usize;
+                    let head = layer.head;
+                    let height = layer.freq_bins;
+
+                    if head >= diff_usize {
+                        let start_x = head - diff_usize;
+                        let mut img = Image { width: diff as u16, height: height as u16, bytes: vec![0; diff_usize * height * 4] };
+                        for y in 0..height {
+                            let src_row = y * MAX_HISTORY * 4;
+                            let dst_row = y * diff_usize * 4;
+                            img.bytes[dst_row .. dst_row + diff_usize * 4]
+                                .copy_from_slice(&layer.pixels[src_row + start_x * 4 .. src_row + (start_x + diff_usize) * 4]);
+                        }
+                        delta_images.push((start_x as f32, img));
+                    } else {
+                        let part1_len = diff_usize - head;
+                        let start_x = MAX_HISTORY - part1_len;
+                        
+                        let mut img1 = Image { width: part1_len as u16, height: height as u16, bytes: vec![0; part1_len * height * 4] };
+                        for y in 0..height {
+                            let src_row = y * MAX_HISTORY * 4;
+                            let dst_row = y * part1_len * 4;
+                            img1.bytes[dst_row .. dst_row + part1_len * 4]
+                                .copy_from_slice(&layer.pixels[src_row + start_x * 4 .. src_row + MAX_HISTORY * 4]);
+                        }
+                        delta_images.push((start_x as f32, img1));
+
+                        if head > 0 {
+                            let mut img2 = Image { width: head as u16, height: height as u16, bytes: vec![0; head * height * 4] };
+                            for y in 0..height {
+                                let src_row = y * MAX_HISTORY * 4;
+                                let dst_row = y * head * 4;
+                                img2.bytes[dst_row .. dst_row + head * 4]
+                                    .copy_from_slice(&layer.pixels[src_row .. src_row + head * 4]);
+                            }
+                            delta_images.push((0.0, img2));
+                        }
+                    }
+                }
                 
                 if current_fft_idx != last_fft_idx {
                     let prev_updates = layers[last_fft_idx].total_updates;
@@ -340,24 +519,53 @@ async fn main() {
             }
         };
 
-        if let Some(px) = pixels_clone {
-             let img = Image {
+        if full_redraw_needed {
+            let img = Image {
                 width: MAX_HISTORY as u16, height: current_height as u16,
                 bytes: px,
             };
-            texture.update(&img);
+            let tex = Texture2D::from_image(&img);
+            
+            let cam = Camera2D {
+                render_target: Some(render_targets[current_fft_idx].clone()),
+                zoom: vec2(2.0 / MAX_HISTORY as f32, -2.0 / current_height as f32),
+                target: vec2(MAX_HISTORY as f32 / 2.0, current_height as f32 / 2.0),
+                ..Default::default()
+            };
+            set_camera(&cam);
+            draw_texture(&tex, 0.0, 0.0, WHITE);
+            set_default_camera();
+            last_rendered_updates[current_fft_idx] = actual_total_updates;
+        } else if !delta_images.is_empty() {
+            let cam = Camera2D {
+                render_target: Some(render_targets[current_fft_idx].clone()),
+                zoom: vec2(2.0 / MAX_HISTORY as f32, -2.0 / current_height as f32),
+                target: vec2(MAX_HISTORY as f32 / 2.0, current_height as f32 / 2.0),
+                ..Default::default()
+            };
+            set_camera(&cam);
+            
+            for (x, img) in delta_images {
+                let tex = Texture2D::from_image(&img);
+                tex.set_filter(FilterMode::Nearest); 
+                draw_texture(&tex, x, 0.0, WHITE);
+            }
+            set_default_camera();
+            last_rendered_updates[current_fft_idx] = actual_total_updates;
         }
 
         clear_background(BLACK);
         let sw = screen_width();
         let sh = screen_height();
 
-        // --- SMOOTH SCROLL ---
         let target_pos = actual_total_updates as f64;
         smooth_head_pos += (target_pos - smooth_head_pos) * 0.5;
         if (target_pos - smooth_head_pos).abs() > 50.0 { smooth_head_pos = target_pos; }
         
-        let head_snapped = (smooth_head_pos % MAX_HISTORY as f64).floor() as f32;
+        smooth_head_pos += diff * (15.0 * dt).min(1.0); 
+        if diff.abs() > 50.0 { smooth_head_pos = target_pos; } 
+        
+        let head_snapped = (smooth_head_pos.rem_euclid(MAX_HISTORY as f64)).floor() as f32;
         let head_offset = head_snapped;
 
         let (screen_time_dim, screen_freq_dim) = match local_dir {
@@ -399,7 +607,8 @@ async fn main() {
         let total_draw_len = dst1_len + dst2_len;
         let start_pos_screen = (screen_time_dim - total_draw_len) / 2.0;
 
-        // --- DRAWING ---
+        let texture_to_draw = &render_targets[current_fft_idx].texture;
+
         if is_horizontal {
             let is_ltr = local_dir == ScrollDirection::LTR;
             let flip_x = is_ltr;
@@ -474,7 +683,7 @@ async fn main() {
     }
 }
 
-// --- FAST PAINTER (Uses LUT) ---
+#[inline(always)]
 fn paint_column_fast(
     pixels: &mut Vec<u8>, 
     col_idx: usize, 
@@ -497,19 +706,7 @@ fn paint_column_fast(
         // Invert Y axis here (standard spectrogram view)
         let y = (freq_bins - 1) - i;
         
-        let target_idx = if settings.mel_scale {
-            let norm_i = i as f32 / freq_bins as f32;
-            let mel = norm_i * (mel_max - mel_min) + mel_min;
-            let freq = 700.0 * (10.0f32.powf(mel / mel_normalization_factor) - 1.0);
-            (freq / sample_rate_over_fft) as usize
-        } else {
-            // Linear scale
-            let norm_i = i as f32 / freq_bins as f32;
-            (norm_i * max_freq_idx as f32) as usize
-        };
-
-        let safe_idx = target_idx.min(max_freq_idx - 1);
-        let magnitude = data[safe_idx];
+        let target_idx = if use_mel { y_map.mel_map[i] } else { y_map.linear_map[i] };
         
         // Intensity mapping
         let intensity = (magnitude * 2000.0).ln() / 8.0;
@@ -528,7 +725,6 @@ fn paint_column_fast(
         }
     }
 }
-
 
 fn cycle_colormap(c: ColorMapType) -> ColorMapType {
     match c {
