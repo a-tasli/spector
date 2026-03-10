@@ -2,6 +2,16 @@
 name = "spector"
 version = "0.1.0"
 edition = "2024"
+default-run = "spector"
+
+[[bin]]
+name = "spector"
+path = "src/main.rs"
+
+[[bin]]
+name = "spector-bg"
+path = "src/main.rs"
+required-features = ["bg"]
 
 [dependencies]
 macroquad = "0.4"          # The Game Engine (Fast & Light)
@@ -10,3 +20,7 @@ spectrum-analyzer = "1.5"  # FFT Math
 colorous = "1.0"           # Pro Colormaps
 libpulse-binding = "2.28"  # Audio Driver
 libpulse-simple-binding = "2.28"
+
+[features]
+default = []
+bg = []
