@@ -24,7 +24,7 @@ const RESOLUTIONS: [usize; 3] = [2048, 4096, 8192];
 const MAX_HISTORY: usize = 2520; 
 const TARGET_DISPLAY_WIDTH: f32 = 2520.0;
 
-const DRAW_UI: bool = true;
+const DRAW_UI: bool = false;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum ColorMapType { Magma, Inferno, Viridis, Plasma, Turbo, Cubehelix }
