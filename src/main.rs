@@ -38,10 +38,13 @@ enum ScrollDirection { RTL, LTR, DTU, UTD }
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum AudioSource { SinkMonitor, Microphone }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ScaleType { Linear, Mel, Logarithmic, Chromatic }
+
 /// Shared state between the Brain (processing) and Face (UI) threads.
 #[derive(Clone)]
 struct AppSettings {
-    mel_scale: bool,
+    scale_type: ScaleType,
     colormap: ColorMapType,
     redraw_flag: bool,
     audio_source: AudioSource,
@@ -175,7 +178,7 @@ varying lowp vec2 uv;
 varying lowp vec4 color;
 uniform sampler2D Texture;
 uniform sampler2D colormap;
-uniform float use_mel;
+uniform float scale_type;
 uniform float sample_rate;
 
 void main() {
@@ -183,16 +186,31 @@ void main() {
     // By inverting uv.y, norm_f becomes 0.0 at the bottom (DC) and 1.0 at the top (Nyquist).
     float norm_f = 1.0 - uv.y; 
 
-    // GPU-accelerated Mel-scale stretching
-    if (use_mel > 0.5) {
+    if (scale_type > 2.5) {
+        // 3.0 = Chromatic (starts precisely at C0: 16.35Hz)
+        float min_freq = 16.35159;
         float max_freq = sample_rate / 2.0;
-        
+        float log_min = log2(min_freq);
+        float log_max = log2(max_freq);
+        float current_log = log_min + norm_f * (log_max - log_min);
+        float current_hz = exp2(current_log);
+        norm_f = clamp(current_hz / max_freq, 0.0, 1.0);
+    } else if (scale_type > 1.5) {
+        // 2.0 = Logarithmic (starts at standard 20Hz limit)
+        float min_freq = 20.0;
+        float max_freq = sample_rate / 2.0;
+        float log_min = log2(min_freq);
+        float log_max = log2(max_freq);
+        float current_log = log_min + norm_f * (log_max - log_min);
+        float current_hz = exp2(current_log);
+        norm_f = clamp(current_hz / max_freq, 0.0, 1.0);
+    } else if (scale_type > 0.5) {
+        // 1.0 = Mel
+        float max_freq = sample_rate / 2.0;
         float mel_max = 2595.0 * (log(1.0 + max_freq / 700.0) / 2.30258509299);
         float current_mel = norm_f * mel_max;
-        
         float current_hz = 700.0 * (exp((current_mel / 2595.0) * 2.30258509299) - 1.0);
-        
-        norm_f = current_hz / max_freq;
+        norm_f = clamp(current_hz / max_freq, 0.0, 1.0);
     }
 
     // The CPU paints DC at the bottom of the memory array (y = max), which translates to OpenGL v = 0.0 natively.
@@ -228,7 +246,7 @@ async fn main() {
 
     let shared_layers = Arc::new(Mutex::new(layers));
     let shared_settings = Arc::new(Mutex::new(AppSettings {
-        mel_scale: true,
+        scale_type: ScaleType::Mel,
         colormap: ColorMapType::Magma,
         redraw_flag: false,
         audio_source: AudioSource::SinkMonitor,
@@ -439,7 +457,7 @@ async fn main() {
     }
     let mut last_rendered_updates = vec![0u64; RESOLUTIONS.len() + 1];
 
-    let mut local_mel = true;
+    let mut local_scale = ScaleType::Mel;
     let mut local_cmap = ColorMapType::Magma;
     let mut local_dir = ScrollDirection::RTL;
     let mut local_source = AudioSource::SinkMonitor;
@@ -453,7 +471,7 @@ async fn main() {
         ShaderSource::Glsl { vertex: VERTEX_SHADER, fragment: FRAGMENT_SHADER },
         MaterialParams {
             uniforms: vec![
-                UniformDesc::new("use_mel", UniformType::Float1),
+                UniformDesc::new("scale_type", UniformType::Float1),
                 UniformDesc::new("sample_rate", UniformType::Float1),
             ],
             textures: vec!["colormap".to_string()],
@@ -468,7 +486,7 @@ async fn main() {
         let mut visual_changed = false;
         let mut source_changed = false;
 
-        if is_key_pressed(KeyCode::S) { local_mel = !local_mel; } 
+        if is_key_pressed(KeyCode::S) { local_scale = cycle_scale(local_scale); visual_changed = true; } 
         if is_key_pressed(KeyCode::C) { local_cmap = cycle_colormap(local_cmap); visual_changed = true; }
         if is_key_pressed(KeyCode::F) { local_dir = cycle_direction(local_dir); }
         if is_key_pressed(KeyCode::R) { current_fft_idx = (current_fft_idx + 1) % (RESOLUTIONS.len() + 1); } 
@@ -491,7 +509,7 @@ async fn main() {
                 colormap_texture = create_colormap_texture(&lut);
             }
             if let Ok(mut s) = shared_settings.lock() {
-                s.mel_scale = local_mel;
+                s.scale_type = local_scale;
                 s.colormap = local_cmap;
                 s.audio_source = local_source;
             }
@@ -660,7 +678,13 @@ async fn main() {
 
         let texture_to_draw = &render_targets[current_fft_idx].texture;
 
-        shader_material.set_uniform("use_mel", if local_mel { 1.0f32 } else { 0.0f32 });
+        let scale_uniform_val = match local_scale {
+            ScaleType::Linear => 0.0f32,
+            ScaleType::Mel => 1.0f32,
+            ScaleType::Logarithmic => 2.0f32,
+            ScaleType::Chromatic => 3.0f32,
+        };
+        shader_material.set_uniform("scale_type", scale_uniform_val);
         shader_material.set_uniform("sample_rate", SAMPLE_RATE as f32);
         shader_material.set_texture("colormap", colormap_texture.clone());
         gl_use_material(&shader_material);
@@ -735,8 +759,8 @@ async fn main() {
 
         gl_use_default_material();
 
-        draw_note_ruler(local_mel, local_dir, display_fft_size);
-        if DRAW_UI { draw_ui_overlay(local_mel, local_cmap, local_dir, current_fft_idx, current_view_len, local_source); }
+        draw_note_ruler(local_scale, local_dir, display_fft_size);
+        if DRAW_UI { draw_ui_overlay(local_scale, local_cmap, local_dir, current_fft_idx, current_view_len, local_source); }
 
         if DRAW_UI {
             // --- Interactive Mouse Crosshair (Frequency/Note Peeking) ---
@@ -762,12 +786,25 @@ async fn main() {
             // Only show tooltip if the mouse is hovering over the actual drawn area
             if norm_time >= 0.0 && norm_time <= 1.0 && norm_freq >= 0.0 && norm_freq <= 1.0 {
                 let max_freq = SAMPLE_RATE as f32 / 2.0;
-                let current_hz = if local_mel {
-                    let mel_max = 2595.0 * (1.0 + max_freq / 700.0).log10();
-                    let current_mel = norm_freq * mel_max;
-                    700.0 * (10.0f32.powf(current_mel / 2595.0) - 1.0)
-                } else {
-                    norm_freq * max_freq
+                let current_hz = match local_scale {
+                    ScaleType::Linear => norm_freq * max_freq,
+                    ScaleType::Mel => {
+                        let mel_max = 2595.0 * (1.0 + max_freq / 700.0).log10();
+                        let current_mel = norm_freq * mel_max;
+                        700.0 * (10.0f32.powf(current_mel / 2595.0) - 1.0)
+                    },
+                    ScaleType::Logarithmic => {
+                        let min_freq = 20.0f32;
+                        let log_min = min_freq.log2();
+                        let log_max = max_freq.log2();
+                        2.0f32.powf(log_min + norm_freq * (log_max - log_min))
+                    },
+                    ScaleType::Chromatic => {
+                        let min_freq = 16.35159f32;
+                        let log_min = min_freq.log2();
+                        let log_max = max_freq.log2();
+                        2.0f32.powf(log_min + norm_freq * (log_max - log_min))
+                    }
                 };
 
                 // The drawn duration depends on the ACTUAL width we rendered, not strictly current_view_len
@@ -858,6 +895,15 @@ fn hz_to_pitch(hz: f32) -> (String, f32) {
     (format!("{}{}{}", note_names[note_idx], octave, cent_str), cents)
 }
 
+fn cycle_scale(s: ScaleType) -> ScaleType {
+    match s {
+        ScaleType::Linear => ScaleType::Mel,
+        ScaleType::Mel => ScaleType::Logarithmic,
+        ScaleType::Logarithmic => ScaleType::Chromatic,
+        ScaleType::Chromatic => ScaleType::Linear,
+    }
+}
+
 fn cycle_colormap(c: ColorMapType) -> ColorMapType {
     match c {
         ColorMapType::Magma => ColorMapType::Inferno,
@@ -878,18 +924,35 @@ fn cycle_direction(d: ScrollDirection) -> ScrollDirection {
     }
 }
 
-fn freq_to_screen_pos(freq: f32, mel_scale: bool) -> f32 {
+fn freq_to_screen_pos(freq: f32, scale: ScaleType) -> f32 {
     let max_freq = SAMPLE_RATE as f32 / 2.0;
-    if mel_scale {
-        let mel_val = 2595.0 * (1.0 + freq / 700.0).log10();
-        let mel_max = 2595.0 * (1.0 + max_freq / 700.0).log10();
-        mel_val / mel_max
-    } else {
-        freq / max_freq
+    match scale {
+        ScaleType::Linear => freq / max_freq,
+        ScaleType::Mel => {
+            let mel_val = 2595.0 * (1.0 + freq / 700.0).log10();
+            let mel_max = 2595.0 * (1.0 + max_freq / 700.0).log10();
+            mel_val / mel_max
+        },
+        ScaleType::Logarithmic => {
+            let min_freq = 20.0f32;
+            if freq <= min_freq { return -1.0; } // Ensure off-screen handling
+            let log_f = freq.log2();
+            let log_min = min_freq.log2();
+            let log_max = max_freq.log2();
+            (log_f - log_min) / (log_max - log_min)
+        },
+        ScaleType::Chromatic => {
+            let min_freq = 16.35159f32;
+            if freq <= min_freq { return -1.0; } // Ensure off-screen handling
+            let log_f = freq.log2();
+            let log_min = min_freq.log2();
+            let log_max = max_freq.log2();
+            (log_f - log_min) / (log_max - log_min)
+        }
     }
 }
 
-fn draw_note_ruler(mel_scale: bool, dir: ScrollDirection, fft_size: usize) {
+fn draw_note_ruler(scale: ScaleType, dir: ScrollDirection, fft_size: usize) {
     let w = screen_width();
     let h = screen_height();
     if fft_size == 0 { return; }
@@ -897,7 +960,8 @@ fn draw_note_ruler(mel_scale: bool, dir: ScrollDirection, fft_size: usize) {
     for midi in 21..109 {
         let freq = 440.0 * 2.0f32.powf((midi as f32 - 69.0) / 12.0);
         if freq > (SAMPLE_RATE as f32 / 2.0) { break; }
-        let norm_pos = freq_to_screen_pos(freq, mel_scale);
+        let norm_pos = freq_to_screen_pos(freq, scale);
+        if norm_pos < 0.0 || norm_pos > 1.0 { continue; } // Exclude notes outside displayable bounds
         
         let (x, y, is_c) = match dir {
             ScrollDirection::RTL => (w, h * (1.0 - norm_pos), midi % 12 == 0),
@@ -935,8 +999,8 @@ struct UiStat {
     color: Color,
 }
 
-fn draw_ui_overlay(mel: bool, cmap: ColorMapType, dir: ScrollDirection, fft_idx: usize, history: usize, source: AudioSource) {
-    let scale_str = if mel { "Mel" } else { "Linear" };
+fn draw_ui_overlay(scale: ScaleType, cmap: ColorMapType, dir: ScrollDirection, fft_idx: usize, history: usize, source: AudioSource) {
+    let scale_str = format!("{:?}", scale);
     let map_str = format!("{:?}", cmap); 
     let dir_str = match dir {
         ScrollDirection::RTL => "RTL", 
