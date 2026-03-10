@@ -742,13 +742,24 @@ async fn main() {
             // --- Interactive Mouse Crosshair (Frequency/Note Peeking) ---
             let (mx, my) = mouse_position();
             
-            let (norm_time, norm_freq) = match local_dir {
-                ScrollDirection::RTL => (1.0 - (mx / sw), 1.0 - (my / sh)),
-                ScrollDirection::LTR => (mx / sw, 1.0 - (my / sh)),
-                ScrollDirection::DTU => (1.0 - (my / sh), mx / sw), 
-                ScrollDirection::UTD => (my / sh, mx / sw),
+            // Re-map the mouse position to be relative to the *drawn area* (handling scaling and centering)
+            let norm_time = if total_draw_len > 0.0 {
+                match local_dir {
+                    ScrollDirection::RTL => (start_pos_screen + total_draw_len - mx) / total_draw_len,
+                    ScrollDirection::LTR => (mx - start_pos_screen) / total_draw_len,
+                    ScrollDirection::DTU => (start_pos_screen + total_draw_len - my) / total_draw_len,
+                    ScrollDirection::UTD => (my - start_pos_screen) / total_draw_len,
+                }
+            } else {
+                -1.0
             };
 
+            let norm_freq = match local_dir {
+                ScrollDirection::RTL | ScrollDirection::LTR => 1.0 - (my / sh),
+                ScrollDirection::DTU | ScrollDirection::UTD => mx / sw, 
+            };
+
+            // Only show tooltip if the mouse is hovering over the actual drawn area
             if norm_time >= 0.0 && norm_time <= 1.0 && norm_freq >= 0.0 && norm_freq <= 1.0 {
                 let max_freq = SAMPLE_RATE as f32 / 2.0;
                 let current_hz = if local_mel {
@@ -759,8 +770,9 @@ async fn main() {
                     norm_freq * max_freq
                 };
 
-                let view_time_seconds = (current_view_len as f32 * HOP_SIZE as f32) / SAMPLE_RATE as f32;
-                let time_ago = norm_time * view_time_seconds;
+                // The drawn duration depends on the ACTUAL width we rendered, not strictly current_view_len
+                let drawn_time_seconds = (final_source_w_snapped * HOP_SIZE as f32) / SAMPLE_RATE as f32;
+                let time_ago = norm_time * drawn_time_seconds;
                 let (note_name, _) = hz_to_pitch(current_hz);
 
                 draw_line(mx, 0.0, mx, sh, 1.0, Color::new(1.0, 1.0, 1.0, 0.3));
@@ -769,8 +781,10 @@ async fn main() {
                 let mut intensity_u8 = 0;
                 if let Ok(layers) = shared_layers.lock() {
                     let layer = &layers[current_fft_idx];
-                    let history_col = (norm_time * current_view_len as f32) as usize;
-                    let ring_buffer_col = (head_snapped as usize + MAX_HISTORY - 1 - history_col) % MAX_HISTORY;
+                    
+                    // Recover the exact column relative to the current subpixel write-head
+                    let exact_col = (head_offset - (norm_time * final_source_w_snapped) - 1.0).floor();
+                    let ring_buffer_col = exact_col.rem_euclid(MAX_HISTORY as f32) as usize;
                     
                     let bin_idx = ((current_hz / max_freq) * layer.freq_bins as f32) as usize;
                     let bin_idx = bin_idx.clamp(0, layer.freq_bins.saturating_sub(1));
