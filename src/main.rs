@@ -16,6 +16,12 @@ const SAMPLE_RATE: u32 = 44100;
 const MIN_HOP_SIZE: usize = 256; 
 const CQT_HOP_SIZE: usize = 512; 
 
+// --- SPECTRAL OVERSAMPLING (Zero-Padding) ---
+// Activating this pads lower-resolution STFT windows with zeros up to the OVERSAMPLE_TARGET.
+// This multiplies the frequency bins (resolving "black space" gaps) WITHOUT sacrificing temporal sharpness.
+const SPECTRAL_OVERSAMPLING: bool = true;
+const OVERSAMPLE_TARGET: usize = 16384; 
+
 // Professional Visualizer Tweaks
 const PINK_NOISE_TILT_DB_PER_OCTAVE: f32 = 0.0; // 3.0 is standard for mastered music
 const PEAK_WEIGHT: f32 = 0.5; // Hybrid Peak-RMS balance
@@ -23,6 +29,7 @@ const RMS_WEIGHT: f32 = 0.5;
 
 // --- NEW CONFIGS: PSD & Adaptive Smoothing ---
 const PSD_NORMALIZATION: bool = true;  // Flattens white noise by dividing by bandwidth (energy density)
+const PEAK_DENSITY_DAMPENING: f32 = 1.0; // Amount to smooth brightness banding at STFT boundaries. 0.0 = off, 1.0 = mathematically flat.
 
 const DECAY_LOW_FREQ: f32 = 0.01;      // Heavy phosphor in the bass for stability
 const DECAY_HIGH_FREQ: f32 = 0.005;     // Fast release in the treble for transients
@@ -162,6 +169,7 @@ struct CqtInstruction {
     b_start: usize,
     weights: Vec<f32>,
     weight_sum: f32,
+    peak_dampening: f32,
 }
 
 // Generates dynamic Gaussian/Hann kernels to perfectly blend sparse bass bins
@@ -201,7 +209,7 @@ fn build_splat_kernels() -> Vec<SplatKernel> {
     }).collect()
 }
 
-fn build_cqt_map(sample_rate: u32) -> (Vec<CqtInstruction>, Vec<(usize, Biquad, f32)>) {
+fn build_cqt_map(sample_rate: u32, stft_specs: &[(usize, usize)]) -> (Vec<CqtInstruction>, Vec<(usize, Biquad, f32)>) {
     let mut stft_map = Vec::with_capacity(CQT_BINS);
     let mut iir_filters = Vec::new();
     
@@ -229,24 +237,35 @@ fn build_cqt_map(sample_rate: u32) -> (Vec<CqtInstruction>, Vec<(usize, Biquad, 
             iir_filters.push((bin, Biquad::bandpass(sample_rate as f32, freq, q_factor), bw_hz));
         }
         
-        let min_stft_bw = sample_rate as f32 / RESOLUTIONS[RESOLUTIONS.len()-1] as f32;
+        let (max_win_size, _) = stft_specs[stft_specs.len() - 1];
+        let min_stft_bw = sample_rate as f32 / max_win_size as f32;
         if bw_hz < min_stft_bw * 1.5 {
             bw_hz = min_stft_bw * 1.5;
         }
 
-        let ideal_n = (4.0 * sample_rate as f32 / bw_hz) as usize;
+        let ideal_n_float = 4.0 * sample_rate as f32 / bw_hz;
+        let ideal_n = ideal_n_float as usize;
         
         let mut best_idx = 0;
         let mut min_diff = usize::MAX;
-        for (i, &res) in RESOLUTIONS.iter().enumerate() {
-            let diff = (res as isize - ideal_n as isize).unsigned_abs();
+        // Select the STFT state based on its temporal window size
+        for (i, &(win_res, _)) in stft_specs.iter().enumerate() {
+            let diff = (win_res as isize - ideal_n as isize).unsigned_abs();
             if diff < min_diff {
                 min_diff = diff;
                 best_idx = i;
             }
         }
         
-        let fft_size = RESOLUTIONS[best_idx];
+        let (win_res, fft_size) = stft_specs[best_idx];
+        
+        // --- SOLUTION 2: PEAK-DENSITY DAMPENING ---
+        // Calculates the true mismatch between theoretical ideal density and our discrete bins.
+        // Interpolates the dampening target based on the PEAK_DENSITY_DAMPENING config amount.
+        let density_mismatch = win_res as f32 / ideal_n_float;
+        let target_dampening = 1.0 / density_mismatch.powf(0.5);
+        let peak_dampening = 1.0 + (target_dampening - 1.0) * PEAK_DENSITY_DAMPENING;
+
         let freq_res = sample_rate as f32 / fft_size as f32;
         let center_bin = freq / freq_res;
         let mut bw_bins = bw_hz / freq_res;
@@ -288,6 +307,7 @@ fn build_cqt_map(sample_rate: u32) -> (Vec<CqtInstruction>, Vec<(usize, Biquad, 
             b_start: start_bin,
             weights,
             weight_sum,
+            peak_dampening,
         });
     }
     (stft_map, iir_filters)
@@ -313,6 +333,7 @@ impl SpectrogramLayer {
 
 // State container for our Phase Vocoder
 struct StftState {
+    window_size: usize,
     fft_size: usize,
     hop_size: usize,
     samples_since_last: usize,
@@ -323,6 +344,7 @@ struct StftState {
     decays: Vec<f32>, // Frequency-mapped phosphor decays
     fft: Arc<dyn rustfft::Fft<f32>>,
     window: Vec<f32>,
+    scratch_buffer: Vec<Complex<f32>>, // Pre-allocated buffer for Zero-Padding
 }
 
 const VERTEX_SHADER: &str = r#"#version 100
@@ -440,7 +462,8 @@ fn window_conf() -> Conf {
 async fn main() {
     let mut layers = Vec::new();
     for &size in RESOLUTIONS.iter() {
-        layers.push(SpectrogramLayer::new(size / 2));
+        let actual_fft = if SPECTRAL_OVERSAMPLING { OVERSAMPLE_TARGET.max(size) } else { size };
+        layers.push(SpectrogramLayer::new(actual_fft / 2));
     }
     // We now maintain TWO parallel CQT history buffers: one WITH IIR, one WITHOUT IIR.
     layers.push(SpectrogramLayer::new(CQT_BINS)); 
@@ -541,20 +564,57 @@ async fn main() {
         let mut rolling_audio = vec![0.0; max_fft];
         let mut pending_buffer = Vec::with_capacity(4096);
 
+        // 1. Establish precise padding target states for the FFT planner
+        let stft_specs: Vec<(usize, usize)> = RESOLUTIONS.iter().map(|&res| {
+            let actual_fft = if SPECTRAL_OVERSAMPLING { OVERSAMPLE_TARGET.max(res) } else { res };
+            (res, actual_fft)
+        }).collect();
+
+        // 2. Setup Phase Vocoder states
+        let mut planner = FftPlanner::new();
+        let mut stft_states: Vec<StftState> = stft_specs.iter().zip(HOP_SIZES.iter()).map(|(&(win_size, fft_size), &hop_size)| {
+            let freq_res = SAMPLE_RATE as f32 / fft_size as f32;
+            let mut decays = vec![0.0f32; fft_size / 2];
+            let min_log = 20.0f32.log2();
+            let log_range = (SAMPLE_RATE as f32 / 2.0).log2() - min_log;
+
+            for bin in 0..(fft_size / 2) {
+                let freq = bin as f32 * freq_res;
+                let norm = if freq >= 20.0 { ((freq.log2() - min_log) / log_range).clamp(0.0, 1.0) } else { 0.0 };
+                decays[bin] = DECAY_LOW_FREQ + (DECAY_HIGH_FREQ - DECAY_LOW_FREQ) * norm;
+            }
+
+            StftState {
+                window_size: win_size,
+                fft_size,
+                hop_size,
+                samples_since_last: hop_size, // Trigger immediately on start
+                prev_phases: vec![0.0; fft_size / 2],
+                last_mags: vec![0.0; fft_size / 2],
+                display_mags: vec![0.0; fft_size / 2],
+                last_true_freqs: vec![0.0; fft_size / 2],
+                decays,
+                fft: planner.plan_fft_forward(fft_size),
+                window: generate_hann_window(win_size),
+                scratch_buffer: vec![Complex { re: 0.0, im: 0.0 }; fft_size],
+            }
+        }).collect();
+
+        // 3. Size float history accurately accommodating oversampled dimensions
         let mut float_history: Vec<Vec<f32>> = (0..=RESOLUTIONS.len() + 1).map(|i| {
-            let size = if i < RESOLUTIONS.len() { RESOLUTIONS[i] / 2 } else { CQT_BINS };
+            let size = if i < RESOLUTIONS.len() { stft_states[i].fft_size / 2 } else { CQT_BINS };
             vec![0.0f32; MAX_HISTORY * size]
         }).collect();
 
         let mut local_cqt_col_no_iir: Vec<f32> = vec![0.0; CQT_BINS];
         let mut local_cqt_col_with_iir: Vec<f32> = vec![0.0; CQT_BINS];
 
-        // --- Generate Visual Tilt Curves ---
+        // 4. Generate Visual Tilt Curves natively tied to mapped resolutions
         let mut tilt_curves: Vec<Vec<f32>> = Vec::new();
-        for &fft_size in RESOLUTIONS.iter() {
-            let half_size = fft_size / 2;
+        for state in &stft_states {
+            let half_size = state.fft_size / 2;
             let mut curve = vec![1.0f32; half_size];
-            let freq_res = SAMPLE_RATE as f32 / fft_size as f32;
+            let freq_res = SAMPLE_RATE as f32 / state.fft_size as f32;
             let min_log = 20.0f32.log2();
             
             for bin in 0..half_size {
@@ -587,32 +647,7 @@ async fn main() {
         tilt_curves.push(cqt_tilt_curve.clone()); // Add tilt for CQT (No IIR) layer
         tilt_curves.push(cqt_tilt_curve);         // Add tilt for CQT (With IIR) layer
 
-        // Setup Phase Vocoder states for each resolution tier
-        let mut planner = FftPlanner::new();
-        let mut stft_states: Vec<StftState> = RESOLUTIONS.iter().zip(HOP_SIZES.iter()).map(|(&fft_size, &hop_size)| {
-            let freq_res = SAMPLE_RATE as f32 / fft_size as f32;
-            let mut decays = vec![0.0f32; fft_size / 2];
-            for bin in 0..(fft_size / 2) {
-                let freq = bin as f32 * freq_res;
-                let norm = if freq >= 20.0 { ((freq.log2() - min_log) / log_range).clamp(0.0, 1.0) } else { 0.0 };
-                decays[bin] = DECAY_LOW_FREQ + (DECAY_HIGH_FREQ - DECAY_LOW_FREQ) * norm;
-            }
-
-            StftState {
-                fft_size,
-                hop_size,
-                samples_since_last: hop_size, // Trigger immediately on start
-                prev_phases: vec![0.0; fft_size / 2],
-                last_mags: vec![0.0; fft_size / 2],
-                display_mags: vec![0.0; fft_size / 2],
-                last_true_freqs: vec![0.0; fft_size / 2],
-                decays,
-                fft: planner.plan_fft_forward(fft_size),
-                window: generate_hann_window(fft_size),
-            }
-        }).collect();
-
-        let (stft_cqt_map, mut iir_filters) = build_cqt_map(SAMPLE_RATE);
+        let (stft_cqt_map, mut iir_filters) = build_cqt_map(SAMPLE_RATE, &stft_specs);
         let splat_kernels = build_splat_kernels();
         
         let min_stft_weight_sum = stft_cqt_map.first().map(|inst| inst.weight_sum).unwrap_or(1.0);
@@ -700,18 +735,22 @@ async fn main() {
                     state.samples_since_last += MIN_HOP_SIZE;
                     
                     if state.samples_since_last >= state.hop_size {
-                        let start_sample = len - state.fft_size;
+                        let start_sample = len - state.window_size;
                         let audio_slice = &rolling_audio[start_sample..];
                         
-                        let mut buffer: Vec<Complex<f32>> = audio_slice.iter().zip(state.window.iter())
-                            .map(|(&a, &w)| Complex { re: a * w, im: 0.0 })
-                            .collect();
+                        // Rigorous Zero-Padding insertion utilizing CPU-friendly pre-allocated buffer
+                        let buffer = &mut state.scratch_buffer;
+                        buffer.fill(Complex { re: 0.0, im: 0.0 });
+                        for (i, (&a, &w)) in audio_slice.iter().zip(state.window.iter()).enumerate() {
+                            buffer[i] = Complex { re: a * w, im: 0.0 };
+                        }
                         
-                        state.fft.process(&mut buffer);
+                        state.fft.process(buffer);
                         
                         // --- STFT PARITY MATH ---
-                        let scale = 2.0 / state.fft_size as f32; // mathematically pure (read by CQT layer)
-                        let broadband_comp = (state.fft_size as f32 / 2048.0).sqrt(); // fix energy spreading
+                        // Magnitude normalization acts strictly upon the original time-window envelope span to remain perfectly consistent
+                        let scale = 2.0 / state.window_size as f32; 
+                        let broadband_comp = (state.window_size as f32 / 2048.0).sqrt(); // fix energy spreading
                         let cqt_makeup_gain = STFT_BOOST_GAIN.sqrt() * HALO_SHARP_BLEND; // fix absolute brightness
                         
                         let half_size = state.fft_size / 2;
@@ -793,6 +832,12 @@ async fn main() {
                         let default_bin = inst.cqt_bin_idx;
                         let norm_factor = if PSD_NORMALIZATION { inst.weight_sum / min_stft_weight_sum } else { 1.0 };
                         
+                        // --- RESOLUTION COMPENSATION ---
+                        // Re-aligns energy scaling identically to original window widths regardless of spectral oversampling multiplier
+                        let resolution_comp = state.window_size as f32 / 2048.0;
+                        let comp_mag_factor = resolution_comp.sqrt();
+                        let peak_dampening = inst.peak_dampening;
+                        
                         let start = inst.b_start;
                         let end = start + inst.weights.len();
                         
@@ -800,12 +845,16 @@ async fn main() {
                         let freqs = &state.last_true_freqs[start..end];
                         
                         for ((&mag, &true_freq), &w) in mags.iter().zip(freqs).zip(&inst.weights) {
-                            let energy = ((mag * mag) * w) / norm_factor;
+                            // Apply compensation to the squared energy
+                            let energy = (((mag * mag) * w) / norm_factor) * resolution_comp;
                             
                             // 1. Accumulate Raw CQT 'Halo' Energy (Bandwidth Normalized)
                             raw_cqt_power[default_bin] += energy;
-                            if mag > raw_cqt_peak[default_bin] {
-                                raw_cqt_peak[default_bin] = mag;
+                            
+                            // Apply peak density dampening strictly to the linear peaks to smooth out boundaries
+                            let comp_mag = (mag * comp_mag_factor) * peak_dampening; // Compensated linear magnitude
+                            if comp_mag > raw_cqt_peak[default_bin] {
+                                raw_cqt_peak[default_bin] = comp_mag;
                             }
                             
                             // 2. Accumulate Sharp Reassigned Energy with Dynamic Gaussian Splat
@@ -815,7 +864,7 @@ async fn main() {
                                 
                                 if target_bin >= 0 && target_bin < CQT_BINS as isize {
                                     let boosted_energy = energy * STFT_BOOST_GAIN;
-                                    let boosted_mag = mag * STFT_BOOST_GAIN.sqrt(); 
+                                    let boosted_mag = comp_mag * STFT_BOOST_GAIN.sqrt(); 
                                     
                                     let splat = &splat_kernels[target_bin as usize];
                                     
@@ -911,7 +960,11 @@ async fn main() {
     
     let mut render_targets = Vec::new();
     for i in 0..=RESOLUTIONS.len() + 1 {
-        let height = if i < RESOLUTIONS.len() { RESOLUTIONS[i] / 2 } else { CQT_BINS };
+        let height = if i < RESOLUTIONS.len() {
+            let res = RESOLUTIONS[i];
+            let actual_fft = if SPECTRAL_OVERSAMPLING { OVERSAMPLE_TARGET.max(res) } else { res };
+            actual_fft / 2
+        } else { CQT_BINS };
         let rt = render_target(MAX_HISTORY as u32, height as u32);
         rt.texture.set_filter(FilterMode::Linear);
         render_targets.push(rt);
@@ -942,7 +995,8 @@ async fn main() {
         },
     ).unwrap();
 
-    let max_possible_height = (*RESOLUTIONS.iter().max().unwrap() / 2).max(CQT_BINS);
+    let max_stft_height = if SPECTRAL_OVERSAMPLING { OVERSAMPLE_TARGET / 2 } else { *RESOLUTIONS.iter().max().unwrap() / 2 };
+    let max_possible_height = max_stft_height.max(CQT_BINS);
     let mut local_pixels_buffer = vec![0u8; MAX_HISTORY * max_possible_height * 4];
 
     loop {
@@ -987,7 +1041,13 @@ async fn main() {
             current_fft_idx
         };
 
-        let current_height = if actual_fft_idx >= RESOLUTIONS.len() { CQT_BINS } else { RESOLUTIONS[actual_fft_idx] / 2 };
+        let current_height = if actual_fft_idx >= RESOLUTIONS.len() {
+            CQT_BINS
+        } else {
+            let res = RESOLUTIONS[actual_fft_idx];
+            let actual_fft = if SPECTRAL_OVERSAMPLING { OVERSAMPLE_TARGET.max(res) } else { res };
+            actual_fft / 2 
+        };
 
         let mut actual_total_updates = 0u64;
         let mut full_redraw_needed = false;
@@ -1490,7 +1550,12 @@ fn draw_ui_overlay(scale: ScaleType, cmap: ColorMapType, dir: ScrollDirection, f
     let res_str = if fft_idx == RESOLUTIONS.len() {
         "CQT (HD)".to_string()
     } else {
-        format!("{} bins", RESOLUTIONS[fft_idx] / 2)
+        let actual_fft = if SPECTRAL_OVERSAMPLING { OVERSAMPLE_TARGET.max(RESOLUTIONS[fft_idx]) } else { RESOLUTIONS[fft_idx] };
+        if SPECTRAL_OVERSAMPLING && actual_fft > RESOLUTIONS[fft_idx] {
+            format!("{} bins (x{} Pad)", actual_fft / 2, actual_fft / RESOLUTIONS[fft_idx])
+        } else {
+            format!("{} bins", actual_fft / 2)
+        }
     };
     
     let hist_str = format!("{}", history);
