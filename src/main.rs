@@ -17,9 +17,9 @@ const MIN_HOP_SIZE: usize = 256;
 const CQT_HOP_SIZE: usize = 512; 
 
 // Professional Visualizer Tweaks
-const PINK_NOISE_TILT_DB_PER_OCTAVE: f32 = -1.0; // 3.0 is standard for mastered music
-const PEAK_WEIGHT: f32 = 1.0; // Hybrid Peak-RMS balance
-const RMS_WEIGHT: f32 = 0.0;
+const PINK_NOISE_TILT_DB_PER_OCTAVE: f32 = 0.0; // 3.0 is standard for mastered music
+const PEAK_WEIGHT: f32 = 0.5; // Hybrid Peak-RMS balance
+const RMS_WEIGHT: f32 = 0.5;
 
 // --- NEW CONFIGS: PSD & Adaptive Smoothing ---
 const PSD_NORMALIZATION: bool = true;  // Flattens white noise by dividing by bandwidth (energy density)
@@ -32,15 +32,16 @@ const SPLAT_SPREAD_HIGH: f32 = 0.01;    // Narrow splatting in the treble to mai
 
 const HALO_RAW_BLEND: f32 = 0.0;       // Amount of the 'blurry' original FFT background (fills gaps)
 const HALO_SHARP_BLEND: f32 = 10.0;     // Amount of the razor-sharp reassigned pitch cores
-const STFT_BOOST_GAIN: f32 = 20.0;     // Restores brightness lost to PSD and pitch-core condensation
-const IIR_BOOST_GAIN: f32 = 1.5;       // Matches the sub-bass brightness to the STFT layer
+const STFT_BOOST_GAIN: f32 = 5.0;     // Restores brightness lost to PSD and pitch-core condensation
+const IIR_BOOST_GAIN: f32 = 5.0;       // Matches the sub-bass brightness to the STFT layer
 
 // Variable resolutions and their corresponding Variable Hop Sizes
 const RESOLUTIONS: [usize; 4] = [2048, 4096, 8192, 16384];
 const HOP_SIZES: [usize; 4] = [256, 512, 1024, 2048];
 
 const CQT_BINS: usize = 1200; // The HD resolution of our Constant-Q Transform output
-const IIR_CROSSOVER_HZ: f32 = 300.0; // Frequencies below this use instantaneous zero-latency IIR filters
+const IIR_CROSSOVER_LOWER_HZ: f32 = 100.0; // Start crossfading from IIR to STFT here
+const IIR_CROSSOVER_UPPER_HZ: f32 = 261.5; // IIR fully faded out by here
 
 // View length is 2520, but the Ring Buffer is 2800 to give the write-head an invisible margin!
 const MAX_VIEW_LEN: usize = 2520; 
@@ -72,6 +73,7 @@ struct AppSettings {
     colormap: ColorMapType,
     redraw_flag: bool,
     audio_source: AudioSource,
+    iir_enabled: bool,
 }
 
 // 1D Colormap Generator for the GPU Shader
@@ -222,10 +224,9 @@ fn build_cqt_map(sample_rate: u32) -> (Vec<CqtInstruction>, Vec<(usize, Biquad, 
         };
 
         // --- IIR Sub-Bass Routing ---
-        if freq < IIR_CROSSOVER_HZ {
+        if freq < IIR_CROSSOVER_UPPER_HZ {
             let q_factor = freq / bw_hz;
             iir_filters.push((bin, Biquad::bandpass(sample_rate as f32, freq, q_factor), bw_hz));
-            continue; // Skip STFT generation for this bin
         }
         
         let min_stft_bw = sample_rate as f32 / RESOLUTIONS[RESOLUTIONS.len()-1] as f32;
@@ -441,6 +442,8 @@ async fn main() {
     for &size in RESOLUTIONS.iter() {
         layers.push(SpectrogramLayer::new(size / 2));
     }
+    // We now maintain TWO parallel CQT history buffers: one WITH IIR, one WITHOUT IIR.
+    layers.push(SpectrogramLayer::new(CQT_BINS)); 
     layers.push(SpectrogramLayer::new(CQT_BINS)); 
 
     let shared_layers = Arc::new(Mutex::new(layers));
@@ -449,6 +452,7 @@ async fn main() {
         colormap: ColorMapType::Magma,
         redraw_flag: false,
         audio_source: AudioSource::SinkMonitor,
+        iir_enabled: false,
     }));
 
     let rb = HeapRb::<f32>::new(65536);
@@ -537,12 +541,13 @@ async fn main() {
         let mut rolling_audio = vec![0.0; max_fft];
         let mut pending_buffer = Vec::with_capacity(4096);
 
-        let mut float_history: Vec<Vec<f32>> = (0..=RESOLUTIONS.len()).map(|i| {
+        let mut float_history: Vec<Vec<f32>> = (0..=RESOLUTIONS.len() + 1).map(|i| {
             let size = if i < RESOLUTIONS.len() { RESOLUTIONS[i] / 2 } else { CQT_BINS };
             vec![0.0f32; MAX_HISTORY * size]
         }).collect();
 
-        let mut local_cqt_col: Vec<f32> = vec![0.0; CQT_BINS];
+        let mut local_cqt_col_no_iir: Vec<f32> = vec![0.0; CQT_BINS];
+        let mut local_cqt_col_with_iir: Vec<f32> = vec![0.0; CQT_BINS];
 
         // --- Generate Visual Tilt Curves ---
         let mut tilt_curves: Vec<Vec<f32>> = Vec::new();
@@ -579,7 +584,8 @@ async fn main() {
             // Map the adaptive decay frequency-wise
             cqt_decays[bin] = DECAY_LOW_FREQ + (DECAY_HIGH_FREQ - DECAY_LOW_FREQ) * norm;
         }
-        tilt_curves.push(cqt_tilt_curve);
+        tilt_curves.push(cqt_tilt_curve.clone()); // Add tilt for CQT (No IIR) layer
+        tilt_curves.push(cqt_tilt_curve);         // Add tilt for CQT (With IIR) layer
 
         // Setup Phase Vocoder states for each resolution tier
         let mut planner = FftPlanner::new();
@@ -612,13 +618,29 @@ async fn main() {
         let min_stft_weight_sum = stft_cqt_map.first().map(|inst| inst.weight_sum).unwrap_or(1.0);
         let min_iir_bw = iir_filters.first().map(|&(_, _, bw)| bw).unwrap_or(1.0);
 
+        // --- Calculate IIR / STFT Blend Weights ---
+        let mut iir_blend_weights = vec![0.0f32; CQT_BINS];
+        for bin in 0..CQT_BINS {
+            let norm = bin as f32 / (CQT_BINS - 1) as f32;
+            let freq = 2.0_f32.powf(min_log + norm * log_range);
+            if freq <= IIR_CROSSOVER_LOWER_HZ {
+                iir_blend_weights[bin] = 1.0;
+            } else if freq >= IIR_CROSSOVER_UPPER_HZ {
+                iir_blend_weights[bin] = 0.0;
+            } else {
+                let t = (freq - IIR_CROSSOVER_LOWER_HZ) / (IIR_CROSSOVER_UPPER_HZ - IIR_CROSSOVER_LOWER_HZ);
+                iir_blend_weights[bin] = 0.5 * (1.0 + (std::f32::consts::PI * t).cos()); // Smooth fade 1 to 0
+            }
+        }
+
         // IIR and Temporal state accumulators
         let mut iir_power_accum = vec![0.0f32; CQT_BINS];
         let mut iir_peak_accum = vec![0.0f32; CQT_BINS];
         let mut iir_samples_accum = 0;
         let mut cqt_samples_since_last = 0;
         
-        let mut prev_cqt_col = vec![0.0f32; CQT_BINS];
+        let mut prev_cqt_col_no_iir = vec![0.0f32; CQT_BINS];
+        let mut prev_cqt_col_with_iir = vec![0.0f32; CQT_BINS];
 
         loop {
             let mut redraw_requested = false;
@@ -653,8 +675,9 @@ async fn main() {
             // Process audio in steady multi-rate intervals
             while pending_buffer.len() >= MIN_HOP_SIZE {
                 let chunk: Vec<f32> = pending_buffer.drain(0..MIN_HOP_SIZE).collect();
-                
+
                 // --- Instantaneous IIR Processing (Vectorized Inner Loop) ---
+                // We always compute this so the background history remains completely populated and accurate.
                 for &sample in &chunk {
                     for (bin_idx, biquad, _) in iir_filters.iter_mut() {
                         let filtered = biquad.process(sample);
@@ -686,7 +709,11 @@ async fn main() {
                         
                         state.fft.process(&mut buffer);
                         
-                        let scale = 2.0 / state.fft_size as f32;
+                        // --- STFT PARITY MATH ---
+                        let scale = 2.0 / state.fft_size as f32; // mathematically pure (read by CQT layer)
+                        let broadband_comp = (state.fft_size as f32 / 2048.0).sqrt(); // fix energy spreading
+                        let cqt_makeup_gain = STFT_BOOST_GAIN.sqrt() * HALO_SHARP_BLEND; // fix absolute brightness
+                        
                         let half_size = state.fft_size / 2;
                         let freq_res = SAMPLE_RATE as f32 / state.fft_size as f32;
                         let hop_advance = 2.0 * std::f32::consts::PI * state.hop_size as f32 / state.fft_size as f32;
@@ -713,13 +740,16 @@ async fn main() {
                                 
                             *true_freq = bin_freq + unwrapped_diff * sr_over_hop;
                             
+                            // Apply visual makeup gain *only* for the direct STFT display to perfectly match CQT
+                            let display_mag = *mag * broadband_comp * cqt_makeup_gain;
+                            
                             // Apply adaptive Phosphor-decay
                             let prev_disp = state.display_mags[bin];
                             let decay = state.decays[bin];
-                            state.display_mags[bin] = if *mag > prev_disp {
-                                *mag
+                            state.display_mags[bin] = if display_mag > prev_disp {
+                                display_mag
                             } else {
-                                (*mag * (1.0 - decay)) + (prev_disp * decay)
+                                (display_mag * (1.0 - decay)) + (prev_disp * decay)
                             };
                         }
                         
@@ -736,7 +766,8 @@ async fn main() {
                     let mut sharp_cqt_power = vec![0.0f32; CQT_BINS];
                     let mut sharp_cqt_peak = vec![0.0f32; CQT_BINS];
                     
-                    let mut final_amplitudes = vec![0.0f32; CQT_BINS];
+                    let mut stft_amplitudes = vec![0.0f32; CQT_BINS];
+                    let mut iir_amplitudes = vec![0.0f32; CQT_BINS];
                     
                     // --- Inject Hybrid IIR Bass Energy w/ PSD Normalization ---
                     if iir_samples_accum > 0 {
@@ -744,11 +775,12 @@ async fn main() {
                         for &(bin, _, bw) in iir_filters.iter() {
                             let norm_factor = if PSD_NORMALIZATION { bw / min_iir_bw } else { 1.0 };
                             let rms = ((iir_power_accum[bin] * inv_samples) / norm_factor).sqrt();
-                            let peak = iir_peak_accum[bin]; // Peak is density independent
+                            let peak = iir_peak_accum[bin]; 
                             
                             let hybrid = (peak * PEAK_WEIGHT) + (rms * RMS_WEIGHT);
-                            final_amplitudes[bin] = hybrid * IIR_BOOST_GAIN; 
-                            
+                            iir_amplitudes[bin] = hybrid * IIR_BOOST_GAIN; 
+                        }
+                        for &(bin, _, _) in iir_filters.iter() {
                             iir_power_accum[bin] = 0.0;
                             iir_peak_accum[bin] = 0.0;
                         }
@@ -777,7 +809,7 @@ async fn main() {
                             }
                             
                             // 2. Accumulate Sharp Reassigned Energy with Dynamic Gaussian Splat
-                            if true_freq >= IIR_CROSSOVER_HZ {
+                            if true_freq >= 20.0 {
                                 let norm = (true_freq.log2() - min_log) / log_range;
                                 let target_bin = (norm * (CQT_BINS - 1) as f32).round() as isize;
                                 
@@ -805,39 +837,46 @@ async fn main() {
                     }
                     
                     for bin in 0..CQT_BINS {
-                        // Blend STFT layer where IIR layer is inactive
-                        if final_amplitudes[bin] == 0.0 {
-                            let raw_hybrid = (raw_cqt_peak[bin] * PEAK_WEIGHT) + (raw_cqt_power[bin].sqrt() * RMS_WEIGHT);
-                            let sharp_hybrid = (sharp_cqt_peak[bin] * PEAK_WEIGHT) + (sharp_cqt_power[bin].sqrt() * RMS_WEIGHT);
-                            
-                            final_amplitudes[bin] = (raw_hybrid * HALO_RAW_BLEND) + (sharp_hybrid * HALO_SHARP_BLEND);
-                        }
+                        let raw_hybrid = (raw_cqt_peak[bin] * PEAK_WEIGHT) + (raw_cqt_power[bin].sqrt() * RMS_WEIGHT);
+                        let sharp_hybrid = (sharp_cqt_peak[bin] * PEAK_WEIGHT) + (sharp_cqt_power[bin].sqrt() * RMS_WEIGHT);
                         
-                        // --- Temporal Persistence (Adaptive Phosphor Decay) ---
-                        let current = final_amplitudes[bin];
-                        let previous = prev_cqt_col[bin];
+                        stft_amplitudes[bin] = (raw_hybrid * HALO_RAW_BLEND) + (sharp_hybrid * HALO_SHARP_BLEND);
+                        
+                        let iir_w = iir_blend_weights[bin];
+                        let stft_w = 1.0 - iir_w;
+
+                        // Calculate BOTH paths independently
+                        let current_no_iir = stft_amplitudes[bin];
+                        let current_with_iir = (iir_amplitudes[bin] * iir_w) + (stft_amplitudes[bin] * stft_w);
+                        
                         let decay = cqt_decays[bin];
                         
-                        let final_val = if current > previous {
-                            current // Instant Attack
-                        } else {
-                            (current * (1.0 - decay)) + (previous * decay) // Smooth Frequency-Mapped Release
-                        };
+                        // --- Temporal Persistence (Adaptive Phosphor Decay) ---
+                        // Persist NO IIR path
+                        let prev_no = prev_cqt_col_no_iir[bin];
+                        let final_no = if current_no_iir > prev_no { current_no_iir } else { (current_no_iir * (1.0 - decay)) + (prev_no * decay) };
+                        prev_cqt_col_no_iir[bin] = final_no;
+                        local_cqt_col_no_iir[bin] = final_no;
                         
-                        prev_cqt_col[bin] = final_val;
-                        local_cqt_col[bin] = final_val;
+                        // Persist WITH IIR path
+                        let prev_with = prev_cqt_col_with_iir[bin];
+                        let final_with = if current_with_iir > prev_with { current_with_iir } else { (current_with_iir * (1.0 - decay)) + (prev_with * decay) };
+                        prev_cqt_col_with_iir[bin] = final_with;
+                        local_cqt_col_with_iir[bin] = final_with;
                     }
 
                     if let Ok(mut layers) = layers_ref.lock() {
-                        for i in 0..=RESOLUTIONS.len() {
+                        for i in 0..=RESOLUTIONS.len() + 1 {
                             let layer = &mut layers[i];
                             let head_idx = layer.head;
                             let float_start = head_idx * layer.freq_bins;
                             
                             let data_source = if i < RESOLUTIONS.len() {
                                 &stft_states[i].display_mags
+                            } else if i == RESOLUTIONS.len() {
+                                &local_cqt_col_no_iir
                             } else {
-                                &local_cqt_col
+                                &local_cqt_col_with_iir
                             };
 
                             let copy_len = data_source.len().min(layer.freq_bins);
@@ -871,18 +910,19 @@ async fn main() {
     let mut current_view_len = MAX_VIEW_LEN; 
     
     let mut render_targets = Vec::new();
-    for i in 0..=RESOLUTIONS.len() {
+    for i in 0..=RESOLUTIONS.len() + 1 {
         let height = if i < RESOLUTIONS.len() { RESOLUTIONS[i] / 2 } else { CQT_BINS };
         let rt = render_target(MAX_HISTORY as u32, height as u32);
         rt.texture.set_filter(FilterMode::Linear);
         render_targets.push(rt);
     }
-    let mut last_rendered_updates = vec![0u64; RESOLUTIONS.len() + 1];
+    let mut last_rendered_updates = vec![0u64; RESOLUTIONS.len() + 2];
 
     let mut local_scale = ScaleType::Mel;
     let mut local_cmap = ColorMapType::Magma;
     let mut local_dir = ScrollDirection::RTL;
     let mut local_source = AudioSource::SinkMonitor;
+    let mut local_iir = false;
     let mut smooth_head_pos: f64 = 0.0;
     
     let mut current_lut_type = local_cmap;
@@ -913,6 +953,7 @@ async fn main() {
         if is_key_pressed(KeyCode::C) { local_cmap = cycle_colormap(local_cmap); visual_changed = true; }
         if is_key_pressed(KeyCode::F) { local_dir = cycle_direction(local_dir); }
         if is_key_pressed(KeyCode::R) { current_fft_idx = (current_fft_idx + 1) % (RESOLUTIONS.len() + 1); } 
+        if is_key_pressed(KeyCode::I) { local_iir = !local_iir; visual_changed = true; }
         if is_key_pressed(KeyCode::X) { 
             local_source = match local_source {
                 AudioSource::SinkMonitor => AudioSource::Microphone,
@@ -935,10 +976,18 @@ async fn main() {
                 s.scale_type = local_scale;
                 s.colormap = local_cmap;
                 s.audio_source = local_source;
+                s.iir_enabled = local_iir;
             }
         }
 
-        let current_height = if current_fft_idx == RESOLUTIONS.len() { CQT_BINS } else { RESOLUTIONS[current_fft_idx] / 2 };
+        // Dynamically resolve which texture layer we are rendering based on the IIR toggle
+        let actual_fft_idx = if current_fft_idx == RESOLUTIONS.len() {
+            if local_iir { RESOLUTIONS.len() + 1 } else { RESOLUTIONS.len() }
+        } else {
+            current_fft_idx
+        };
+
+        let current_height = if actual_fft_idx >= RESOLUTIONS.len() { CQT_BINS } else { RESOLUTIONS[actual_fft_idx] / 2 };
 
         let mut actual_total_updates = 0u64;
         let mut full_redraw_needed = false;
@@ -946,10 +995,10 @@ async fn main() {
 
         {
             if let Ok(layers) = shared_layers.lock() {
-                let layer = &layers[current_fft_idx];
+                let layer = &layers[actual_fft_idx];
                 actual_total_updates = layer.total_updates;
                 
-                let prev_updates = last_rendered_updates[current_fft_idx];
+                let prev_updates = last_rendered_updates[actual_fft_idx];
                 let diff = if actual_total_updates > prev_updates { actual_total_updates - prev_updates } else { 0 };
                 
                 let full_redraw_threshold = (MAX_HISTORY / 2) as u64;
@@ -1002,11 +1051,11 @@ async fn main() {
                     }
                 }
                 
-                if current_fft_idx != last_fft_idx {
+                if actual_fft_idx != last_fft_idx {
                     let prev_mode_updates = layers[last_fft_idx].total_updates;
                     let diff_from_last = actual_total_updates as f64 - prev_mode_updates as f64;
                     smooth_head_pos += diff_from_last;
-                    last_fft_idx = current_fft_idx;
+                    last_fft_idx = actual_fft_idx;
                 }
             }
         }
@@ -1019,14 +1068,14 @@ async fn main() {
             let tex = Texture2D::from_image(&img);
             
             let mut cam = Camera2D::from_display_rect(Rect::new(0.0, 0.0, MAX_HISTORY as f32, current_height as f32));
-            cam.render_target = Some(render_targets[current_fft_idx].clone());
+            cam.render_target = Some(render_targets[actual_fft_idx].clone());
             set_camera(&cam);
             draw_texture(&tex, 0.0, 0.0, WHITE);
             set_default_camera();
-            last_rendered_updates[current_fft_idx] = actual_total_updates;
+            last_rendered_updates[actual_fft_idx] = actual_total_updates;
         } else if !delta_images.is_empty() {
             let mut cam = Camera2D::from_display_rect(Rect::new(0.0, 0.0, MAX_HISTORY as f32, current_height as f32));
-            cam.render_target = Some(render_targets[current_fft_idx].clone());
+            cam.render_target = Some(render_targets[actual_fft_idx].clone());
             set_camera(&cam);
             
             for (x, img) in delta_images {
@@ -1035,7 +1084,7 @@ async fn main() {
                 draw_texture(&tex, x, 0.0, WHITE);
             }
             set_default_camera();
-            last_rendered_updates[current_fft_idx] = actual_total_updates;
+            last_rendered_updates[actual_fft_idx] = actual_total_updates;
         }
 
         clear_background(BLACK);
@@ -1095,7 +1144,7 @@ async fn main() {
         let total_draw_len = dst1_len + dst2_len;
         let start_pos_screen = (screen_time_dim - total_draw_len) / 2.0;
 
-        let texture_to_draw = &render_targets[current_fft_idx].texture;
+        let texture_to_draw = &render_targets[actual_fft_idx].texture;
 
         let scale_uniform_val = match local_scale {
             ScaleType::Linear => 0.0f32,
@@ -1103,7 +1152,7 @@ async fn main() {
             ScaleType::Logarithmic => 2.0f32,
             ScaleType::Chromatic => 3.0f32,
         };
-        let is_cqt = if current_fft_idx == RESOLUTIONS.len() { 1.0f32 } else { 0.0f32 };
+        let is_cqt = if actual_fft_idx >= RESOLUTIONS.len() { 1.0f32 } else { 0.0f32 };
         
         shader_material.set_uniform("scale_type", scale_uniform_val);
         shader_material.set_uniform("sample_rate", SAMPLE_RATE as f32);
@@ -1182,7 +1231,7 @@ async fn main() {
         gl_use_default_material();
 
         draw_note_ruler(local_scale, local_dir);
-        if DRAW_UI { draw_ui_overlay(local_scale, local_cmap, local_dir, current_fft_idx, current_view_len, local_source); }
+        if DRAW_UI { draw_ui_overlay(local_scale, local_cmap, local_dir, current_fft_idx, current_view_len, local_source, local_iir); }
 
         if DRAW_UI {
             // --- Interactive Mouse Crosshair (Frequency/Note Peeking) ---
@@ -1237,12 +1286,12 @@ async fn main() {
 
                 let mut intensity_u8 = 0;
                 if let Ok(layers) = shared_layers.lock() {
-                    let layer = &layers[current_fft_idx];
+                    let layer = &layers[actual_fft_idx];
                     
                     let exact_col = (head_offset - (norm_time * final_source_w_snapped) - 1.0).floor();
                     let ring_buffer_col = exact_col.rem_euclid(MAX_HISTORY as f32) as usize;
                     
-                    let bin_idx = if current_fft_idx == RESOLUTIONS.len() {
+                    let bin_idx = if actual_fft_idx >= RESOLUTIONS.len() {
                         let min_f = 20.0f32;
                         if current_hz <= min_f { 0 } else {
                             let norm_cqt = (current_hz.log2() - min_f.log2()) / (max_freq.log2() - min_f.log2());
@@ -1428,7 +1477,7 @@ struct UiStat {
     color: Color,
 }
 
-fn draw_ui_overlay(scale: ScaleType, cmap: ColorMapType, dir: ScrollDirection, fft_idx: usize, history: usize, source: AudioSource) {
+fn draw_ui_overlay(scale: ScaleType, cmap: ColorMapType, dir: ScrollDirection, fft_idx: usize, history: usize, source: AudioSource, iir_enabled: bool) {
     let scale_str = format!("{:?}", scale);
     let map_str = format!("{:?}", cmap); 
     let dir_str = match dir {
@@ -1449,19 +1498,21 @@ fn draw_ui_overlay(scale: ScaleType, cmap: ColorMapType, dir: ScrollDirection, f
         AudioSource::SinkMonitor => "Sink",
         AudioSource::Microphone => "Mic",
     };
+    let iir_str = if iir_enabled { "On" } else { "Off" };
 
     let stats = vec![
         UiStat { label: "Scale",  hotkey: Some('S'), value: scale_str.to_string(), color: ORANGE },
         UiStat { label: "Colour", hotkey: Some('C'), value: map_str,               color: YELLOW },
         UiStat { label: "Flow",   hotkey: Some('F'), value: dir_str.to_string(),   color: SKYBLUE },
-        UiStat { label: "Res",    hotkey: Some('R'), value: res_str,               color: VIOLET },
-        UiStat { label: "Win",    hotkey: Some('W'), value: hist_str,              color: PINK },
-        UiStat { label: "X Source",     hotkey: Some('X'), value: src_str.to_string(),   color: GREEN },
+        UiStat { label: "Resolution",    hotkey: Some('R'), value: res_str,               color: VIOLET },
+        UiStat { label: "Window",    hotkey: Some('W'), value: hist_str,              color: PINK },
+        UiStat { label: "Audio Src",     hotkey: Some('A'), value: src_str.to_string(),   color: GREEN },
+        UiStat { label: "IIR Bass",     hotkey: Some('I'), value: iir_str.to_string(),   color: LIME },
     ];
 
     let (bg_x, bg_y, bg_w, bg_h, is_vertical) = match dir {
         ScrollDirection::RTL | ScrollDirection::LTR => (0.0, 0.0, screen_width(), 35.0, false),
-        _ => (screen_width() - 220.0, 0.0, 220.0, 155.0, true),
+        _ => (screen_width() - 220.0, 0.0, 220.0, 180.0, true),
     };
 
     draw_rectangle(bg_x, bg_y, bg_w, bg_h, Color::new(0.0, 0.0, 0.0, 0.6));
