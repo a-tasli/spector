@@ -15,7 +15,7 @@ required-features = ["bg"]
 
 [dependencies]
 macroquad = "0.4"          # The Game Engine
-egui-macroquad = "0.17"
+#egui-macroquad = "0.17"
 ringbuf = "0.3"            # Thread Bridge
 spectrum-analyzer = "1.5"  # FFT Math
 rustfft = "6.1"

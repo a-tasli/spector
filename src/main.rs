@@ -1,5 +1,4 @@
 use macroquad::prelude::*;
-use egui_macroquad::egui;
 use ringbuf::HeapRb;
 use rustfft::{FftPlanner, num_complex::Complex};
 use std::sync::{Arc, Mutex};
@@ -24,7 +23,6 @@ const SPECTRAL_OVERSAMPLING: bool = false;
 const OVERSAMPLE_TARGET: usize = 16384; 
 
 // Variable resolutions and their corresponding Variable Hop Sizes
-// const RESOLUTIONS: [usize; 4] = [2048, 4096, 8192, 16384];
 const RESOLUTIONS: [usize; 4] = [1024, 2048, 4096, 8192];
 const HOP_SIZES: [usize; 4] = [256, 512, 1024, 2048];
 
@@ -56,8 +54,8 @@ enum AudioSource { SinkMonitor, Microphone }
 enum ScaleType { Linear, Mel, Logarithmic, Chromatic }
 
 // --- DYNAMIC DSP CONFIGURATION ---
-// Replaces compile-time constants for runtime tuning via egui
-#[derive(Clone, PartialEq)]
+// Derived Copy to completely avoid heap allocations/clones in the UI frame loop
+#[derive(Clone, Copy, PartialEq)]
 struct DspConfig {
     pink_noise_tilt: f32,
     peak_weight: f32,
@@ -95,7 +93,7 @@ impl Default for DspConfig {
 }
 
 /// Shared state between the Brain (processing) and Face (UI) threads.
-#[derive(Clone)]
+#[derive(Clone, Copy, PartialEq)]
 struct AppSettings {
     scale_type: ScaleType,
     colormap: ColorMapType,
@@ -599,11 +597,14 @@ async fn main() {
         }).collect();
         let mut cqt_decays = vec![0.0f32; CQT_BINS];
 
-        // Ensure initially constructed correctly
         let mut splat_kernels = build_splat_kernels(local_dsp_config.splat_low, local_dsp_config.splat_high);
         let (mut stft_cqt_map, mut iir_filters) = build_cqt_map(SAMPLE_RATE, &stft_specs, local_dsp_config.peak_density_dampening);
 
-        // Function to rebuild DSP caches dynamically
+        let mut scratch_cols: Vec<Vec<u8>> = (0..=RESOLUTIONS.len() + 1).map(|i| {
+            let size = if i < RESOLUTIONS.len() { stft_states[i].fft_size / 2 } else { CQT_BINS };
+            vec![0u8; size * 4]
+        }).collect();
+
         let mut rebuild_dsp_caches = |config: &DspConfig, stft_states: &mut Vec<StftState>, tilt_curves: &mut Vec<Vec<f32>>, cqt_decays: &mut Vec<f32>, splat_kernels: &mut Vec<SplatKernel>, stft_cqt_map: &mut Vec<CqtInstruction>| {
             for (i, state) in stft_states.iter_mut().enumerate() {
                 let half_size = state.fft_size / 2;
@@ -643,7 +644,6 @@ async fn main() {
             *stft_cqt_map = new_map;
         };
 
-        // Do the initial build
         rebuild_dsp_caches(&local_dsp_config, &mut stft_states, &mut tilt_curves, &mut cqt_decays, &mut splat_kernels, &mut stft_cqt_map);
 
         let mut iir_blend_weights = vec![0.0f32; CQT_BINS];
@@ -671,13 +671,12 @@ async fn main() {
         loop {
             let mut redraw_requested = false;
 
-            if let Ok(mut s) = settings_ref.lock() {
+            if let Ok(s) = settings_ref.lock() {
                 if s.redraw_flag {
                     redraw_requested = true;
-                    s.redraw_flag = false;
                 }
                 if s.dsp_config != local_dsp_config {
-                    local_dsp_config = s.dsp_config.clone();
+                    local_dsp_config = s.dsp_config;
                     rebuild_dsp_caches(&local_dsp_config, &mut stft_states, &mut tilt_curves, &mut cqt_decays, &mut splat_kernels, &mut stft_cqt_map);
                 }
             }
@@ -703,9 +702,12 @@ async fn main() {
             }
 
             while pending_buffer.len() >= MIN_HOP_SIZE {
-                let chunk: Vec<f32> = pending_buffer.drain(0..MIN_HOP_SIZE).collect();
+                
+                rolling_audio.rotate_left(MIN_HOP_SIZE);
+                let start_idx = rolling_audio.len() - MIN_HOP_SIZE;
 
-                for &sample in &chunk {
+                let mut i = 0;
+                for sample in pending_buffer.drain(0..MIN_HOP_SIZE) {
                     for (bin_idx, biquad, _) in iir_filters.iter_mut() {
                         let filtered = biquad.process(sample);
                         iir_power_accum[*bin_idx] += filtered * filtered;
@@ -715,18 +717,16 @@ async fn main() {
                             iir_peak_accum[*bin_idx] = abs_f;
                         }
                     }
+                    rolling_audio[start_idx + i] = sample;
+                    i += 1;
                 }
-                iir_samples_accum += chunk.len();
-                
-                rolling_audio.rotate_left(MIN_HOP_SIZE);
-                let len = rolling_audio.len();
-                rolling_audio[len - MIN_HOP_SIZE..].copy_from_slice(&chunk);
+                iir_samples_accum += MIN_HOP_SIZE;
                 
                 for state in stft_states.iter_mut() {
                     state.samples_since_last += MIN_HOP_SIZE;
                     
                     if state.samples_since_last >= state.hop_size {
-                        let start_sample = len - state.window_size;
+                        let start_sample = rolling_audio.len() - state.window_size;
                         let audio_slice = &rolling_audio[start_sample..];
                         
                         let buffer = &mut state.scratch_buffer;
@@ -890,11 +890,24 @@ async fn main() {
                         local_cqt_col_with_iir[bin] = final_with;
                     }
 
+                    for i in 0..=RESOLUTIONS.len() + 1 {
+                        let freq_bins = if i < RESOLUTIONS.len() { stft_states[i].fft_size / 2 } else { CQT_BINS };
+                        let data_source = if i < RESOLUTIONS.len() {
+                            &stft_states[i].display_mags
+                        } else if i == RESOLUTIONS.len() {
+                            &local_cqt_col_no_iir
+                        } else {
+                            &local_cqt_col_with_iir
+                        };
+
+                        compute_column_colors(&mut scratch_cols[i], data_source, freq_bins, &tilt_curves[i]);
+                    }
+
                     if let Ok(mut layers) = layers_ref.lock() {
                         for i in 0..=RESOLUTIONS.len() + 1 {
                             let layer = &mut layers[i];
                             let head_idx = layer.head;
-                            let float_start = head_idx * layer.freq_bins;
+                            let freq_bins = layer.freq_bins;
                             
                             let data_source = if i < RESOLUTIONS.len() {
                                 &stft_states[i].display_mags
@@ -904,12 +917,18 @@ async fn main() {
                                 &local_cqt_col_with_iir
                             };
 
-                            let copy_len = data_source.len().min(layer.freq_bins);
+                            let float_start = head_idx * freq_bins;
+                            let copy_len = data_source.len().min(freq_bins);
                             if float_start + copy_len <= float_history[i].len() {
                                 float_history[i][float_start..float_start+copy_len].copy_from_slice(&data_source[0..copy_len]);
                             }
 
-                            paint_column_fast(&mut layer.pixels, head_idx, data_source, layer.freq_bins, &tilt_curves[i]);
+                            for y in 0..freq_bins {
+                                let src_idx = y * 4;
+                                let dst_idx = (y * MAX_HISTORY * 4) + (head_idx * 4);
+                                layer.pixels[dst_idx..dst_idx+4].copy_from_slice(&scratch_cols[i][src_idx..src_idx+4]);
+                            }
+
                             layer.head = (layer.head + 1) % MAX_HISTORY;
                             layer.total_updates += 1;
                         }
@@ -945,7 +964,7 @@ async fn main() {
     }
     let mut last_rendered_updates = vec![0u64; RESOLUTIONS.len() + 2];
 
-    let mut local_scale = ScaleType::Mel;
+    let mut local_scale = ScaleType::Logarithmic;
     let mut local_cmap = ColorMapType::Magma;
     let mut local_dir = ScrollDirection::RTL;
     let mut local_source = AudioSource::SinkMonitor;
@@ -973,57 +992,44 @@ async fn main() {
     let max_possible_height = max_stft_height.max(CQT_BINS);
     let mut local_pixels_buffer = vec![0u8; MAX_HISTORY * max_possible_height * 4];
 
+    // Native Custom UI State
+    let mut show_advanced_ui = false;
+    let mut active_slider: Option<usize> = None;
+    let mut drag_start_freq: Option<f32> = None;
+
     loop {
         let mut visual_changed = false;
         let mut source_changed = false;
         let mut ui_wants_input = false;
 
-        // --- EGUI DSP Config Panel ---
-        if DRAW_UI {
-            egui_macroquad::ui(|egui_ctx| {
-                ui_wants_input = egui_ctx.wants_keyboard_input() || egui_ctx.wants_pointer_input();
+        let (mx, my) = mouse_position();
+        let m_down = is_mouse_button_down(MouseButton::Left);
+        let m_pressed = is_mouse_button_pressed(MouseButton::Left);
 
-                egui::Window::new("DSP Engine Tweaks")
-                    .default_pos([20.0, 100.0])
-                    .show(egui_ctx, |ui| {
-                        let mut local_config = shared_settings.lock().unwrap().dsp_config.clone();
-                        let original_config = local_config.clone();
-
-                        ui.heading("Signal Pipeline");
-                        ui.add(egui::Slider::new(&mut local_config.pink_noise_tilt, 0.0..=6.0).text("Pink Noise Tilt (dB/Oct)"));
-                        ui.checkbox(&mut local_config.psd_normalization, "PSD Normalization");
-                        ui.add(egui::Slider::new(&mut local_config.peak_density_dampening, 0.0..=2.0).text("Density Dampening"));
-                        
-                        ui.separator();
-                        ui.heading("Dynamics & Decay");
-                        ui.add(egui::Slider::new(&mut local_config.peak_weight, 0.0..=1.0).text("Peak Weight"));
-                        ui.add(egui::Slider::new(&mut local_config.rms_weight, 0.0..=1.0).text("RMS Weight"));
-                        ui.add(egui::Slider::new(&mut local_config.decay_low, 0.0..=0.1).text("Phosphor Decay (Bass)"));
-                        ui.add(egui::Slider::new(&mut local_config.decay_high, 0.0..=0.1).text("Phosphor Decay (Treble)"));
-                        
-                        ui.separator();
-                        ui.heading("CQT Kernel Splatting");
-                        ui.add(egui::Slider::new(&mut local_config.splat_low, 0.0..=10.0).text("Splat Spread (Bass)"));
-                        ui.add(egui::Slider::new(&mut local_config.splat_high, 0.0..=5.0).text("Splat Spread (Treble)"));
-                        ui.add(egui::Slider::new(&mut local_config.halo_raw, 0.0..=10.0).text("Halo Raw Blend"));
-                        ui.add(egui::Slider::new(&mut local_config.halo_sharp, 0.0..=10.0).text("Halo Sharp Blend"));
-                        
-                        ui.separator();
-                        ui.heading("Makeup Gains");
-                        ui.add(egui::Slider::new(&mut local_config.stft_boost, 1.0..=20.0).text("STFT Boost Gain"));
-                        ui.add(egui::Slider::new(&mut local_config.iir_boost, 1.0..=20.0).text("IIR Boost Gain"));
-
-                        // Sync back to Brain Thread if tweaked
-                        if local_config != original_config {
-                            if let Ok(mut s) = shared_settings.lock() {
-                                s.dsp_config = local_config;
-                            }
-                        }
-                    });
-            });
+        if !m_down {
+            drag_start_freq = None;
         }
 
-        // Only process hotkeys if the user is not actively interacting with the egui sliders
+        if is_key_pressed(KeyCode::T) { 
+            show_advanced_ui = !show_advanced_ui; 
+        }
+
+        let menu_x = 20.0;
+        let menu_y = 60.0; 
+        let menu_w = 320.0;
+        let menu_h = 640.0;
+
+        // Determine if mouse is over the menu to prevent background interaction
+        if show_advanced_ui {
+            if mx >= menu_x && mx <= menu_x + menu_w && my >= menu_y && my <= menu_y + menu_h {
+                ui_wants_input = true;
+            }
+            if active_slider.is_some() {
+                ui_wants_input = true;
+            }
+        }
+
+        // Only process keyboard visual hotkeys if not actively interacting with UI
         if !ui_wants_input {
             if is_key_pressed(KeyCode::S) { local_scale = cycle_scale(local_scale); visual_changed = true; } 
             if is_key_pressed(KeyCode::C) { local_cmap = cycle_colormap(local_cmap); visual_changed = true; }
@@ -1313,12 +1319,10 @@ async fn main() {
         gl_use_default_material();
 
         draw_note_ruler(local_scale, local_dir);
-        if DRAW_UI { draw_ui_overlay(local_scale, local_cmap, local_dir, current_fft_idx, current_view_len, local_source, local_iir); }
+        if DRAW_UI { draw_ui_overlay(local_scale, local_cmap, local_dir, current_fft_idx, current_view_len, local_source, local_iir, show_advanced_ui); }
 
         if DRAW_UI && !ui_wants_input {
             // --- Interactive Mouse Crosshair (Frequency/Note Peeking) ---
-            let (mx, my) = mouse_position();
-            
             let norm_time = if total_draw_len > 0.0 {
                 match local_dir {
                     ScrollDirection::RTL => (start_pos_screen + total_draw_len - mx) / total_draw_len,
@@ -1358,6 +1362,10 @@ async fn main() {
                     }
                 };
 
+                if m_pressed {
+                    drag_start_freq = Some(current_hz);
+                }
+
                 let drawn_time_seconds = (final_source_w_snapped * CQT_HOP_SIZE as f32) / SAMPLE_RATE as f32;
                 let time_ago = norm_time * drawn_time_seconds;
                 let (note_name, _) = hz_to_pitch(current_hz);
@@ -1395,6 +1403,43 @@ async fn main() {
                 let exact_mag = ((intensity_u8 as f32 / 255.0) * 8.0).exp() / 2000.0;
                 let db = if exact_mag > 0.0001 { 20.0 * exact_mag.log10() } else { -100.0 };
 
+                // Handle Drag-to-Select Rendering
+                if let Some(f1) = drag_start_freq {
+                    let norm_start_pos = freq_to_screen_pos(f1, local_scale);
+                    
+                    if local_dir == ScrollDirection::RTL || local_dir == ScrollDirection::LTR {
+                        let start_y = sh * (1.0 - norm_start_pos);
+                        let min_y = start_y.min(my);
+                        let max_y = start_y.max(my);
+                        draw_rectangle(0.0, min_y, sw, max_y - min_y, Color::new(0.3, 0.8, 1.0, 0.2));
+                        draw_line(0.0, start_y, sw, start_y, 1.0, Color::new(0.3, 0.8, 1.0, 0.8));
+                        draw_line(0.0, my, sw, my, 1.0, Color::new(0.3, 0.8, 1.0, 0.8));
+                    } else {
+                        let start_x = sw * norm_start_pos;
+                        let min_x = start_x.min(mx);
+                        let max_x = start_x.max(mx);
+                        draw_rectangle(min_x, 0.0, max_x - min_x, sh, Color::new(0.3, 0.8, 1.0, 0.2));
+                        draw_line(start_x, 0.0, start_x, sh, 1.0, Color::new(0.3, 0.8, 1.0, 0.8));
+                        draw_line(mx, 0.0, mx, sh, 1.0, Color::new(0.3, 0.8, 1.0, 0.8));
+                    }
+
+                    let f2 = current_hz;
+                    let raw_semitones = 12.0 * (f2 / f1).log2();
+                    let diff_hz = (f2 - f1).abs();
+                    let sign_str = if raw_semitones >= 0.0 { "+" } else { "" };
+                    
+                    let drag_tooltip = format!("{}{:.2} st | {}{:.1} Hz", sign_str, raw_semitones, sign_str, diff_hz);
+                    let drag_text_size = measure_text(&drag_tooltip, None, 20, 1.0);
+                    
+                    let mut d_tooltip_x = mx + 15.0;
+                    let mut d_tooltip_y = my - 25.0;
+                    if d_tooltip_x + drag_text_size.width + 10.0 > sw { d_tooltip_x = mx - drag_text_size.width - 15.0; }
+                    if d_tooltip_y - 20.0 < 0.0 { d_tooltip_y = my + 45.0; }
+
+                    draw_rectangle(d_tooltip_x, d_tooltip_y - 20.0, drag_text_size.width + 10.0, 25.0, Color::new(0.0, 0.1, 0.3, 0.9));
+                    draw_text(&drag_tooltip, d_tooltip_x + 5.0, d_tooltip_y - 2.0, 20.0, Color::new(0.5, 0.9, 1.0, 1.0));
+                }
+
                 let tooltip_text = format!("-{:.2}s | {:.1} Hz | {} | {:.1} dB", time_ago, current_hz, note_name, db);
                 let text_size = measure_text(&tooltip_text, None, 20, 1.0);
                 
@@ -1408,15 +1453,155 @@ async fn main() {
             }
         }
 
-        if DRAW_UI {
-            egui_macroquad::draw();
+        // --- Native Macroquad Advanced UI Overlay (MOVED TO BOTTOM) ---
+        if DRAW_UI && show_advanced_ui {
+            draw_rectangle(menu_x, menu_y, menu_w, menu_h, Color::new(0.0, 0.0, 0.0, 0.85));
+            draw_rectangle_lines(menu_x, menu_y, menu_w, menu_h, 2.0, Color::new(0.3, 0.3, 0.3, 1.0));
+            
+            draw_text("DSP Engine Tweaks", menu_x + 15.0, menu_y + 30.0, 24.0, WHITE);
+            
+            let mut local_config = shared_settings.lock().unwrap().dsp_config;
+            let original_config = local_config;
+
+            let mut cy = menu_y + 60.0;
+            let mut id = 0;
+            
+            draw_text("Signal Pipeline", menu_x + 15.0, cy, 18.0, ORANGE); cy += 25.0;
+            draw_slider("Pink Noise Tilt (dB/Oct)", &mut local_config.pink_noise_tilt, -6.0, 6.0, menu_x + 15.0, cy, 180.0, (mx, my), m_down, m_pressed, &mut active_slider, id); id += 1; cy += 35.0;
+            draw_checkbox("PSD Normalization", &mut local_config.psd_normalization, menu_x + 15.0, cy, (mx, my), m_pressed); cy += 30.0;
+            draw_slider("Density Dampening", &mut local_config.peak_density_dampening, 0.0, 2.0, menu_x + 15.0, cy, 180.0, (mx, my), m_down, m_pressed, &mut active_slider, id); id += 1; cy += 45.0;
+
+            draw_text("Dynamics & Decay", menu_x + 15.0, cy, 18.0, ORANGE); cy += 25.0;
+            draw_slider("Peak Weight", &mut local_config.peak_weight, 0.0, 1.0, menu_x + 15.0, cy, 180.0, (mx, my), m_down, m_pressed, &mut active_slider, id); id += 1; cy += 35.0;
+            draw_slider("RMS Weight", &mut local_config.rms_weight, 0.0, 1.0, menu_x + 15.0, cy, 180.0, (mx, my), m_down, m_pressed, &mut active_slider, id); id += 1; cy += 35.0;
+            draw_slider("Phosphor Decay (Bass)", &mut local_config.decay_low, 0.0, 0.1, menu_x + 15.0, cy, 180.0, (mx, my), m_down, m_pressed, &mut active_slider, id); id += 1; cy += 35.0;
+            draw_slider("Phosphor Decay (Treble)", &mut local_config.decay_high, 0.0, 0.1, menu_x + 15.0, cy, 180.0, (mx, my), m_down, m_pressed, &mut active_slider, id); id += 1; cy += 45.0;
+
+            draw_text("CQT Kernel Splatting", menu_x + 15.0, cy, 18.0, ORANGE); cy += 25.0;
+            draw_slider("Splat Spread (Bass)", &mut local_config.splat_low, 0.0, 10.0, menu_x + 15.0, cy, 180.0, (mx, my), m_down, m_pressed, &mut active_slider, id); id += 1; cy += 35.0;
+            draw_slider("Splat Spread (Treble)", &mut local_config.splat_high, 0.0, 5.0, menu_x + 15.0, cy, 180.0, (mx, my), m_down, m_pressed, &mut active_slider, id); id += 1; cy += 35.0;
+            draw_slider("Halo Raw Blend", &mut local_config.halo_raw, 0.0, 10.0, menu_x + 15.0, cy, 180.0, (mx, my), m_down, m_pressed, &mut active_slider, id); id += 1; cy += 35.0;
+            draw_slider("Halo Sharp Blend", &mut local_config.halo_sharp, 0.0, 10.0, menu_x + 15.0, cy, 180.0, (mx, my), m_down, m_pressed, &mut active_slider, id); id += 1; cy += 45.0;
+
+            draw_text("Makeup Gains", menu_x + 15.0, cy, 18.0, ORANGE); cy += 25.0;
+            draw_slider("STFT Boost Gain", &mut local_config.stft_boost, 1.0, 20.0, menu_x + 15.0, cy, 180.0, (mx, my), m_down, m_pressed, &mut active_slider, id); id += 1; cy += 35.0;
+            draw_slider("IIR Boost Gain", &mut local_config.iir_boost, 1.0, 20.0, menu_x + 15.0, cy, 180.0, (mx, my), m_down, m_pressed, &mut active_slider, id); 
+
+            if local_config != original_config {
+                if let Ok(mut s) = shared_settings.lock() {
+                    s.dsp_config = local_config;
+                }
+            }
         }
 
         next_frame().await
     }
 }
 
+// --- Custom Macroquad UI Components ---
+
+fn draw_slider(
+    label: &str,
+    val: &mut f32,
+    min: f32,
+    max: f32,
+    x: f32,
+    y: f32,
+    w: f32,
+    mouse_pos: (f32, f32),
+    mouse_down: bool,
+    mouse_pressed: bool,
+    active_id: &mut Option<usize>,
+    my_id: usize,
+) -> bool {
+    let mut changed = false;
+    draw_text(label, x, y - 4.0, 16.0, WHITE);
+    
+    let is_hovered = mouse_pos.0 >= x && mouse_pos.0 <= x + w + 30.0 && mouse_pos.1 >= y - 10.0 && mouse_pos.1 <= y + 20.0;
+
+    if mouse_pressed && is_hovered {
+        *active_id = Some(my_id);
+    }
+
+    if mouse_down && *active_id == Some(my_id) {
+        let norm = ((mouse_pos.0 - x) / w).clamp(0.0, 1.0);
+        let new_val = min + norm * (max - min);
+        if (*val - new_val).abs() > f32::EPSILON {
+            *val = new_val;
+            changed = true;
+        }
+    }
+
+    if !mouse_down && *active_id == Some(my_id) {
+        *active_id = None;
+    }
+
+    draw_line(x, y + 10.0, x + w, y + 10.0, 4.0, GRAY);
+    
+    let norm = (*val - min) / (max - min);
+    let hx = x + norm * w;
+    let color = if *active_id == Some(my_id) { YELLOW } else if is_hovered { LIGHTGRAY } else { WHITE };
+    draw_circle(hx, y + 10.0, 6.0, color);
+    
+    let val_str = format!("{:.2}", val);
+    draw_text(&val_str, x + w + 10.0, y + 14.0, 16.0, color);
+
+    changed
+}
+
+fn draw_checkbox(
+    label: &str,
+    val: &mut bool,
+    x: f32,
+    y: f32,
+    mouse_pos: (f32, f32),
+    mouse_pressed: bool,
+) -> bool {
+    let mut changed = false;
+    let box_size = 14.0;
+    
+    let is_hovered = mouse_pos.0 >= x && mouse_pos.0 <= x + 200.0 && mouse_pos.1 >= y - box_size && mouse_pos.1 <= y + 5.0;
+
+    if mouse_pressed && is_hovered {
+        *val = !*val;
+        changed = true;
+    }
+
+    let color = if is_hovered { YELLOW } else { WHITE };
+
+    draw_rectangle_lines(x, y - box_size + 2.0, box_size, box_size, 2.0, color);
+    if *val {
+        draw_rectangle(x + 3.0, y - box_size + 5.0, box_size - 6.0, box_size - 6.0, color);
+    }
+    draw_text(label, x + box_size + 10.0, y, 16.0, color);
+
+    changed
+}
+
 // Highly optimized lock-free CPU memory prep. Converts f32 -> u8 intensity in a straight linear array.
+// Moved to compute natively sequential arrays, preventing random access jumping in heavy loops!
+#[inline(always)]
+fn compute_column_colors(
+    col_buffer: &mut [u8], 
+    data: &[f32], 
+    freq_bins: usize, 
+    tilt_curve: &[f32],
+) {
+    for i in 0..freq_bins {
+        let y = (freq_bins - 1) - i; 
+        let magnitude = data[i] * tilt_curve[i]; // Apply Pink Noise Slope
+        
+        let intensity = ((magnitude * 2000.0).ln() / 8.0).clamp(0.0, 1.0);
+        let val = (intensity * 255.0) as u8;
+
+        let idx = y * 4;
+        col_buffer[idx] = val;     // R
+        col_buffer[idx+1] = val;   // G
+        col_buffer[idx+2] = val;   // B
+        col_buffer[idx+3] = 255;   // A
+    }
+}
+
 #[inline(always)]
 fn paint_column_fast(
     pixels: &mut [u8], 
@@ -1558,7 +1743,7 @@ struct UiStat {
     color: Color,
 }
 
-fn draw_ui_overlay(scale: ScaleType, cmap: ColorMapType, dir: ScrollDirection, fft_idx: usize, history: usize, source: AudioSource, iir_enabled: bool) {
+fn draw_ui_overlay(scale: ScaleType, cmap: ColorMapType, dir: ScrollDirection, fft_idx: usize, history: usize, source: AudioSource, iir_enabled: bool, show_tweaks: bool) {
     let scale_str = format!("{:?}", scale);
     let map_str = format!("{:?}", cmap); 
     let dir_str = match dir {
@@ -1585,6 +1770,7 @@ fn draw_ui_overlay(scale: ScaleType, cmap: ColorMapType, dir: ScrollDirection, f
         AudioSource::Microphone => "Mic",
     };
     let iir_str = if iir_enabled { "On" } else { "Off" };
+    let tweaks_str = if show_tweaks { "Visible" } else { "Hidden" };
 
     let stats = vec![
         UiStat { label: "Scale",  hotkey: Some('S'), value: scale_str.to_string(), color: ORANGE },
@@ -1594,11 +1780,12 @@ fn draw_ui_overlay(scale: ScaleType, cmap: ColorMapType, dir: ScrollDirection, f
         UiStat { label: "Window",    hotkey: Some('W'), value: hist_str,              color: PINK },
         UiStat { label: "Audio Src",     hotkey: Some('X'), value: src_str.to_string(),   color: GREEN },
         UiStat { label: "IIR Bass",     hotkey: Some('I'), value: iir_str.to_string(),   color: LIME },
+        UiStat { label: "Tweaks",       hotkey: Some('T'), value: tweaks_str.to_string(), color: WHITE },
     ];
 
     let (bg_x, bg_y, bg_w, bg_h, is_vertical) = match dir {
         ScrollDirection::RTL | ScrollDirection::LTR => (0.0, 0.0, screen_width(), 35.0, false),
-        _ => (screen_width() - 220.0, 0.0, 220.0, 180.0, true),
+        _ => (screen_width() - 220.0, 0.0, 220.0, 205.0, true),
     };
 
     draw_rectangle(bg_x, bg_y, bg_w, bg_h, Color::new(0.0, 0.0, 0.0, 0.6));
