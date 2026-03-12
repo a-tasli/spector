@@ -1,4 +1,5 @@
 use macroquad::prelude::*;
+use egui_macroquad::egui;
 use ringbuf::HeapRb;
 use rustfft::{FftPlanner, num_complex::Complex};
 use std::sync::{Arc, Mutex};
@@ -19,36 +20,17 @@ const CQT_HOP_SIZE: usize = 512;
 // --- SPECTRAL OVERSAMPLING (Zero-Padding) ---
 // Activating this pads lower-resolution STFT windows with zeros up to the OVERSAMPLE_TARGET.
 // This multiplies the frequency bins (resolving "black space" gaps) WITHOUT sacrificing temporal sharpness.
-const SPECTRAL_OVERSAMPLING: bool = true;
+const SPECTRAL_OVERSAMPLING: bool = false;
 const OVERSAMPLE_TARGET: usize = 16384; 
 
-// Professional Visualizer Tweaks
-const PINK_NOISE_TILT_DB_PER_OCTAVE: f32 = 0.0; // 3.0 is standard for mastered music
-const PEAK_WEIGHT: f32 = 0.5; // Hybrid Peak-RMS balance
-const RMS_WEIGHT: f32 = 0.5;
-
-// --- NEW CONFIGS: PSD & Adaptive Smoothing ---
-const PSD_NORMALIZATION: bool = true;  // Flattens white noise by dividing by bandwidth (energy density)
-const PEAK_DENSITY_DAMPENING: f32 = 1.0; // Amount to smooth brightness banding at STFT boundaries. 0.0 = off, 1.0 = mathematically flat.
-
-const DECAY_LOW_FREQ: f32 = 0.01;      // Heavy phosphor in the bass for stability
-const DECAY_HIGH_FREQ: f32 = 0.005;     // Fast release in the treble for transients
-
-const SPLAT_SPREAD_LOW: f32 = 3.0;     // Wide interpolation in the bass to fill sparse STFT gaps
-const SPLAT_SPREAD_HIGH: f32 = 0.01;    // Narrow splatting in the treble to maintain razor sharpness
-
-const HALO_RAW_BLEND: f32 = 0.0;       // Amount of the 'blurry' original FFT background (fills gaps)
-const HALO_SHARP_BLEND: f32 = 10.0;     // Amount of the razor-sharp reassigned pitch cores
-const STFT_BOOST_GAIN: f32 = 5.0;     // Restores brightness lost to PSD and pitch-core condensation
-const IIR_BOOST_GAIN: f32 = 5.0;       // Matches the sub-bass brightness to the STFT layer
-
 // Variable resolutions and their corresponding Variable Hop Sizes
-const RESOLUTIONS: [usize; 4] = [2048, 4096, 8192, 16384];
+// const RESOLUTIONS: [usize; 4] = [2048, 4096, 8192, 16384];
+const RESOLUTIONS: [usize; 4] = [1024, 2048, 4096, 8192];
 const HOP_SIZES: [usize; 4] = [256, 512, 1024, 2048];
 
 const CQT_BINS: usize = 1200; // The HD resolution of our Constant-Q Transform output
 const IIR_CROSSOVER_LOWER_HZ: f32 = 100.0; // Start crossfading from IIR to STFT here
-const IIR_CROSSOVER_UPPER_HZ: f32 = 261.5; // IIR fully faded out by here
+const IIR_CROSSOVER_UPPER_HZ: f32 = 350.0; // IIR fully faded out by here
 
 // View length is 2520, but the Ring Buffer is 2800 to give the write-head an invisible margin!
 const MAX_VIEW_LEN: usize = 2520; 
@@ -73,6 +55,45 @@ enum AudioSource { SinkMonitor, Microphone }
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum ScaleType { Linear, Mel, Logarithmic, Chromatic }
 
+// --- DYNAMIC DSP CONFIGURATION ---
+// Replaces compile-time constants for runtime tuning via egui
+#[derive(Clone, PartialEq)]
+struct DspConfig {
+    pink_noise_tilt: f32,
+    peak_weight: f32,
+    rms_weight: f32,
+    psd_normalization: bool,
+    peak_density_dampening: f32,
+    decay_low: f32,
+    decay_high: f32,
+    splat_low: f32,
+    splat_high: f32,
+    halo_raw: f32,
+    halo_sharp: f32,
+    stft_boost: f32,
+    iir_boost: f32,
+}
+
+impl Default for DspConfig {
+    fn default() -> Self {
+        Self {
+            pink_noise_tilt: 0.0,
+            peak_weight: 0.5,
+            rms_weight: 0.5,
+            psd_normalization: false,
+            peak_density_dampening: 0.0,
+            decay_low: 0.0,
+            decay_high: 0.0,
+            splat_low: 5.0,
+            splat_high: 1.0,
+            halo_raw: 0.0,
+            halo_sharp: 1.0,
+            stft_boost: 5.0,
+            iir_boost: 5.0,
+        }
+    }
+}
+
 /// Shared state between the Brain (processing) and Face (UI) threads.
 #[derive(Clone)]
 struct AppSettings {
@@ -81,6 +102,7 @@ struct AppSettings {
     redraw_flag: bool,
     audio_source: AudioSource,
     iir_enabled: bool,
+    dsp_config: DspConfig,
 }
 
 // 1D Colormap Generator for the GPU Shader
@@ -128,7 +150,6 @@ fn generate_hann_window(size: usize) -> Vec<f32> {
 }
 
 // --- Professional IIR Biquad Filter (Direct Form II Transposed) ---
-// Used for zero-latency, sub-bass transient resolution
 #[derive(Clone)]
 struct Biquad {
     b0: f32, b1: f32, b2: f32,
@@ -172,16 +193,15 @@ struct CqtInstruction {
     peak_dampening: f32,
 }
 
-// Generates dynamic Gaussian/Hann kernels to perfectly blend sparse bass bins
 struct SplatKernel {
     half_width: isize,
     weights: Vec<f32>,
 }
 
-fn build_splat_kernels() -> Vec<SplatKernel> {
+fn build_splat_kernels(splat_low: f32, splat_high: f32) -> Vec<SplatKernel> {
     (0..CQT_BINS).map(|bin| {
         let norm = bin as f32 / (CQT_BINS - 1) as f32;
-        let spread = SPLAT_SPREAD_LOW + (SPLAT_SPREAD_HIGH - SPLAT_SPREAD_LOW) * norm;
+        let spread = splat_low + (splat_high - splat_low) * norm;
         let mut half_width = spread.ceil() as isize;
         
         let mut weights = Vec::new();
@@ -209,7 +229,7 @@ fn build_splat_kernels() -> Vec<SplatKernel> {
     }).collect()
 }
 
-fn build_cqt_map(sample_rate: u32, stft_specs: &[(usize, usize)]) -> (Vec<CqtInstruction>, Vec<(usize, Biquad, f32)>) {
+fn build_cqt_map(sample_rate: u32, stft_specs: &[(usize, usize)], peak_damp_amount: f32) -> (Vec<CqtInstruction>, Vec<(usize, Biquad, f32)>) {
     let mut stft_map = Vec::with_capacity(CQT_BINS);
     let mut iir_filters = Vec::new();
     
@@ -231,7 +251,6 @@ fn build_cqt_map(sample_rate: u32, stft_specs: &[(usize, usize)]) -> (Vec<CqtIns
             musical_bw * (1.0 - t) + (erb * 1.2) * t
         };
 
-        // --- IIR Sub-Bass Routing ---
         if freq < IIR_CROSSOVER_UPPER_HZ {
             let q_factor = freq / bw_hz;
             iir_filters.push((bin, Biquad::bandpass(sample_rate as f32, freq, q_factor), bw_hz));
@@ -248,7 +267,6 @@ fn build_cqt_map(sample_rate: u32, stft_specs: &[(usize, usize)]) -> (Vec<CqtIns
         
         let mut best_idx = 0;
         let mut min_diff = usize::MAX;
-        // Select the STFT state based on its temporal window size
         for (i, &(win_res, _)) in stft_specs.iter().enumerate() {
             let diff = (win_res as isize - ideal_n as isize).unsigned_abs();
             if diff < min_diff {
@@ -259,12 +277,9 @@ fn build_cqt_map(sample_rate: u32, stft_specs: &[(usize, usize)]) -> (Vec<CqtIns
         
         let (win_res, fft_size) = stft_specs[best_idx];
         
-        // --- SOLUTION 2: PEAK-DENSITY DAMPENING ---
-        // Calculates the true mismatch between theoretical ideal density and our discrete bins.
-        // Interpolates the dampening target based on the PEAK_DENSITY_DAMPENING config amount.
         let density_mismatch = win_res as f32 / ideal_n_float;
         let target_dampening = 1.0 / density_mismatch.powf(0.5);
-        let peak_dampening = 1.0 + (target_dampening - 1.0) * PEAK_DENSITY_DAMPENING;
+        let peak_dampening = 1.0 + (target_dampening - 1.0) * peak_damp_amount;
 
         let freq_res = sample_rate as f32 / fft_size as f32;
         let center_bin = freq / freq_res;
@@ -275,7 +290,6 @@ fn build_cqt_map(sample_rate: u32, stft_specs: &[(usize, usize)]) -> (Vec<CqtIns
         let start_bin = (center_bin - bw_bins / 2.0).floor() as usize;
         let end_bin = (center_bin + bw_bins / 2.0).ceil() as usize;
         
-        // Clamping ensures weights perfectly match the slice, enabling safe SIMD auto-vectorization
         let start_bin = start_bin.clamp(0, fft_size / 2 - 1);
         let end_bin = end_bin.clamp(start_bin, fft_size / 2 - 1);
         
@@ -331,7 +345,6 @@ impl SpectrogramLayer {
     }
 }
 
-// State container for our Phase Vocoder
 struct StftState {
     window_size: usize,
     fft_size: usize,
@@ -341,10 +354,10 @@ struct StftState {
     last_mags: Vec<f32>,
     display_mags: Vec<f32>, 
     last_true_freqs: Vec<f32>,
-    decays: Vec<f32>, // Frequency-mapped phosphor decays
+    decays: Vec<f32>, 
     fft: Arc<dyn rustfft::Fft<f32>>,
     window: Vec<f32>,
-    scratch_buffer: Vec<Complex<f32>>, // Pre-allocated buffer for Zero-Padding
+    scratch_buffer: Vec<Complex<f32>>, 
 }
 
 const VERTEX_SHADER: &str = r#"#version 100
@@ -373,40 +386,29 @@ uniform float sample_rate;
 uniform float is_cqt_texture;
 
 void main() {
-    // uv.y = 0.0 is the top of the screen (Nyquist). uv.y = 1.0 is the bottom (DC).
-    // By inverting uv.y, norm_f becomes 0.0 at the bottom (DC) and 1.0 at the top (Nyquist).
     float norm_f = 1.0 - uv.y; 
-    
     float min_log_freq = 20.0;
     float max_freq = sample_rate / 2.0;
 
     if (is_cqt_texture > 0.5) {
-        // The CQT texture natively stores data logarithmically from min_log_freq to max_freq.
-        // We must map the requested screen scale to a frequency, then to the CQT coordinate.
         float current_hz;
-        
         if (scale_type > 2.5) {
-            // Chromatic
             float min_freq = 16.35159;
             float log_min = log2(min_freq);
             float log_max = log2(max_freq);
             current_hz = exp2(log_min + norm_f * (log_max - log_min));
         } else if (scale_type > 1.5) {
-            // Logarithmic
             float log_min = log2(min_log_freq);
             float log_max = log2(max_freq);
             current_hz = exp2(log_min + norm_f * (log_max - log_min));
         } else if (scale_type > 0.5) {
-            // Mel
             float mel_max = 2595.0 * (log(1.0 + max_freq / 700.0) / 2.30258509299);
             float current_mel = norm_f * mel_max;
             current_hz = 700.0 * (exp((current_mel / 2595.0) * 2.30258509299) - 1.0);
         } else {
-            // Linear
             current_hz = norm_f * max_freq;
         }
         
-        // Map the resolved frequency to the CQT texture's native log mapping array
         if (current_hz < min_log_freq) {
             norm_f = 0.0; 
         } else {
@@ -414,7 +416,6 @@ void main() {
             norm_f = clamp(norm_f, 0.0, 1.0);
         }
     } else {
-        // Standard linear STFT texture mapping
         if (scale_type > 2.5) {
             float min_freq = 16.35159;
             float log_min = log2(min_freq);
@@ -438,11 +439,7 @@ void main() {
     }
 
     vec2 sample_uv = vec2(uv.x, norm_f);
-
-    // Read the grayscale intensity computed by the CPU
     float intensity = texture2D(Texture, sample_uv).r;
-    
-    // Apply 1D Color LUT natively on GPU
     gl_FragColor = texture2D(colormap, vec2(intensity, 0.5));
 }
 "#;
@@ -465,19 +462,19 @@ async fn main() {
         let actual_fft = if SPECTRAL_OVERSAMPLING { OVERSAMPLE_TARGET.max(size) } else { size };
         layers.push(SpectrogramLayer::new(actual_fft / 2));
     }
-    // We now maintain TWO parallel CQT history buffers: one WITH IIR, one WITHOUT IIR.
     layers.push(SpectrogramLayer::new(CQT_BINS)); 
     layers.push(SpectrogramLayer::new(CQT_BINS)); 
 
-    let shared_layers = Arc::new(Mutex::new(layers));
     let shared_settings = Arc::new(Mutex::new(AppSettings {
-        scale_type: ScaleType::Mel,
+        scale_type: ScaleType::Logarithmic,
         colormap: ColorMapType::Magma,
         redraw_flag: false,
         audio_source: AudioSource::SinkMonitor,
         iir_enabled: false,
+        dsp_config: DspConfig::default(),
     }));
 
+    let shared_layers = Arc::new(Mutex::new(layers));
     let rb = HeapRb::<f32>::new(65536);
     let (mut producer, mut consumer) = rb.split();
 
@@ -560,115 +557,109 @@ async fn main() {
 
     thread::spawn(move || {
         let max_fft = *RESOLUTIONS.iter().max().unwrap();
-        
         let mut rolling_audio = vec![0.0; max_fft];
         let mut pending_buffer = Vec::with_capacity(4096);
 
-        // 1. Establish precise padding target states for the FFT planner
+        let mut local_dsp_config = DspConfig::default();
+
         let stft_specs: Vec<(usize, usize)> = RESOLUTIONS.iter().map(|&res| {
             let actual_fft = if SPECTRAL_OVERSAMPLING { OVERSAMPLE_TARGET.max(res) } else { res };
             (res, actual_fft)
         }).collect();
 
-        // 2. Setup Phase Vocoder states
         let mut planner = FftPlanner::new();
         let mut stft_states: Vec<StftState> = stft_specs.iter().zip(HOP_SIZES.iter()).map(|(&(win_size, fft_size), &hop_size)| {
-            let freq_res = SAMPLE_RATE as f32 / fft_size as f32;
-            let mut decays = vec![0.0f32; fft_size / 2];
-            let min_log = 20.0f32.log2();
-            let log_range = (SAMPLE_RATE as f32 / 2.0).log2() - min_log;
-
-            for bin in 0..(fft_size / 2) {
-                let freq = bin as f32 * freq_res;
-                let norm = if freq >= 20.0 { ((freq.log2() - min_log) / log_range).clamp(0.0, 1.0) } else { 0.0 };
-                decays[bin] = DECAY_LOW_FREQ + (DECAY_HIGH_FREQ - DECAY_LOW_FREQ) * norm;
-            }
-
             StftState {
                 window_size: win_size,
                 fft_size,
                 hop_size,
-                samples_since_last: hop_size, // Trigger immediately on start
+                samples_since_last: hop_size,
                 prev_phases: vec![0.0; fft_size / 2],
                 last_mags: vec![0.0; fft_size / 2],
                 display_mags: vec![0.0; fft_size / 2],
                 last_true_freqs: vec![0.0; fft_size / 2],
-                decays,
+                decays: vec![0.0; fft_size / 2], 
                 fft: planner.plan_fft_forward(fft_size),
                 window: generate_hann_window(win_size),
                 scratch_buffer: vec![Complex { re: 0.0, im: 0.0 }; fft_size],
             }
         }).collect();
 
-        // 3. Size float history accurately accommodating oversampled dimensions
         let mut float_history: Vec<Vec<f32>> = (0..=RESOLUTIONS.len() + 1).map(|i| {
             let size = if i < RESOLUTIONS.len() { stft_states[i].fft_size / 2 } else { CQT_BINS };
             vec![0.0f32; MAX_HISTORY * size]
         }).collect();
 
-        let mut local_cqt_col_no_iir: Vec<f32> = vec![0.0; CQT_BINS];
-        let mut local_cqt_col_with_iir: Vec<f32> = vec![0.0; CQT_BINS];
+        let mut local_cqt_col_no_iir = vec![0.0; CQT_BINS];
+        let mut local_cqt_col_with_iir = vec![0.0; CQT_BINS];
 
-        // 4. Generate Visual Tilt Curves natively tied to mapped resolutions
-        let mut tilt_curves: Vec<Vec<f32>> = Vec::new();
-        for state in &stft_states {
-            let half_size = state.fft_size / 2;
-            let mut curve = vec![1.0f32; half_size];
-            let freq_res = SAMPLE_RATE as f32 / state.fft_size as f32;
-            let min_log = 20.0f32.log2();
-            
-            for bin in 0..half_size {
-                let freq = bin as f32 * freq_res;
-                if freq > 20.0 {
-                    let octaves_above_min = freq.log2() - min_log;
-                    let tilt_db = octaves_above_min * PINK_NOISE_TILT_DB_PER_OCTAVE;
-                    curve[bin] = 10.0f32.powf(tilt_db / 20.0);
-                }
-            }
-            tilt_curves.push(curve);
-        }
-
-        let mut cqt_tilt_curve = vec![1.0f32; CQT_BINS];
-        let min_log = 20.0f32.log2();
-        let max_log = (SAMPLE_RATE as f32 / 2.0).log2();
-        let log_range = max_log - min_log;
-        
+        let mut tilt_curves: Vec<Vec<f32>> = (0..=RESOLUTIONS.len() + 1).map(|i| {
+            let size = if i < RESOLUTIONS.len() { stft_states[i].fft_size / 2 } else { CQT_BINS };
+            vec![1.0f32; size]
+        }).collect();
         let mut cqt_decays = vec![0.0f32; CQT_BINS];
 
-        for bin in 0..CQT_BINS {
-            let norm = bin as f32 / (CQT_BINS - 1) as f32;
-            let octaves_above_min = norm * log_range;
-            let tilt_db = octaves_above_min * PINK_NOISE_TILT_DB_PER_OCTAVE;
-            cqt_tilt_curve[bin] = 10.0f32.powf(tilt_db / 20.0);
+        // Ensure initially constructed correctly
+        let mut splat_kernels = build_splat_kernels(local_dsp_config.splat_low, local_dsp_config.splat_high);
+        let (mut stft_cqt_map, mut iir_filters) = build_cqt_map(SAMPLE_RATE, &stft_specs, local_dsp_config.peak_density_dampening);
+
+        // Function to rebuild DSP caches dynamically
+        let mut rebuild_dsp_caches = |config: &DspConfig, stft_states: &mut Vec<StftState>, tilt_curves: &mut Vec<Vec<f32>>, cqt_decays: &mut Vec<f32>, splat_kernels: &mut Vec<SplatKernel>, stft_cqt_map: &mut Vec<CqtInstruction>| {
+            for (i, state) in stft_states.iter_mut().enumerate() {
+                let half_size = state.fft_size / 2;
+                let freq_res = SAMPLE_RATE as f32 / state.fft_size as f32;
+                let min_log = 20.0f32.log2();
+                let log_range = (SAMPLE_RATE as f32 / 2.0).log2() - min_log;
+                
+                for bin in 0..half_size {
+                    let freq = bin as f32 * freq_res;
+                    let norm = if freq >= 20.0 { ((freq.log2() - min_log) / log_range).clamp(0.0, 1.0) } else { 0.0 };
+                    state.decays[bin] = config.decay_low + (config.decay_high - config.decay_low) * norm;
+                    
+                    if freq > 20.0 {
+                        let octaves_above_min = freq.log2() - min_log;
+                        let tilt_db = octaves_above_min * config.pink_noise_tilt;
+                        tilt_curves[i][bin] = 10.0f32.powf(tilt_db / 20.0);
+                    } else {
+                        tilt_curves[i][bin] = 1.0;
+                    }
+                }
+            }
             
-            // Map the adaptive decay frequency-wise
-            cqt_decays[bin] = DECAY_LOW_FREQ + (DECAY_HIGH_FREQ - DECAY_LOW_FREQ) * norm;
-        }
-        tilt_curves.push(cqt_tilt_curve.clone()); // Add tilt for CQT (No IIR) layer
-        tilt_curves.push(cqt_tilt_curve);         // Add tilt for CQT (With IIR) layer
+            let min_log = 20.0f32.log2();
+            let log_range = (SAMPLE_RATE as f32 / 2.0).log2() - min_log;
+            for bin in 0..CQT_BINS {
+                let norm = bin as f32 / (CQT_BINS - 1) as f32;
+                let octaves_above_min = norm * log_range;
+                let tilt_db = octaves_above_min * config.pink_noise_tilt;
+                let tilt_val = 10.0f32.powf(tilt_db / 20.0);
+                tilt_curves[RESOLUTIONS.len()][bin] = tilt_val;
+                tilt_curves[RESOLUTIONS.len()+1][bin] = tilt_val;
+                cqt_decays[bin] = config.decay_low + (config.decay_high - config.decay_low) * norm;
+            }
+            
+            *splat_kernels = build_splat_kernels(config.splat_low, config.splat_high);
+            let (new_map, _) = build_cqt_map(SAMPLE_RATE, &stft_specs, config.peak_density_dampening);
+            *stft_cqt_map = new_map;
+        };
 
-        let (stft_cqt_map, mut iir_filters) = build_cqt_map(SAMPLE_RATE, &stft_specs);
-        let splat_kernels = build_splat_kernels();
-        
-        let min_stft_weight_sum = stft_cqt_map.first().map(|inst| inst.weight_sum).unwrap_or(1.0);
-        let min_iir_bw = iir_filters.first().map(|&(_, _, bw)| bw).unwrap_or(1.0);
+        // Do the initial build
+        rebuild_dsp_caches(&local_dsp_config, &mut stft_states, &mut tilt_curves, &mut cqt_decays, &mut splat_kernels, &mut stft_cqt_map);
 
-        // --- Calculate IIR / STFT Blend Weights ---
         let mut iir_blend_weights = vec![0.0f32; CQT_BINS];
         for bin in 0..CQT_BINS {
             let norm = bin as f32 / (CQT_BINS - 1) as f32;
-            let freq = 2.0_f32.powf(min_log + norm * log_range);
+            let freq = 2.0_f32.powf(20.0f32.log2() + norm * ((SAMPLE_RATE as f32 / 2.0).log2() - 20.0f32.log2()));
             if freq <= IIR_CROSSOVER_LOWER_HZ {
                 iir_blend_weights[bin] = 1.0;
             } else if freq >= IIR_CROSSOVER_UPPER_HZ {
                 iir_blend_weights[bin] = 0.0;
             } else {
                 let t = (freq - IIR_CROSSOVER_LOWER_HZ) / (IIR_CROSSOVER_UPPER_HZ - IIR_CROSSOVER_LOWER_HZ);
-                iir_blend_weights[bin] = 0.5 * (1.0 + (std::f32::consts::PI * t).cos()); // Smooth fade 1 to 0
+                iir_blend_weights[bin] = 0.5 * (1.0 + (std::f32::consts::PI * t).cos()); 
             }
         }
 
-        // IIR and Temporal state accumulators
         let mut iir_power_accum = vec![0.0f32; CQT_BINS];
         let mut iir_peak_accum = vec![0.0f32; CQT_BINS];
         let mut iir_samples_accum = 0;
@@ -684,6 +675,10 @@ async fn main() {
                 if s.redraw_flag {
                     redraw_requested = true;
                     s.redraw_flag = false;
+                }
+                if s.dsp_config != local_dsp_config {
+                    local_dsp_config = s.dsp_config.clone();
+                    rebuild_dsp_caches(&local_dsp_config, &mut stft_states, &mut tilt_curves, &mut cqt_decays, &mut splat_kernels, &mut stft_cqt_map);
                 }
             }
 
@@ -707,12 +702,9 @@ async fn main() {
                 pending_buffer.extend(temp);
             }
 
-            // Process audio in steady multi-rate intervals
             while pending_buffer.len() >= MIN_HOP_SIZE {
                 let chunk: Vec<f32> = pending_buffer.drain(0..MIN_HOP_SIZE).collect();
 
-                // --- Instantaneous IIR Processing (Vectorized Inner Loop) ---
-                // We always compute this so the background history remains completely populated and accurate.
                 for &sample in &chunk {
                     for (bin_idx, biquad, _) in iir_filters.iter_mut() {
                         let filtered = biquad.process(sample);
@@ -730,7 +722,6 @@ async fn main() {
                 let len = rolling_audio.len();
                 rolling_audio[len - MIN_HOP_SIZE..].copy_from_slice(&chunk);
                 
-                // 1. Process STFT layers at their independent hop rates
                 for state in stft_states.iter_mut() {
                     state.samples_since_last += MIN_HOP_SIZE;
                     
@@ -738,7 +729,6 @@ async fn main() {
                         let start_sample = len - state.window_size;
                         let audio_slice = &rolling_audio[start_sample..];
                         
-                        // Rigorous Zero-Padding insertion utilizing CPU-friendly pre-allocated buffer
                         let buffer = &mut state.scratch_buffer;
                         buffer.fill(Complex { re: 0.0, im: 0.0 });
                         for (i, (&a, &w)) in audio_slice.iter().zip(state.window.iter()).enumerate() {
@@ -747,18 +737,15 @@ async fn main() {
                         
                         state.fft.process(buffer);
                         
-                        // --- STFT PARITY MATH ---
-                        // Magnitude normalization acts strictly upon the original time-window envelope span to remain perfectly consistent
                         let scale = 2.0 / state.window_size as f32; 
-                        let broadband_comp = (state.window_size as f32 / 2048.0).sqrt(); // fix energy spreading
-                        let cqt_makeup_gain = STFT_BOOST_GAIN.sqrt() * HALO_SHARP_BLEND; // fix absolute brightness
+                        let broadband_comp = (state.window_size as f32 / 2048.0).sqrt(); 
+                        let cqt_makeup_gain = local_dsp_config.stft_boost.sqrt() * local_dsp_config.halo_sharp; 
                         
                         let half_size = state.fft_size / 2;
                         let freq_res = SAMPLE_RATE as f32 / state.fft_size as f32;
                         let hop_advance = 2.0 * std::f32::consts::PI * state.hop_size as f32 / state.fft_size as f32;
                         let sr_over_hop = SAMPLE_RATE as f32 / (2.0 * std::f32::consts::PI * state.hop_size as f32);
                         
-                        // --- SIMD Optimized Phase Vocoder Analysis w/ Decay ---
                         for (bin, (((&c, mag), prev_phase), true_freq)) in buffer[0..half_size].iter()
                             .zip(&mut state.last_mags)
                             .zip(&mut state.prev_phases)
@@ -779,12 +766,10 @@ async fn main() {
                                 
                             *true_freq = bin_freq + unwrapped_diff * sr_over_hop;
                             
-                            // Apply visual makeup gain *only* for the direct STFT display to perfectly match CQT
                             let display_mag = *mag * broadband_comp * cqt_makeup_gain;
-                            
-                            // Apply adaptive Phosphor-decay
                             let prev_disp = state.display_mags[bin];
                             let decay = state.decays[bin];
+                            
                             state.display_mags[bin] = if display_mag > prev_disp {
                                 display_mag
                             } else {
@@ -798,8 +783,10 @@ async fn main() {
 
                 cqt_samples_since_last += MIN_HOP_SIZE;
 
-                // 2. Compute CQT and commit to visualizer history grids
                 if cqt_samples_since_last >= CQT_HOP_SIZE {
+                    let min_stft_weight_sum = stft_cqt_map.first().map(|inst| inst.weight_sum).unwrap_or(1.0);
+                    let min_iir_bw = iir_filters.first().map(|&(_, _, bw)| bw).unwrap_or(1.0);
+
                     let mut raw_cqt_power = vec![0.0f32; CQT_BINS];
                     let mut raw_cqt_peak = vec![0.0f32; CQT_BINS];
                     let mut sharp_cqt_power = vec![0.0f32; CQT_BINS];
@@ -808,16 +795,15 @@ async fn main() {
                     let mut stft_amplitudes = vec![0.0f32; CQT_BINS];
                     let mut iir_amplitudes = vec![0.0f32; CQT_BINS];
                     
-                    // --- Inject Hybrid IIR Bass Energy w/ PSD Normalization ---
                     if iir_samples_accum > 0 {
                         let inv_samples = 1.0 / iir_samples_accum as f32;
                         for &(bin, _, bw) in iir_filters.iter() {
-                            let norm_factor = if PSD_NORMALIZATION { bw / min_iir_bw } else { 1.0 };
+                            let norm_factor = if local_dsp_config.psd_normalization { bw / min_iir_bw } else { 1.0 };
                             let rms = ((iir_power_accum[bin] * inv_samples) / norm_factor).sqrt();
                             let peak = iir_peak_accum[bin]; 
                             
-                            let hybrid = (peak * PEAK_WEIGHT) + (rms * RMS_WEIGHT);
-                            iir_amplitudes[bin] = hybrid * IIR_BOOST_GAIN; 
+                            let hybrid = (peak * local_dsp_config.peak_weight) + (rms * local_dsp_config.rms_weight);
+                            iir_amplitudes[bin] = hybrid * local_dsp_config.iir_boost; 
                         }
                         for &(bin, _, _) in iir_filters.iter() {
                             iir_power_accum[bin] = 0.0;
@@ -826,14 +812,14 @@ async fn main() {
                         iir_samples_accum = 0;
                     }
                     
-                    // --- Dual-Pass Sparse Matrix (Raw Halo + Sharp Splatting) ---
+                    let min_log = 20.0f32.log2();
+                    let log_range = (SAMPLE_RATE as f32 / 2.0).log2() - min_log;
+
                     for inst in stft_cqt_map.iter() {
                         let state = &stft_states[inst.fft_idx];
                         let default_bin = inst.cqt_bin_idx;
-                        let norm_factor = if PSD_NORMALIZATION { inst.weight_sum / min_stft_weight_sum } else { 1.0 };
+                        let norm_factor = if local_dsp_config.psd_normalization { inst.weight_sum / min_stft_weight_sum } else { 1.0 };
                         
-                        // --- RESOLUTION COMPENSATION ---
-                        // Re-aligns energy scaling identically to original window widths regardless of spectral oversampling multiplier
                         let resolution_comp = state.window_size as f32 / 2048.0;
                         let comp_mag_factor = resolution_comp.sqrt();
                         let peak_dampening = inst.peak_dampening;
@@ -845,29 +831,23 @@ async fn main() {
                         let freqs = &state.last_true_freqs[start..end];
                         
                         for ((&mag, &true_freq), &w) in mags.iter().zip(freqs).zip(&inst.weights) {
-                            // Apply compensation to the squared energy
                             let energy = (((mag * mag) * w) / norm_factor) * resolution_comp;
-                            
-                            // 1. Accumulate Raw CQT 'Halo' Energy (Bandwidth Normalized)
                             raw_cqt_power[default_bin] += energy;
                             
-                            // Apply peak density dampening strictly to the linear peaks to smooth out boundaries
-                            let comp_mag = (mag * comp_mag_factor) * peak_dampening; // Compensated linear magnitude
+                            let comp_mag = (mag * comp_mag_factor) * peak_dampening; 
                             if comp_mag > raw_cqt_peak[default_bin] {
                                 raw_cqt_peak[default_bin] = comp_mag;
                             }
                             
-                            // 2. Accumulate Sharp Reassigned Energy with Dynamic Gaussian Splat
                             if true_freq >= 20.0 {
                                 let norm = (true_freq.log2() - min_log) / log_range;
                                 let target_bin = (norm * (CQT_BINS - 1) as f32).round() as isize;
                                 
                                 if target_bin >= 0 && target_bin < CQT_BINS as isize {
-                                    let boosted_energy = energy * STFT_BOOST_GAIN;
-                                    let boosted_mag = comp_mag * STFT_BOOST_GAIN.sqrt(); 
+                                    let boosted_energy = energy * local_dsp_config.stft_boost;
+                                    let boosted_mag = comp_mag * local_dsp_config.stft_boost.sqrt(); 
                                     
                                     let splat = &splat_kernels[target_bin as usize];
-                                    
                                     for (s, &s_weight) in (-splat.half_width..=splat.half_width).zip(&splat.weights) {
                                         let offset_bin = target_bin + s;
                                         if offset_bin >= 0 && offset_bin < CQT_BINS as isize {
@@ -886,28 +866,24 @@ async fn main() {
                     }
                     
                     for bin in 0..CQT_BINS {
-                        let raw_hybrid = (raw_cqt_peak[bin] * PEAK_WEIGHT) + (raw_cqt_power[bin].sqrt() * RMS_WEIGHT);
-                        let sharp_hybrid = (sharp_cqt_peak[bin] * PEAK_WEIGHT) + (sharp_cqt_power[bin].sqrt() * RMS_WEIGHT);
+                        let raw_hybrid = (raw_cqt_peak[bin] * local_dsp_config.peak_weight) + (raw_cqt_power[bin].sqrt() * local_dsp_config.rms_weight);
+                        let sharp_hybrid = (sharp_cqt_peak[bin] * local_dsp_config.peak_weight) + (sharp_cqt_power[bin].sqrt() * local_dsp_config.rms_weight);
                         
-                        stft_amplitudes[bin] = (raw_hybrid * HALO_RAW_BLEND) + (sharp_hybrid * HALO_SHARP_BLEND);
+                        stft_amplitudes[bin] = (raw_hybrid * local_dsp_config.halo_raw) + (sharp_hybrid * local_dsp_config.halo_sharp);
                         
                         let iir_w = iir_blend_weights[bin];
                         let stft_w = 1.0 - iir_w;
 
-                        // Calculate BOTH paths independently
                         let current_no_iir = stft_amplitudes[bin];
                         let current_with_iir = (iir_amplitudes[bin] * iir_w) + (stft_amplitudes[bin] * stft_w);
                         
                         let decay = cqt_decays[bin];
                         
-                        // --- Temporal Persistence (Adaptive Phosphor Decay) ---
-                        // Persist NO IIR path
                         let prev_no = prev_cqt_col_no_iir[bin];
                         let final_no = if current_no_iir > prev_no { current_no_iir } else { (current_no_iir * (1.0 - decay)) + (prev_no * decay) };
                         prev_cqt_col_no_iir[bin] = final_no;
                         local_cqt_col_no_iir[bin] = final_no;
                         
-                        // Persist WITH IIR path
                         let prev_with = prev_cqt_col_with_iir[bin];
                         let final_with = if current_with_iir > prev_with { current_with_iir } else { (current_with_iir * (1.0 - decay)) + (prev_with * decay) };
                         prev_cqt_col_with_iir[bin] = final_with;
@@ -933,9 +909,7 @@ async fn main() {
                                 float_history[i][float_start..float_start+copy_len].copy_from_slice(&data_source[0..copy_len]);
                             }
 
-                            // Pass the visual Tilt curves to the painting function
                             paint_column_fast(&mut layer.pixels, head_idx, data_source, layer.freq_bins, &tilt_curves[i]);
-
                             layer.head = (layer.head + 1) % MAX_HISTORY;
                             layer.total_updates += 1;
                         }
@@ -954,7 +928,7 @@ async fn main() {
     // ===============================================
     // --- THREAD C: FACE (UI & GPU Rendering) ---
     // ===============================================
-    let mut current_fft_idx = RESOLUTIONS.len(); // Default to CQT HD
+    let mut current_fft_idx = RESOLUTIONS.len(); 
     let mut last_fft_idx = RESOLUTIONS.len(); 
     let mut current_view_len = MAX_VIEW_LEN; 
     
@@ -1002,22 +976,71 @@ async fn main() {
     loop {
         let mut visual_changed = false;
         let mut source_changed = false;
+        let mut ui_wants_input = false;
 
-        if is_key_pressed(KeyCode::S) { local_scale = cycle_scale(local_scale); visual_changed = true; } 
-        if is_key_pressed(KeyCode::C) { local_cmap = cycle_colormap(local_cmap); visual_changed = true; }
-        if is_key_pressed(KeyCode::F) { local_dir = cycle_direction(local_dir); }
-        if is_key_pressed(KeyCode::R) { current_fft_idx = (current_fft_idx + 1) % (RESOLUTIONS.len() + 1); } 
-        if is_key_pressed(KeyCode::I) { local_iir = !local_iir; visual_changed = true; }
-        if is_key_pressed(KeyCode::X) { 
-            local_source = match local_source {
-                AudioSource::SinkMonitor => AudioSource::Microphone,
-                AudioSource::Microphone => AudioSource::SinkMonitor,
-            };
-            source_changed = true; 
+        // --- EGUI DSP Config Panel ---
+        if DRAW_UI {
+            egui_macroquad::ui(|egui_ctx| {
+                ui_wants_input = egui_ctx.wants_keyboard_input() || egui_ctx.wants_pointer_input();
+
+                egui::Window::new("DSP Engine Tweaks")
+                    .default_pos([20.0, 100.0])
+                    .show(egui_ctx, |ui| {
+                        let mut local_config = shared_settings.lock().unwrap().dsp_config.clone();
+                        let original_config = local_config.clone();
+
+                        ui.heading("Signal Pipeline");
+                        ui.add(egui::Slider::new(&mut local_config.pink_noise_tilt, 0.0..=6.0).text("Pink Noise Tilt (dB/Oct)"));
+                        ui.checkbox(&mut local_config.psd_normalization, "PSD Normalization");
+                        ui.add(egui::Slider::new(&mut local_config.peak_density_dampening, 0.0..=2.0).text("Density Dampening"));
+                        
+                        ui.separator();
+                        ui.heading("Dynamics & Decay");
+                        ui.add(egui::Slider::new(&mut local_config.peak_weight, 0.0..=1.0).text("Peak Weight"));
+                        ui.add(egui::Slider::new(&mut local_config.rms_weight, 0.0..=1.0).text("RMS Weight"));
+                        ui.add(egui::Slider::new(&mut local_config.decay_low, 0.0..=0.1).text("Phosphor Decay (Bass)"));
+                        ui.add(egui::Slider::new(&mut local_config.decay_high, 0.0..=0.1).text("Phosphor Decay (Treble)"));
+                        
+                        ui.separator();
+                        ui.heading("CQT Kernel Splatting");
+                        ui.add(egui::Slider::new(&mut local_config.splat_low, 0.0..=10.0).text("Splat Spread (Bass)"));
+                        ui.add(egui::Slider::new(&mut local_config.splat_high, 0.0..=5.0).text("Splat Spread (Treble)"));
+                        ui.add(egui::Slider::new(&mut local_config.halo_raw, 0.0..=10.0).text("Halo Raw Blend"));
+                        ui.add(egui::Slider::new(&mut local_config.halo_sharp, 0.0..=10.0).text("Halo Sharp Blend"));
+                        
+                        ui.separator();
+                        ui.heading("Makeup Gains");
+                        ui.add(egui::Slider::new(&mut local_config.stft_boost, 1.0..=20.0).text("STFT Boost Gain"));
+                        ui.add(egui::Slider::new(&mut local_config.iir_boost, 1.0..=20.0).text("IIR Boost Gain"));
+
+                        // Sync back to Brain Thread if tweaked
+                        if local_config != original_config {
+                            if let Ok(mut s) = shared_settings.lock() {
+                                s.dsp_config = local_config;
+                            }
+                        }
+                    });
+            });
         }
 
-        if is_key_pressed(KeyCode::W) {
-            current_view_len = if current_view_len == MAX_VIEW_LEN { MAX_VIEW_LEN / 2 } else { MAX_VIEW_LEN };
+        // Only process hotkeys if the user is not actively interacting with the egui sliders
+        if !ui_wants_input {
+            if is_key_pressed(KeyCode::S) { local_scale = cycle_scale(local_scale); visual_changed = true; } 
+            if is_key_pressed(KeyCode::C) { local_cmap = cycle_colormap(local_cmap); visual_changed = true; }
+            if is_key_pressed(KeyCode::F) { local_dir = cycle_direction(local_dir); }
+            if is_key_pressed(KeyCode::R) { current_fft_idx = (current_fft_idx + 1) % (RESOLUTIONS.len() + 1); } 
+            if is_key_pressed(KeyCode::I) { local_iir = !local_iir; visual_changed = true; }
+            if is_key_pressed(KeyCode::X) { 
+                local_source = match local_source {
+                    AudioSource::SinkMonitor => AudioSource::Microphone,
+                    AudioSource::Microphone => AudioSource::SinkMonitor,
+                };
+                source_changed = true; 
+            }
+
+            if is_key_pressed(KeyCode::W) {
+                current_view_len = if current_view_len == MAX_VIEW_LEN { MAX_VIEW_LEN / 2 } else { MAX_VIEW_LEN };
+            }
         }
 
         if visual_changed || source_changed {
@@ -1034,7 +1057,6 @@ async fn main() {
             }
         }
 
-        // Dynamically resolve which texture layer we are rendering based on the IIR toggle
         let actual_fft_idx = if current_fft_idx == RESOLUTIONS.len() {
             if local_iir { RESOLUTIONS.len() + 1 } else { RESOLUTIONS.len() }
         } else {
@@ -1293,7 +1315,7 @@ async fn main() {
         draw_note_ruler(local_scale, local_dir);
         if DRAW_UI { draw_ui_overlay(local_scale, local_cmap, local_dir, current_fft_idx, current_view_len, local_source, local_iir); }
 
-        if DRAW_UI {
+        if DRAW_UI && !ui_wants_input {
             // --- Interactive Mouse Crosshair (Frequency/Note Peeking) ---
             let (mx, my) = mouse_position();
             
@@ -1336,7 +1358,6 @@ async fn main() {
                     }
                 };
 
-                // With the new temporal multi-rate structure, we use the CQT hop size to determine UI time intervals
                 let drawn_time_seconds = (final_source_w_snapped * CQT_HOP_SIZE as f32) / SAMPLE_RATE as f32;
                 let time_ago = norm_time * drawn_time_seconds;
                 let (note_name, _) = hz_to_pitch(current_hz);
@@ -1387,6 +1408,10 @@ async fn main() {
             }
         }
 
+        if DRAW_UI {
+            egui_macroquad::draw();
+        }
+
         next_frame().await
     }
 }
@@ -1402,12 +1427,8 @@ fn paint_column_fast(
 ) {
     let x_offset = col_idx * 4;
     for i in 0..freq_bins {
-        // By mapping i=0 (DC) to y=(max), DC sits at the bottom of the memory buffer
-        // This corresponds perfectly with OpenGL's native v=0.0 texture coordinate.
         let y = (freq_bins - 1) - i; 
-        
-        let magnitude = data[i] * tilt_curve[i]; // Apply Pink Noise Slope
-        
+        let magnitude = data[i] * tilt_curve[i];
         let intensity = ((magnitude * 2000.0).ln() / 8.0).clamp(0.0, 1.0);
         let val = (intensity * 255.0) as u8;
 
@@ -1499,7 +1520,7 @@ fn draw_note_ruler(scale: ScaleType, dir: ScrollDirection) {
         let freq = 440.0 * 2.0f32.powf((midi as f32 - 69.0) / 12.0);
         if freq > (SAMPLE_RATE as f32 / 2.0) { break; }
         let norm_pos = freq_to_screen_pos(freq, scale);
-        if norm_pos < 0.0 || norm_pos > 1.0 { continue; } // Exclude notes outside displayable bounds
+        if norm_pos < 0.0 || norm_pos > 1.0 { continue; } 
         
         let (x, y, is_c) = match dir {
             ScrollDirection::RTL => (w, h * (1.0 - norm_pos), midi % 12 == 0),
@@ -1571,7 +1592,7 @@ fn draw_ui_overlay(scale: ScaleType, cmap: ColorMapType, dir: ScrollDirection, f
         UiStat { label: "Flow",   hotkey: Some('F'), value: dir_str.to_string(),   color: SKYBLUE },
         UiStat { label: "Resolution",    hotkey: Some('R'), value: res_str,               color: VIOLET },
         UiStat { label: "Window",    hotkey: Some('W'), value: hist_str,              color: PINK },
-        UiStat { label: "Audio Src",     hotkey: Some('A'), value: src_str.to_string(),   color: GREEN },
+        UiStat { label: "Audio Src",     hotkey: Some('X'), value: src_str.to_string(),   color: GREEN },
         UiStat { label: "IIR Bass",     hotkey: Some('I'), value: iir_str.to_string(),   color: LIME },
     ];
 
