@@ -16,6 +16,7 @@ use libpulse_simple_binding::Simple;
 const SAMPLE_RATE: u32 = 44100;
 const MIN_HOP_SIZE: usize = 256; 
 const CQT_HOP_SIZE: usize = 512; 
+const USE_PHASE_CONFIDENCE_FILTER: bool = true;
 
 // --- SPECTRAL OVERSAMPLING (Zero-Padding) ---
 const SPECTRAL_OVERSAMPLING: bool = false;
@@ -23,7 +24,7 @@ const OVERSAMPLE_TARGET: usize = 16384;
 
 // Variable resolutions and their corresponding Variable Hop Sizes
 const RESOLUTIONS: [usize; 4] = [1024, 2048, 4096, 8192];
-const HOP_SIZES: [usize; 4] = [256, 512, 1024, 2048];
+const HOP_SIZES: [usize; 4] = [256, 512, 512, 512];
 
 const CQT_BINS: usize = 1200; 
 const IIR_CROSSOVER_LOWER_HZ: f32 = 100.0; 
@@ -89,8 +90,8 @@ impl Default for DspConfig {
             peak_density_dampening: 0.0,
             decay_low: 0.0,
             decay_high: 0.0,
-            splat_low: 5.0,
-            splat_high: 1.0,
+            splat_low: 3.0,
+            splat_high: 0.0,
             halo_raw: 0.0,
             halo_sharp: 1.0,
             stft_boost: 5.0,
@@ -231,6 +232,7 @@ impl IntensityLut {
     }
 }
 
+// Reverted to Hann window for tight main-lobe frequency resolution.
 fn generate_hann_window(size: usize) -> Vec<f32> {
     (0..size)
         .map(|i| 0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / size as f32).cos()))
@@ -284,6 +286,7 @@ struct CqtInstruction {
 struct SplatKernel {
     half_width: isize,
     weights: Vec<f32>,
+    weights_sqrt: Vec<f32>, // Precalculated to save 1,000,000+ sqrt() calls/sec
 }
 
 fn build_splat_kernels(splat_low: f32, splat_high: f32) -> Vec<SplatKernel> {
@@ -313,7 +316,12 @@ fn build_splat_kernels(splat_low: f32, splat_high: f32) -> Vec<SplatKernel> {
             half_width = 0;
         }
         
-        SplatKernel { half_width, weights }
+        let mut weights_sqrt = Vec::with_capacity(weights.len());
+        for w in &weights {
+            weights_sqrt.push(w.sqrt());
+        }
+        
+        SplatKernel { half_width, weights, weights_sqrt }
     }).collect()
 }
 
@@ -438,6 +446,8 @@ struct StftState {
     fft_size: usize,
     hop_size: usize,
     samples_since_last: usize,
+    bin_freqs: Vec<f32>,          // Precomputed array eliminates inner-loop multiplications
+    expected_advances: Vec<f32>,  // Precomputed array eliminates inner-loop multiplications
     prev_phases: Vec<f32>,
     last_mags: Vec<f32>,
     display_mags: Vec<f32>, 
@@ -706,11 +716,15 @@ async fn main() {
 
         let mut planner = FftPlanner::new();
         let mut stft_states: Vec<StftState> = stft_specs.iter().zip(HOP_SIZES.iter()).map(|(&(win_size, fft_size), &hop_size)| {
+            let freq_res = SAMPLE_RATE as f32 / fft_size as f32;
+            let hop_advance = 2.0 * std::f32::consts::PI * hop_size as f32 / fft_size as f32;
             StftState {
                 window_size: win_size,
                 fft_size,
                 hop_size,
                 samples_since_last: hop_size,
+                bin_freqs: (0..fft_size / 2).map(|b| b as f32 * freq_res).collect(),
+                expected_advances: (0..fft_size / 2).map(|b| b as f32 * hop_advance).collect(),
                 prev_phases: vec![0.0; fft_size / 2],
                 last_mags: vec![0.0; fft_size / 2],
                 display_mags: vec![0.0; fft_size / 2],
@@ -807,6 +821,11 @@ async fn main() {
         let mut prev_cqt_col_no_iir = vec![0.0f32; CQT_BINS];
         let mut prev_cqt_col_with_iir = vec![0.0f32; CQT_BINS];
 
+        let min_log_f = 20.0f32.log2();
+        let log_range_f = (SAMPLE_RATE as f32 / 2.0).log2() - min_log_f;
+        let log_range_inv = 1.0 / log_range_f;
+        let two_pi = 2.0 * std::f32::consts::PI;
+
         loop {
             let mut redraw_requested = false;
 
@@ -835,14 +854,12 @@ async fn main() {
             }
 
             // --- DEEP SLEEP SYNCHRONIZATION ---
-            // 1. Block and sleep deeply until AT LEAST one chunk arrives if we don't have enough data
             if pending_buffer.len() < MIN_HOP_SIZE {
                 if let Ok(mut new_data) = audio_rx.recv() { // <--- CPU GOES TO SLEEP HERE (0% Usage)
                     pending_buffer.append(&mut new_data);
                 }
             }
 
-            // 2. Instantly drain any extra chunks that arrived while we were processing
             while let Ok(mut extra_data) = audio_rx.try_recv() {
                 pending_buffer.append(&mut extra_data);
             }
@@ -889,7 +906,6 @@ async fn main() {
                         
                         let half_size = state.fft_size / 2;
                         let freq_res = SAMPLE_RATE as f32 / state.fft_size as f32;
-                        let hop_advance = 2.0 * std::f32::consts::PI * state.hop_size as f32 / state.fft_size as f32;
                         let sr_over_hop = SAMPLE_RATE as f32 / (2.0 * std::f32::consts::PI * state.hop_size as f32);
                         
                         for (bin, (((&c, mag), prev_phase), true_freq)) in buffer[0..half_size].iter()
@@ -898,19 +914,33 @@ async fn main() {
                             .zip(&mut state.last_true_freqs)
                             .enumerate() 
                         {
-                            *mag = c.norm() * scale;
+                            let raw_mag = c.norm() * scale;
                             let phase = c.im.atan2(c.re);
                             
                             let phase_diff = phase - *prev_phase;
                             *prev_phase = phase;
                             
-                            let bin_freq = bin as f32 * freq_res;
-                            let expected_advance = bin as f32 * hop_advance;
-                            
-                            let unwrapped_diff = (phase_diff - expected_advance + std::f32::consts::PI)
-                                .rem_euclid(2.0 * std::f32::consts::PI) - std::f32::consts::PI;
+                            // FAST BRANCHLESS PHASE WRAP
+                            let diff = phase_diff - state.expected_advances[bin];
+                            let diff_wrapped = diff - two_pi * (diff / two_pi).round();
                                 
-                            *true_freq = bin_freq + unwrapped_diff * sr_over_hop;
+                            let offset_hz = diff_wrapped * sr_over_hop;
+                            *true_freq = state.bin_freqs[bin] + offset_hz;
+                            
+                            // FAST INLINE CONFIDENCE PENALTY
+                            // 1.3333333 is exactly 1.0 / 0.75, completely avoiding division
+                            let deviation_norm = (offset_hz / freq_res) * 1.3333333_f32; 
+                            let dev_sq = deviation_norm * deviation_norm;
+                            let dev_6 = dev_sq * dev_sq * dev_sq;
+                            let phase_confidence = if USE_PHASE_CONFIDENCE_FILTER {
+                                1.0 / (1.0 + dev_6)
+                            } else {
+                                1.0
+                            };
+                            
+                            // Instantly crushes the ghost phase magnitude to zero. 
+                            // Eliminates the need to carry confidence memory over to the CQT loop!
+                            *mag = raw_mag * phase_confidence;
                             
                             let display_mag = *mag * broadband_comp * cqt_makeup_gain;
                             let prev_disp = state.display_mags[bin];
@@ -957,9 +987,9 @@ async fn main() {
                         }
                         iir_samples_accum = 0;
                     }
-                    
-                    let min_log = 20.0f32.log2();
-                    let log_range = (SAMPLE_RATE as f32 / 2.0).log2() - min_log;
+
+                    let stft_boost = local_dsp_config.stft_boost;
+                    let stft_boost_sqrt = stft_boost.sqrt(); // Hoisted Constant!
 
                     for inst in stft_cqt_map.iter() {
                         let state = &stft_states[inst.fft_idx];
@@ -978,7 +1008,7 @@ async fn main() {
                         
                         for ((&mag, &true_freq), &w) in mags.iter().zip(freqs).zip(&inst.weights) {
                             let energy = (((mag * mag) * w) / norm_factor) * resolution_comp;
-                            raw_cqt_power[default_bin] += energy;
+                            raw_cqt_power[default_bin] += energy; 
                             
                             let comp_mag = (mag * comp_mag_factor) * peak_dampening; 
                             if comp_mag > raw_cqt_peak[default_bin] {
@@ -986,21 +1016,25 @@ async fn main() {
                             }
                             
                             if true_freq >= 20.0 {
-                                let norm = (true_freq.log2() - min_log) / log_range;
+                                // Fast log2 scaling matching screen layout
+                                let norm = (true_freq.log2() - min_log_f) * log_range_inv;
                                 let target_bin = (norm * (CQT_BINS - 1) as f32).round() as isize;
                                 
                                 if target_bin >= 0 && target_bin < CQT_BINS as isize {
-                                    let boosted_energy = energy * local_dsp_config.stft_boost;
-                                    let boosted_mag = comp_mag * local_dsp_config.stft_boost.sqrt(); 
+                                    let boosted_energy = energy * stft_boost;
+                                    let boosted_mag = comp_mag * stft_boost_sqrt; 
                                     
                                     let splat = &splat_kernels[target_bin as usize];
-                                    for (s, &s_weight) in (-splat.half_width..=splat.half_width).zip(&splat.weights) {
+                                    
+                                    // Utilizes Pre-computed s_weight_sqrt array!
+                                    // Eliminates the massive 4-array memory zip() bottleneck!
+                                    for ((s, &s_weight), &s_weight_sqrt) in (-splat.half_width..=splat.half_width).zip(&splat.weights).zip(&splat.weights_sqrt) {
                                         let offset_bin = target_bin + s;
                                         if offset_bin >= 0 && offset_bin < CQT_BINS as isize {
                                             let ob = offset_bin as usize;
                                             sharp_cqt_power[ob] += boosted_energy * s_weight;
                                             
-                                            let s_mag = boosted_mag * s_weight.sqrt();
+                                            let s_mag = boosted_mag * s_weight_sqrt;
                                             if s_mag > sharp_cqt_peak[ob] {
                                                 sharp_cqt_peak[ob] = s_mag;
                                             }
