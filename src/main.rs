@@ -4,6 +4,7 @@ use rustfft::{FftPlanner, num_complex::Complex};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
+use std::net::UdpSocket;
 
 // PulseAudio bindings for audio capture
 use libpulse_binding::sample::{Spec, Format};
@@ -17,8 +18,6 @@ const MIN_HOP_SIZE: usize = 256;
 const CQT_HOP_SIZE: usize = 512; 
 
 // --- SPECTRAL OVERSAMPLING (Zero-Padding) ---
-// Activating this pads lower-resolution STFT windows with zeros up to the OVERSAMPLE_TARGET.
-// This multiplies the frequency bins (resolving "black space" gaps) WITHOUT sacrificing temporal sharpness.
 const SPECTRAL_OVERSAMPLING: bool = false;
 const OVERSAMPLE_TARGET: usize = 16384; 
 
@@ -26,9 +25,9 @@ const OVERSAMPLE_TARGET: usize = 16384;
 const RESOLUTIONS: [usize; 4] = [1024, 2048, 4096, 8192];
 const HOP_SIZES: [usize; 4] = [256, 512, 1024, 2048];
 
-const CQT_BINS: usize = 1200; // The HD resolution of our Constant-Q Transform output
-const IIR_CROSSOVER_LOWER_HZ: f32 = 100.0; // Start crossfading from IIR to STFT here
-const IIR_CROSSOVER_UPPER_HZ: f32 = 350.0; // IIR fully faded out by here
+const CQT_BINS: usize = 1200; 
+const IIR_CROSSOVER_LOWER_HZ: f32 = 100.0; 
+const IIR_CROSSOVER_UPPER_HZ: f32 = 350.0; 
 
 // View length is 2520, but the Ring Buffer is 2800 to give the write-head an invisible margin!
 const MAX_VIEW_LEN: usize = 2520; 
@@ -41,20 +40,28 @@ const DRAW_UI: bool = false;
 #[cfg(not(feature = "bg"))]
 const DRAW_UI: bool = true;
 
+// --- EXPLICIT MEMORY LAYOUTS FOR RAW IPC TRANSMISSION ---
+#[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq)]
-enum ColorMapType { Magma, Inferno, Viridis, Plasma, Turbo, Cubehelix }
+enum ColorMapType { 
+    Magma, Inferno, Viridis, Plasma, Turbo, Cubehelix, 
+    Cividis, Warm, Cool, Sinebow, 
+    Greys, InvertedGreys, InvertedMagma 
+}
 
+#[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum ScrollDirection { RTL, LTR, DTU, UTD }
 
+#[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum AudioSource { SinkMonitor, Microphone }
 
+#[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum ScaleType { Linear, Mel, Logarithmic, Chromatic }
 
-// --- DYNAMIC DSP CONFIGURATION ---
-// Derived Copy to completely avoid heap allocations/clones in the UI frame loop
+#[repr(C)]
 #[derive(Clone, Copy, PartialEq)]
 struct DspConfig {
     pink_noise_tilt: f32,
@@ -92,15 +99,61 @@ impl Default for DspConfig {
     }
 }
 
-/// Shared state between the Brain (processing) and Face (UI) threads.
+/// Shared state synchronized via Mutex locally, and UDP globally.
+#[repr(C)]
 #[derive(Clone, Copy, PartialEq)]
 struct AppSettings {
     scale_type: ScaleType,
     colormap: ColorMapType,
-    redraw_flag: bool,
     audio_source: AudioSource,
+    dir: ScrollDirection,
     iir_enabled: bool,
+    redraw_flag: bool,
+    fft_idx: u32,
+    view_len: u32,
     dsp_config: DspConfig,
+}
+
+impl Default for AppSettings {
+    fn default() -> Self {
+        Self {
+            scale_type: ScaleType::Logarithmic,
+            colormap: ColorMapType::Magma,
+            audio_source: AudioSource::SinkMonitor,
+            dir: ScrollDirection::RTL,
+            iir_enabled: false,
+            redraw_flag: false,
+            fft_idx: RESOLUTIONS.len() as u32,
+            view_len: MAX_VIEW_LEN as u32,
+            dsp_config: DspConfig::default(),
+        }
+    }
+}
+
+// Memory-safe raw byte conversion for the UDP socket
+fn to_bytes(settings: &AppSettings) -> &[u8] {
+    unsafe {
+        std::slice::from_raw_parts(
+            (settings as *const AppSettings) as *const u8,
+            std::mem::size_of::<AppSettings>(),
+        )
+    }
+}
+
+fn from_bytes(bytes: &[u8]) -> Option<AppSettings> {
+    if bytes.len() == std::mem::size_of::<AppSettings>() {
+        let mut settings: AppSettings = unsafe { std::mem::zeroed() };
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                (&mut settings as *mut AppSettings) as *mut u8,
+                bytes.len(),
+            );
+        }
+        Some(settings)
+    } else {
+        None
+    }
 }
 
 // 1D Colormap Generator for the GPU Shader
@@ -110,18 +163,28 @@ struct ColorLut {
 
 impl ColorLut {
     fn new(map_type: ColorMapType) -> Self {
-        let gradient = match map_type {
-            ColorMapType::Magma => colorous::MAGMA,
-            ColorMapType::Inferno => colorous::INFERNO,
-            ColorMapType::Viridis => colorous::VIRIDIS,
-            ColorMapType::Plasma => colorous::PLASMA,
-            ColorMapType::Turbo => colorous::TURBO,
-            ColorMapType::Cubehelix => colorous::CUBEHELIX,
-        };
-
         let mut bytes = Vec::with_capacity(256);
         for i in 0..=255 {
-            let val = i as f64 / 255.0;
+            let mut val = i as f64 / 255.0;
+            
+            let gradient = match map_type {
+                ColorMapType::Magma => colorous::MAGMA,
+                ColorMapType::Inferno => colorous::INFERNO,
+                ColorMapType::Viridis => colorous::VIRIDIS,
+                ColorMapType::Plasma => colorous::PLASMA,
+                ColorMapType::Turbo => colorous::TURBO,
+                ColorMapType::Cubehelix => colorous::CUBEHELIX,
+                ColorMapType::Cividis => colorous::CIVIDIS,
+                ColorMapType::Warm => colorous::WARM,
+                ColorMapType::Cool => colorous::COOL,
+                ColorMapType::Sinebow => colorous::SINEBOW,
+                // Greys naturally goes from White (0.0) to Black (1.0).
+                ColorMapType::Greys => colorous::GREYS,
+                // Inverted versions flip the intensity input so 0.0 accesses the 'loud' end of the map
+                ColorMapType::InvertedGreys => { val = 1.0 - val; colorous::GREYS },
+                ColorMapType::InvertedMagma => { val = 1.0 - val; colorous::MAGMA },
+            };
+
             let c = gradient.eval_continuous(val);
             bytes.push([c.r, c.g, c.b]);
         }
@@ -463,14 +526,42 @@ async fn main() {
     layers.push(SpectrogramLayer::new(CQT_BINS)); 
     layers.push(SpectrogramLayer::new(CQT_BINS)); 
 
-    let shared_settings = Arc::new(Mutex::new(AppSettings {
-        scale_type: ScaleType::Logarithmic,
-        colormap: ColorMapType::Magma,
-        redraw_flag: false,
-        audio_source: AudioSource::SinkMonitor,
-        iir_enabled: false,
-        dsp_config: DspConfig::default(),
-    }));
+    let shared_settings = Arc::new(Mutex::new(AppSettings::default()));
+
+    // ==========================================
+    // --- UDP IPC LISTENER (Cross-Instance Sync)
+    // ==========================================
+    let shared_settings_recv = shared_settings.clone();
+    let mut bind_port = 44101;
+    let mut receiver = None;
+    
+    // Finds the first available port allowing up to 10 instances to run
+    for p in 44101..=44110 {
+        if let Ok(socket) = UdpSocket::bind(format!("127.0.0.1:{}", p)) {
+            socket.set_nonblocking(false).ok();
+            bind_port = p;
+            receiver = Some(socket);
+            break;
+        }
+    }
+
+    if let Some(socket) = receiver {
+        thread::spawn(move || {
+            let mut buf = [0u8; 1024];
+            loop {
+                if let Ok((len, _)) = socket.recv_from(&mut buf) {
+                    if let Some(new_settings) = from_bytes(&buf[..len]) {
+                        if let Ok(mut s) = shared_settings_recv.lock() {
+                            *s = new_settings;
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    // UDP Sender allows the UI thread to push its changes out
+    let udp_sender = UdpSocket::bind("127.0.0.1:0").ok();
 
     let shared_layers = Arc::new(Mutex::new(layers));
     let rb = HeapRb::<f32>::new(65536);
@@ -671,9 +762,10 @@ async fn main() {
         loop {
             let mut redraw_requested = false;
 
-            if let Ok(s) = settings_ref.lock() {
+            if let Ok(mut s) = settings_ref.lock() {
                 if s.redraw_flag {
                     redraw_requested = true;
+                    s.redraw_flag = false; // Brain thread correctly resets the flag
                 }
                 if s.dsp_config != local_dsp_config {
                     local_dsp_config = s.dsp_config;
@@ -947,10 +1039,6 @@ async fn main() {
     // ===============================================
     // --- THREAD C: FACE (UI & GPU Rendering) ---
     // ===============================================
-    let mut current_fft_idx = RESOLUTIONS.len(); 
-    let mut last_fft_idx = RESOLUTIONS.len(); 
-    let mut current_view_len = MAX_VIEW_LEN; 
-    
     let mut render_targets = Vec::new();
     for i in 0..=RESOLUTIONS.len() + 1 {
         let height = if i < RESOLUTIONS.len() {
@@ -964,16 +1052,14 @@ async fn main() {
     }
     let mut last_rendered_updates = vec![0u64; RESOLUTIONS.len() + 2];
 
-    let mut local_scale = ScaleType::Logarithmic;
-    let mut local_cmap = ColorMapType::Magma;
-    let mut local_dir = ScrollDirection::RTL;
-    let mut local_source = AudioSource::SinkMonitor;
-    let mut local_iir = false;
+    let mut local_settings = AppSettings::default();
+    let mut last_broadcast_settings = local_settings;
+
+    let mut last_fft_idx = RESOLUTIONS.len(); 
     let mut smooth_head_pos: f64 = 0.0;
     
-    let mut current_lut_type = local_cmap;
-    let lut = ColorLut::new(current_lut_type);
-    let mut colormap_texture = create_colormap_texture(&lut);
+    let mut current_lut_type = local_settings.colormap;
+    let mut colormap_texture = create_colormap_texture(&ColorLut::new(current_lut_type));
 
     let shader_material = load_material(
         ShaderSource::Glsl { vertex: VERTEX_SHADER, fragment: FRAGMENT_SHADER },
@@ -998,9 +1084,22 @@ async fn main() {
     let mut drag_start_freq: Option<f32> = None;
 
     loop {
-        let mut visual_changed = false;
-        let mut source_changed = false;
         let mut ui_wants_input = false;
+
+        // --- 1. RECEIVE INCOMING UDP SYNCS ---
+        if let Ok(s) = shared_settings.lock() {
+            if *s != last_broadcast_settings {
+                // Another instance sent an update via UDP
+                local_settings = *s;
+                last_broadcast_settings = *s;
+
+                // Rebuild visuals if necessary
+                if local_settings.colormap != current_lut_type {
+                    current_lut_type = local_settings.colormap;
+                    colormap_texture = create_colormap_texture(&ColorLut::new(current_lut_type));
+                }
+            }
+        }
 
         let (mx, my) = mouse_position();
         let m_down = is_mouse_button_down(MouseButton::Left);
@@ -1019,7 +1118,6 @@ async fn main() {
         let menu_w = 320.0;
         let menu_h = 640.0;
 
-        // Determine if mouse is over the menu to prevent background interaction
         if show_advanced_ui {
             if mx >= menu_x && mx <= menu_x + menu_w && my >= menu_y && my <= menu_y + menu_h {
                 ui_wants_input = true;
@@ -1029,44 +1127,32 @@ async fn main() {
             }
         }
 
-        // Only process keyboard visual hotkeys if not actively interacting with UI
+        // --- 2. PROCESS LOCAL INPUTS ---
         if !ui_wants_input {
-            if is_key_pressed(KeyCode::S) { local_scale = cycle_scale(local_scale); visual_changed = true; } 
-            if is_key_pressed(KeyCode::C) { local_cmap = cycle_colormap(local_cmap); visual_changed = true; }
-            if is_key_pressed(KeyCode::F) { local_dir = cycle_direction(local_dir); }
-            if is_key_pressed(KeyCode::R) { current_fft_idx = (current_fft_idx + 1) % (RESOLUTIONS.len() + 1); } 
-            if is_key_pressed(KeyCode::I) { local_iir = !local_iir; visual_changed = true; }
-            if is_key_pressed(KeyCode::X) { 
-                local_source = match local_source {
+            if is_key_pressed(KeyCode::S) { local_settings.scale_type = cycle_scale(local_settings.scale_type); } 
+            if is_key_pressed(KeyCode::C) { 
+                local_settings.colormap = cycle_colormap(local_settings.colormap); 
+                current_lut_type = local_settings.colormap;
+                colormap_texture = create_colormap_texture(&ColorLut::new(current_lut_type));
+            }
+            if is_key_pressed(KeyCode::F) { local_settings.dir = cycle_direction(local_settings.dir); }
+            if is_key_pressed(KeyCode::R) { local_settings.fft_idx = ((local_settings.fft_idx + 1) % (RESOLUTIONS.len() as u32 + 1)) as u32; } 
+            if is_key_pressed(KeyCode::I) { local_settings.iir_enabled = !local_settings.iir_enabled; }
+            if is_key_pressed(KeyCode::A) { 
+                local_settings.audio_source = match local_settings.audio_source {
                     AudioSource::SinkMonitor => AudioSource::Microphone,
                     AudioSource::Microphone => AudioSource::SinkMonitor,
                 };
-                source_changed = true; 
             }
-
             if is_key_pressed(KeyCode::W) {
-                current_view_len = if current_view_len == MAX_VIEW_LEN { MAX_VIEW_LEN / 2 } else { MAX_VIEW_LEN };
+                local_settings.view_len = if local_settings.view_len == MAX_VIEW_LEN as u32 { (MAX_VIEW_LEN / 2) as u32 } else { MAX_VIEW_LEN as u32 };
             }
         }
 
-        if visual_changed || source_changed {
-            if visual_changed && local_cmap != current_lut_type {
-                current_lut_type = local_cmap;
-                let lut = ColorLut::new(current_lut_type);
-                colormap_texture = create_colormap_texture(&lut);
-            }
-            if let Ok(mut s) = shared_settings.lock() {
-                s.scale_type = local_scale;
-                s.colormap = local_cmap;
-                s.audio_source = local_source;
-                s.iir_enabled = local_iir;
-            }
-        }
-
-        let actual_fft_idx = if current_fft_idx == RESOLUTIONS.len() {
-            if local_iir { RESOLUTIONS.len() + 1 } else { RESOLUTIONS.len() }
+        let actual_fft_idx = if local_settings.fft_idx as usize == RESOLUTIONS.len() {
+            if local_settings.iir_enabled { RESOLUTIONS.len() + 1 } else { RESOLUTIONS.len() }
         } else {
-            current_fft_idx
+            local_settings.fft_idx as usize
         };
 
         let current_height = if actual_fft_idx >= RESOLUTIONS.len() {
@@ -1189,18 +1275,18 @@ async fn main() {
         let head_snapped = (smooth_head_pos.rem_euclid(MAX_HISTORY as f64)).floor() as f32;
         let head_offset = head_snapped;
 
-        let (screen_time_dim, _screen_freq_dim) = match local_dir {
+        let (screen_time_dim, _screen_freq_dim) = match local_settings.dir {
             ScrollDirection::RTL | ScrollDirection::LTR => (sw, sh),
             ScrollDirection::DTU | ScrollDirection::UTD => (sh, sw),
         };
 
-        let scale_factor = TARGET_DISPLAY_WIDTH / (current_view_len as f32);
+        let scale_factor = TARGET_DISPLAY_WIDTH / (local_settings.view_len as f32);
         let needed_source_w = screen_time_dim / scale_factor;
 
-        let (final_source_w, _) = if needed_source_w <= current_view_len as f32 {
+        let (final_source_w, _) = if needed_source_w <= local_settings.view_len as f32 {
             (needed_source_w, screen_time_dim)
         } else {
-            (current_view_len as f32, screen_time_dim)
+            (local_settings.view_len as f32, screen_time_dim)
         };
 
         let final_source_w_snapped = final_source_w;
@@ -1208,7 +1294,7 @@ async fn main() {
         let tex_w = MAX_HISTORY as f32;
         let tex_h = current_height as f32;
 
-        let is_horizontal = match local_dir {
+        let is_horizontal = match local_settings.dir {
             ScrollDirection::RTL | ScrollDirection::LTR => true,
             _ => false
         };
@@ -1234,7 +1320,7 @@ async fn main() {
 
         let texture_to_draw = &render_targets[actual_fft_idx].texture;
 
-        let scale_uniform_val = match local_scale {
+        let scale_uniform_val = match local_settings.scale_type {
             ScaleType::Linear => 0.0f32,
             ScaleType::Mel => 1.0f32,
             ScaleType::Logarithmic => 2.0f32,
@@ -1249,7 +1335,7 @@ async fn main() {
         gl_use_material(&shader_material);
 
         if is_horizontal {
-            let is_ltr = local_dir == ScrollDirection::LTR;
+            let is_ltr = local_settings.dir == ScrollDirection::LTR;
             let flip_x = is_ltr;
 
             if is_ltr {
@@ -1276,7 +1362,7 @@ async fn main() {
                 }
             }
         } else {
-            let is_fire = local_dir == ScrollDirection::DTU;
+            let is_fire = local_settings.dir == ScrollDirection::DTU;
             if is_fire {
                 if let Some(s1) = src1 {
                     let h = dst1_len;
@@ -1318,13 +1404,13 @@ async fn main() {
 
         gl_use_default_material();
 
-        draw_note_ruler(local_scale, local_dir);
-        if DRAW_UI { draw_ui_overlay(local_scale, local_cmap, local_dir, current_fft_idx, current_view_len, local_source, local_iir, show_advanced_ui); }
+        draw_note_ruler(local_settings.scale_type, local_settings.dir);
+        if DRAW_UI { draw_ui_overlay(&local_settings, show_advanced_ui); }
 
         if DRAW_UI && !ui_wants_input {
             // --- Interactive Mouse Crosshair (Frequency/Note Peeking) ---
             let norm_time = if total_draw_len > 0.0 {
-                match local_dir {
+                match local_settings.dir {
                     ScrollDirection::RTL => (start_pos_screen + total_draw_len - mx) / total_draw_len,
                     ScrollDirection::LTR => (mx - start_pos_screen) / total_draw_len,
                     ScrollDirection::DTU => (start_pos_screen + total_draw_len - my) / total_draw_len,
@@ -1334,14 +1420,14 @@ async fn main() {
                 -1.0
             };
 
-            let norm_freq = match local_dir {
+            let norm_freq = match local_settings.dir {
                 ScrollDirection::RTL | ScrollDirection::LTR => 1.0 - (my / sh),
                 ScrollDirection::DTU | ScrollDirection::UTD => mx / sw, 
             };
 
             if norm_time >= 0.0 && norm_time <= 1.0 && norm_freq >= 0.0 && norm_freq <= 1.0 {
                 let max_freq = SAMPLE_RATE as f32 / 2.0;
-                let current_hz = match local_scale {
+                let current_hz = match local_settings.scale_type {
                     ScaleType::Linear => norm_freq * max_freq,
                     ScaleType::Mel => {
                         let mel_max = 2595.0 * (1.0 + max_freq / 700.0).log10();
@@ -1405,22 +1491,22 @@ async fn main() {
 
                 // Handle Drag-to-Select Rendering
                 if let Some(f1) = drag_start_freq {
-                    let norm_start_pos = freq_to_screen_pos(f1, local_scale);
+                    let norm_start_pos = freq_to_screen_pos(f1, local_settings.scale_type);
                     
-                    if local_dir == ScrollDirection::RTL || local_dir == ScrollDirection::LTR {
+                    if local_settings.dir == ScrollDirection::RTL || local_settings.dir == ScrollDirection::LTR {
                         let start_y = sh * (1.0 - norm_start_pos);
                         let min_y = start_y.min(my);
                         let max_y = start_y.max(my);
-                        draw_rectangle(0.0, min_y, sw, max_y - min_y, Color::new(0.3, 0.8, 1.0, 0.2));
-                        draw_line(0.0, start_y, sw, start_y, 1.0, Color::new(0.3, 0.8, 1.0, 0.8));
-                        draw_line(0.0, my, sw, my, 1.0, Color::new(0.3, 0.8, 1.0, 0.8));
+                        draw_rectangle(0.0, min_y, sw, max_y - min_y, Color::new(1.0, 0.8, 0.3, 0.2));
+                        draw_line(0.0, start_y, sw, start_y, 1.0, Color::new(1.0, 0.8, 0.3, 0.8));
+                        draw_line(0.0, my, sw, my, 1.0, Color::new(1.0, 0.8, 0.3, 0.8));
                     } else {
                         let start_x = sw * norm_start_pos;
                         let min_x = start_x.min(mx);
                         let max_x = start_x.max(mx);
-                        draw_rectangle(min_x, 0.0, max_x - min_x, sh, Color::new(0.3, 0.8, 1.0, 0.2));
-                        draw_line(start_x, 0.0, start_x, sh, 1.0, Color::new(0.3, 0.8, 1.0, 0.8));
-                        draw_line(mx, 0.0, mx, sh, 1.0, Color::new(0.3, 0.8, 1.0, 0.8));
+                        draw_rectangle(min_x, 0.0, max_x - min_x, sh, Color::new(1.0, 0.8, 0.3, 0.2));
+                        draw_line(start_x, 0.0, start_x, sh, 1.0, Color::new(1.0, 0.8, 0.3, 0.8));
+                        draw_line(mx, 0.0, mx, sh, 1.0, Color::new(1.0, 0.8, 0.3, 0.8));
                     }
 
                     let f2 = current_hz;
@@ -1436,8 +1522,8 @@ async fn main() {
                     if d_tooltip_x + drag_text_size.width + 10.0 > sw { d_tooltip_x = mx - drag_text_size.width - 15.0; }
                     if d_tooltip_y - 20.0 < 0.0 { d_tooltip_y = my + 45.0; }
 
-                    draw_rectangle(d_tooltip_x, d_tooltip_y - 20.0, drag_text_size.width + 10.0, 25.0, Color::new(0.0, 0.1, 0.3, 0.9));
-                    draw_text(&drag_tooltip, d_tooltip_x + 5.0, d_tooltip_y - 2.0, 20.0, Color::new(0.5, 0.9, 1.0, 1.0));
+                    draw_rectangle(d_tooltip_x, d_tooltip_y - 10.0, drag_text_size.width + 10.0, 25.0, Color::new(0.3, 0.1, 0.0, 0.6));
+                    draw_text(&drag_tooltip, d_tooltip_x + 5.0, d_tooltip_y + 8.0, 20.0, Color::new(1.0, 0.9, 0.5, 1.0));
                 }
 
                 let tooltip_text = format!("-{:.2}s | {:.1} Hz | {} | {:.1} dB", time_ago, current_hz, note_name, db);
@@ -1453,43 +1539,58 @@ async fn main() {
             }
         }
 
-        // --- Native Macroquad Advanced UI Overlay (MOVED TO BOTTOM) ---
+        // --- Native Macroquad Advanced UI Overlay ---
         if DRAW_UI && show_advanced_ui {
             draw_rectangle(menu_x, menu_y, menu_w, menu_h, Color::new(0.0, 0.0, 0.0, 0.85));
             draw_rectangle_lines(menu_x, menu_y, menu_w, menu_h, 2.0, Color::new(0.3, 0.3, 0.3, 1.0));
             
             draw_text("DSP Engine Tweaks", menu_x + 15.0, menu_y + 30.0, 24.0, WHITE);
             
-            let mut local_config = shared_settings.lock().unwrap().dsp_config;
-            let original_config = local_config;
-
             let mut cy = menu_y + 60.0;
             let mut id = 0;
             
             draw_text("Signal Pipeline", menu_x + 15.0, cy, 18.0, ORANGE); cy += 25.0;
-            draw_slider("Pink Noise Tilt (dB/Oct)", &mut local_config.pink_noise_tilt, -6.0, 6.0, menu_x + 15.0, cy, 180.0, (mx, my), m_down, m_pressed, &mut active_slider, id); id += 1; cy += 35.0;
-            draw_checkbox("PSD Normalization", &mut local_config.psd_normalization, menu_x + 15.0, cy, (mx, my), m_pressed); cy += 30.0;
-            draw_slider("Density Dampening", &mut local_config.peak_density_dampening, 0.0, 2.0, menu_x + 15.0, cy, 180.0, (mx, my), m_down, m_pressed, &mut active_slider, id); id += 1; cy += 45.0;
+            draw_slider("Pink Noise Tilt (dB/Oct)", &mut local_settings.dsp_config.pink_noise_tilt, -6.0, 6.0, menu_x + 15.0, cy, 180.0, (mx, my), m_down, m_pressed, &mut active_slider, id); id += 1; cy += 35.0;
+            draw_checkbox("PSD Normalization", &mut local_settings.dsp_config.psd_normalization, menu_x + 15.0, cy, (mx, my), m_pressed); cy += 30.0;
+            draw_slider("Density Dampening", &mut local_settings.dsp_config.peak_density_dampening, 0.0, 2.0, menu_x + 15.0, cy, 180.0, (mx, my), m_down, m_pressed, &mut active_slider, id); id += 1; cy += 45.0;
 
             draw_text("Dynamics & Decay", menu_x + 15.0, cy, 18.0, ORANGE); cy += 25.0;
-            draw_slider("Peak Weight", &mut local_config.peak_weight, 0.0, 1.0, menu_x + 15.0, cy, 180.0, (mx, my), m_down, m_pressed, &mut active_slider, id); id += 1; cy += 35.0;
-            draw_slider("RMS Weight", &mut local_config.rms_weight, 0.0, 1.0, menu_x + 15.0, cy, 180.0, (mx, my), m_down, m_pressed, &mut active_slider, id); id += 1; cy += 35.0;
-            draw_slider("Phosphor Decay (Bass)", &mut local_config.decay_low, 0.0, 0.1, menu_x + 15.0, cy, 180.0, (mx, my), m_down, m_pressed, &mut active_slider, id); id += 1; cy += 35.0;
-            draw_slider("Phosphor Decay (Treble)", &mut local_config.decay_high, 0.0, 0.1, menu_x + 15.0, cy, 180.0, (mx, my), m_down, m_pressed, &mut active_slider, id); id += 1; cy += 45.0;
+            draw_slider("Peak Weight", &mut local_settings.dsp_config.peak_weight, 0.0, 1.0, menu_x + 15.0, cy, 180.0, (mx, my), m_down, m_pressed, &mut active_slider, id); id += 1; cy += 35.0;
+            draw_slider("RMS Weight", &mut local_settings.dsp_config.rms_weight, 0.0, 1.0, menu_x + 15.0, cy, 180.0, (mx, my), m_down, m_pressed, &mut active_slider, id); id += 1; cy += 35.0;
+            draw_slider("Phosphor Decay (Bass)", &mut local_settings.dsp_config.decay_low, 0.0, 0.1, menu_x + 15.0, cy, 180.0, (mx, my), m_down, m_pressed, &mut active_slider, id); id += 1; cy += 35.0;
+            draw_slider("Phosphor Decay (Treble)", &mut local_settings.dsp_config.decay_high, 0.0, 0.1, menu_x + 15.0, cy, 180.0, (mx, my), m_down, m_pressed, &mut active_slider, id); id += 1; cy += 45.0;
 
             draw_text("CQT Kernel Splatting", menu_x + 15.0, cy, 18.0, ORANGE); cy += 25.0;
-            draw_slider("Splat Spread (Bass)", &mut local_config.splat_low, 0.0, 10.0, menu_x + 15.0, cy, 180.0, (mx, my), m_down, m_pressed, &mut active_slider, id); id += 1; cy += 35.0;
-            draw_slider("Splat Spread (Treble)", &mut local_config.splat_high, 0.0, 5.0, menu_x + 15.0, cy, 180.0, (mx, my), m_down, m_pressed, &mut active_slider, id); id += 1; cy += 35.0;
-            draw_slider("Halo Raw Blend", &mut local_config.halo_raw, 0.0, 10.0, menu_x + 15.0, cy, 180.0, (mx, my), m_down, m_pressed, &mut active_slider, id); id += 1; cy += 35.0;
-            draw_slider("Halo Sharp Blend", &mut local_config.halo_sharp, 0.0, 10.0, menu_x + 15.0, cy, 180.0, (mx, my), m_down, m_pressed, &mut active_slider, id); id += 1; cy += 45.0;
+            draw_slider("Splat Spread (Bass)", &mut local_settings.dsp_config.splat_low, 0.0, 10.0, menu_x + 15.0, cy, 180.0, (mx, my), m_down, m_pressed, &mut active_slider, id); id += 1; cy += 35.0;
+            draw_slider("Splat Spread (Treble)", &mut local_settings.dsp_config.splat_high, 0.0, 5.0, menu_x + 15.0, cy, 180.0, (mx, my), m_down, m_pressed, &mut active_slider, id); id += 1; cy += 35.0;
+            draw_slider("Halo Raw Blend", &mut local_settings.dsp_config.halo_raw, 0.0, 10.0, menu_x + 15.0, cy, 180.0, (mx, my), m_down, m_pressed, &mut active_slider, id); id += 1; cy += 35.0;
+            draw_slider("Halo Sharp Blend", &mut local_settings.dsp_config.halo_sharp, 0.0, 10.0, menu_x + 15.0, cy, 180.0, (mx, my), m_down, m_pressed, &mut active_slider, id); id += 1; cy += 45.0;
 
             draw_text("Makeup Gains", menu_x + 15.0, cy, 18.0, ORANGE); cy += 25.0;
-            draw_slider("STFT Boost Gain", &mut local_config.stft_boost, 1.0, 20.0, menu_x + 15.0, cy, 180.0, (mx, my), m_down, m_pressed, &mut active_slider, id); id += 1; cy += 35.0;
-            draw_slider("IIR Boost Gain", &mut local_config.iir_boost, 1.0, 20.0, menu_x + 15.0, cy, 180.0, (mx, my), m_down, m_pressed, &mut active_slider, id); 
+            draw_slider("STFT Boost Gain", &mut local_settings.dsp_config.stft_boost, 1.0, 20.0, menu_x + 15.0, cy, 180.0, (mx, my), m_down, m_pressed, &mut active_slider, id); id += 1; cy += 35.0;
+            draw_slider("IIR Boost Gain", &mut local_settings.dsp_config.iir_boost, 1.0, 20.0, menu_x + 15.0, cy, 180.0, (mx, my), m_down, m_pressed, &mut active_slider, id); 
+        }
 
-            if local_config != original_config {
-                if let Ok(mut s) = shared_settings.lock() {
-                    s.dsp_config = local_config;
+        // --- 3. BROADCAST LOCAL CHANGES VIA UDP ---
+        // Exclude redraw_flag from equality check so we don't trigger infinite loops
+        let mut diff = local_settings;
+        diff.redraw_flag = false;
+        let mut last_diff = last_broadcast_settings;
+        last_diff.redraw_flag = false;
+
+        if diff != last_diff {
+            last_broadcast_settings = local_settings;
+            if let Ok(mut s) = shared_settings.lock() {
+                *s = local_settings;
+            }
+
+            // Sync with all background threads out in the wild!
+            if let Some(ref sock) = udp_sender {
+                let bytes = to_bytes(&local_settings);
+                for p in 44101..=44110 {
+                    if p != bind_port {
+                        let _ = sock.send_to(bytes, format!("127.0.0.1:{}", p));
+                    }
                 }
             }
         }
@@ -1578,8 +1679,6 @@ fn draw_checkbox(
     changed
 }
 
-// Highly optimized lock-free CPU memory prep. Converts f32 -> u8 intensity in a straight linear array.
-// Moved to compute natively sequential arrays, preventing random access jumping in heavy loops!
 #[inline(always)]
 fn compute_column_colors(
     col_buffer: &mut [u8], 
@@ -1589,7 +1688,7 @@ fn compute_column_colors(
 ) {
     for i in 0..freq_bins {
         let y = (freq_bins - 1) - i; 
-        let magnitude = data[i] * tilt_curve[i]; // Apply Pink Noise Slope
+        let magnitude = data[i] * tilt_curve[i]; 
         
         let intensity = ((magnitude * 2000.0).ln() / 8.0).clamp(0.0, 1.0);
         let val = (intensity * 255.0) as u8;
@@ -1656,7 +1755,14 @@ fn cycle_colormap(c: ColorMapType) -> ColorMapType {
         ColorMapType::Viridis => ColorMapType::Plasma,
         ColorMapType::Plasma => ColorMapType::Turbo,
         ColorMapType::Turbo => ColorMapType::Cubehelix,
-        ColorMapType::Cubehelix => ColorMapType::Magma,
+        ColorMapType::Cubehelix => ColorMapType::Cividis,
+        ColorMapType::Cividis => ColorMapType::Warm,
+        ColorMapType::Warm => ColorMapType::Cool,
+        ColorMapType::Cool => ColorMapType::Sinebow,
+        ColorMapType::Sinebow => ColorMapType::Greys,
+        ColorMapType::Greys => ColorMapType::InvertedGreys,
+        ColorMapType::InvertedGreys => ColorMapType::InvertedMagma,
+        ColorMapType::InvertedMagma => ColorMapType::Magma,
     }
 }
 
@@ -1743,33 +1849,33 @@ struct UiStat {
     color: Color,
 }
 
-fn draw_ui_overlay(scale: ScaleType, cmap: ColorMapType, dir: ScrollDirection, fft_idx: usize, history: usize, source: AudioSource, iir_enabled: bool, show_tweaks: bool) {
-    let scale_str = format!("{:?}", scale);
-    let map_str = format!("{:?}", cmap); 
-    let dir_str = match dir {
+fn draw_ui_overlay(settings: &AppSettings, show_tweaks: bool) {
+    let scale_str = format!("{:?}", settings.scale_type);
+    let map_str = format!("{:?}", settings.colormap); 
+    let dir_str = match settings.dir {
         ScrollDirection::RTL => "RTL", 
         ScrollDirection::LTR => "LTR",
         ScrollDirection::DTU => "Fire", 
         ScrollDirection::UTD => "Rain",
     };
     
-    let res_str = if fft_idx == RESOLUTIONS.len() {
+    let res_str = if settings.fft_idx as usize == RESOLUTIONS.len() {
         "CQT (HD)".to_string()
     } else {
-        let actual_fft = if SPECTRAL_OVERSAMPLING { OVERSAMPLE_TARGET.max(RESOLUTIONS[fft_idx]) } else { RESOLUTIONS[fft_idx] };
-        if SPECTRAL_OVERSAMPLING && actual_fft > RESOLUTIONS[fft_idx] {
-            format!("{} bins (x{} Pad)", actual_fft / 2, actual_fft / RESOLUTIONS[fft_idx])
+        let actual_fft = if SPECTRAL_OVERSAMPLING { OVERSAMPLE_TARGET.max(RESOLUTIONS[settings.fft_idx as usize]) } else { RESOLUTIONS[settings.fft_idx as usize] };
+        if SPECTRAL_OVERSAMPLING && actual_fft > RESOLUTIONS[settings.fft_idx as usize] {
+            format!("{} bins (x{} Pad)", actual_fft / 2, actual_fft / RESOLUTIONS[settings.fft_idx as usize])
         } else {
             format!("{} bins", actual_fft / 2)
         }
     };
     
-    let hist_str = format!("{}", history);
-    let src_str = match source {
+    let hist_str = format!("{}", settings.view_len);
+    let src_str = match settings.audio_source {
         AudioSource::SinkMonitor => "Sink",
         AudioSource::Microphone => "Mic",
     };
-    let iir_str = if iir_enabled { "On" } else { "Off" };
+    let iir_str = if settings.iir_enabled { "On" } else { "Off" };
     let tweaks_str = if show_tweaks { "Visible" } else { "Hidden" };
 
     let stats = vec![
@@ -1783,7 +1889,7 @@ fn draw_ui_overlay(scale: ScaleType, cmap: ColorMapType, dir: ScrollDirection, f
         UiStat { label: "Tweaks",       hotkey: Some('T'), value: tweaks_str.to_string(), color: WHITE },
     ];
 
-    let (bg_x, bg_y, bg_w, bg_h, is_vertical) = match dir {
+    let (bg_x, bg_y, bg_w, bg_h, is_vertical) = match settings.dir {
         ScrollDirection::RTL | ScrollDirection::LTR => (0.0, 0.0, screen_width(), 35.0, false),
         _ => (screen_width() - 220.0, 0.0, 220.0, 205.0, true),
     };
