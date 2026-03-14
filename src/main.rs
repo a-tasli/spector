@@ -1,10 +1,10 @@
 use macroquad::prelude::*;
-use ringbuf::HeapRb;
 use rustfft::{FftPlanner, num_complex::Complex};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 use std::net::UdpSocket;
+use std::sync::mpsc::sync_channel;
 
 // PulseAudio bindings for audio capture
 use libpulse_binding::sample::{Spec, Format};
@@ -59,7 +59,7 @@ enum AudioSource { SinkMonitor, Microphone }
 
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq)]
-enum ScaleType { Linear, Mel, Logarithmic, Chromatic }
+enum ScaleType { Linear, Mel, Logarithmic, Bark }
 
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq)]
@@ -202,6 +202,33 @@ fn create_colormap_texture(lut: &ColorLut) -> Texture2D {
     let tex = Texture2D::from_image(&img);
     tex.set_filter(FilterMode::Linear);
     tex
+}
+
+// DSP Intensity Pre-computation Look-Up Table
+struct IntensityLut {
+    table: Vec<u8>,
+}
+
+impl IntensityLut {
+    fn new() -> Self {
+        let mut table = vec![0; 65536];
+        for i in 0..65536 {
+            let mag = (i as f32 / 65535.0) * 2.0; 
+            let val_in = mag * 2000.0;
+            let intensity = if val_in > 1.0 { (val_in.ln() / 8.0).clamp(0.0, 1.0) } else { 0.0 };
+            table[i] = (intensity * 255.0) as u8;
+        }
+        Self { table }
+    }
+
+    #[inline(always)]
+    fn get(&self, mag: f32) -> u8 {
+        if mag <= 0.0 { return 0; }
+        if mag >= 2.0 { return 255; }
+        let norm = mag / 2.0;
+        let idx = (norm * 65535.0) as usize;
+        self.table[idx]
+    }
 }
 
 fn generate_hann_window(size: usize) -> Vec<f32> {
@@ -454,10 +481,11 @@ void main() {
     if (is_cqt_texture > 0.5) {
         float current_hz;
         if (scale_type > 2.5) {
-            float min_freq = 16.35159;
-            float log_min = log2(min_freq);
-            float log_max = log2(max_freq);
-            current_hz = exp2(log_min + norm_f * (log_max - log_min));
+            float arg = max_freq / 600.0;
+            float bark_max = 6.0 * log(arg + sqrt(arg * arg + 1.0));
+            float current_bark = norm_f * bark_max;
+            float z_over_6 = current_bark / 6.0;
+            current_hz = 600.0 * (exp(z_over_6) - exp(-z_over_6)) / 2.0;
         } else if (scale_type > 1.5) {
             float log_min = log2(min_log_freq);
             float log_max = log2(max_freq);
@@ -478,11 +506,11 @@ void main() {
         }
     } else {
         if (scale_type > 2.5) {
-            float min_freq = 16.35159;
-            float log_min = log2(min_freq);
-            float log_max = log2(max_freq);
-            float current_log = log_min + norm_f * (log_max - log_min);
-            float current_hz = exp2(current_log);
+            float arg = max_freq / 600.0;
+            float bark_max = 6.0 * log(arg + sqrt(arg * arg + 1.0));
+            float current_bark = norm_f * bark_max;
+            float z_over_6 = current_bark / 6.0;
+            float current_hz = 600.0 * (exp(z_over_6) - exp(-z_over_6)) / 2.0;
             norm_f = clamp(current_hz / max_freq, 0.0, 1.0);
         } else if (scale_type > 1.5) {
             float min_freq = 20.0;
@@ -513,6 +541,23 @@ fn window_conf() -> Conf {
         high_dpi: true,
         window_resizable: true,
         ..Default::default()
+    }
+}
+
+// Delta chunker helper
+struct DeltaUpdate {
+    start_x: f32,
+    width: usize,
+}
+
+fn push_delta(updates: &mut Vec<DeltaUpdate>, start_x: usize, width: usize, max_delta: usize) {
+    let mut remaining = width;
+    let mut curr_x = start_x;
+    while remaining > 0 {
+        let chunk = remaining.min(max_delta);
+        updates.push(DeltaUpdate { start_x: curr_x as f32, width: chunk });
+        curr_x += chunk;
+        remaining -= chunk;
     }
 }
 
@@ -564,8 +609,9 @@ async fn main() {
     let udp_sender = UdpSocket::bind("127.0.0.1:0").ok();
 
     let shared_layers = Arc::new(Mutex::new(layers));
-    let rb = HeapRb::<f32>::new(65536);
-    let (mut producer, mut consumer) = rb.split();
+    
+    // --- REPLACED HEAP_RB WITH BLOCKING CHANNEL ---
+    let (audio_tx, audio_rx) = sync_channel::<Vec<f32>>(100);
 
     // ==========================================
     // --- THREAD A: RECORDER (Audio Ingest) ---
@@ -626,7 +672,8 @@ async fn main() {
             if let Some(ref s) = stream {
                 if let Ok(_) = s.read(&mut buf) {
                     let floats: &[f32] = unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const f32, buf.len() / 4) };
-                    producer.push_slice(floats);
+                    // Push chunk to blocking channel! This wakes up the waiting Brain Thread.
+                    let _ = audio_tx.send(floats.to_vec());
                 } else {
                     thread::sleep(Duration::from_millis(100));
                     stream = open_stream(current_source);
@@ -648,6 +695,7 @@ async fn main() {
         let max_fft = *RESOLUTIONS.iter().max().unwrap();
         let mut rolling_audio = vec![0.0; max_fft];
         let mut pending_buffer = Vec::with_capacity(4096);
+        let lut = IntensityLut::new(); // Optimized Pre-computed lookups
 
         let mut local_dsp_config = DspConfig::default();
 
@@ -779,18 +827,24 @@ async fn main() {
                         for t in 0..MAX_HISTORY {
                             let start = t * layer.freq_bins;
                             let slice = &float_history[i][start..start + layer.freq_bins];
-                            paint_column_fast(&mut layer.pixels, t, slice, layer.freq_bins, &tilt_curves[i]);
+                            paint_column_fast(&mut layer.pixels, t, slice, layer.freq_bins, &tilt_curves[i], &lut);
                         }
                         layer.total_updates += (MAX_HISTORY * 2) as u64; 
                     }
                 }
             }
 
-            let num_new = consumer.len();
-            if num_new > 0 {
-                let mut temp = vec![0.0; num_new];
-                consumer.pop_slice(&mut temp);
-                pending_buffer.extend(temp);
+            // --- DEEP SLEEP SYNCHRONIZATION ---
+            // 1. Block and sleep deeply until AT LEAST one chunk arrives if we don't have enough data
+            if pending_buffer.len() < MIN_HOP_SIZE {
+                if let Ok(mut new_data) = audio_rx.recv() { // <--- CPU GOES TO SLEEP HERE (0% Usage)
+                    pending_buffer.append(&mut new_data);
+                }
+            }
+
+            // 2. Instantly drain any extra chunks that arrived while we were processing
+            while let Ok(mut extra_data) = audio_rx.try_recv() {
+                pending_buffer.append(&mut extra_data);
             }
 
             while pending_buffer.len() >= MIN_HOP_SIZE {
@@ -992,7 +1046,7 @@ async fn main() {
                             &local_cqt_col_with_iir
                         };
 
-                        compute_column_colors(&mut scratch_cols[i], data_source, freq_bins, &tilt_curves[i]);
+                        compute_column_colors(&mut scratch_cols[i], data_source, freq_bins, &tilt_curves[i], &lut);
                     }
 
                     if let Ok(mut layers) = layers_ref.lock() {
@@ -1028,10 +1082,6 @@ async fn main() {
                     
                     cqt_samples_since_last -= CQT_HOP_SIZE;
                 }
-            }
-            
-            if pending_buffer.len() < MIN_HOP_SIZE {
-                thread::sleep(Duration::from_millis(1));
             }
         }
     });
@@ -1078,6 +1128,24 @@ async fn main() {
     let max_possible_height = max_stft_height.max(CQT_BINS);
     let mut local_pixels_buffer = vec![0u8; MAX_HISTORY * max_possible_height * 4];
 
+    // --- PRE-ALLOCATED TEXTURES & IMAGES FOR PRECISE UPDATE DRIVER OPTIMIZATIONS ---
+    const MAX_DELTA_WIDTH: usize = 256;
+    let mut delta_img = Image { 
+        width: MAX_DELTA_WIDTH as u16, 
+        height: max_possible_height as u16, 
+        bytes: vec![0; MAX_DELTA_WIDTH * max_possible_height * 4] 
+    };
+    let delta_tex = Texture2D::from_image(&delta_img);
+    delta_tex.set_filter(FilterMode::Nearest);
+
+    let mut full_img = Image {
+        width: MAX_HISTORY as u16,
+        height: max_possible_height as u16,
+        bytes: vec![0; MAX_HISTORY * max_possible_height * 4]
+    };
+    let full_tex = Texture2D::from_image(&full_img);
+    full_tex.set_filter(FilterMode::Nearest);
+
     // Native Custom UI State
     let mut show_advanced_ui = false;
     let mut active_slider: Option<usize> = None;
@@ -1089,11 +1157,8 @@ async fn main() {
         // --- 1. RECEIVE INCOMING UDP SYNCS ---
         if let Ok(s) = shared_settings.lock() {
             if *s != last_broadcast_settings {
-                // Another instance sent an update via UDP
                 local_settings = *s;
                 last_broadcast_settings = *s;
-
-                // Rebuild visuals if necessary
                 if local_settings.colormap != current_lut_type {
                     current_lut_type = local_settings.colormap;
                     colormap_texture = create_colormap_texture(&ColorLut::new(current_lut_type));
@@ -1105,13 +1170,8 @@ async fn main() {
         let m_down = is_mouse_button_down(MouseButton::Left);
         let m_pressed = is_mouse_button_pressed(MouseButton::Left);
 
-        if !m_down {
-            drag_start_freq = None;
-        }
-
-        if is_key_pressed(KeyCode::T) { 
-            show_advanced_ui = !show_advanced_ui; 
-        }
+        if !m_down { drag_start_freq = None; }
+        if is_key_pressed(KeyCode::T) { show_advanced_ui = !show_advanced_ui; }
 
         let menu_x = 20.0;
         let menu_y = 60.0; 
@@ -1165,7 +1225,7 @@ async fn main() {
 
         let mut actual_total_updates = 0u64;
         let mut full_redraw_needed = false;
-        let mut delta_images: Vec<(f32, Image)> = Vec::new();
+        let mut delta_updates: Vec<DeltaUpdate> = Vec::new();
 
         {
             if let Ok(layers) = shared_layers.lock() {
@@ -1177,55 +1237,39 @@ async fn main() {
                 
                 let full_redraw_threshold = (MAX_HISTORY / 2) as u64;
 
-                if diff >= full_redraw_threshold {
-                    let expected_len = layer.pixels.len();
-                    if local_pixels_buffer.len() < expected_len {
-                        local_pixels_buffer.resize(expected_len, 0);
-                    }
-                    local_pixels_buffer[..expected_len].copy_from_slice(&layer.pixels);
+                // FIX: Force a full redraw if we just switched resolutions
+                let resolution_changed = actual_fft_idx != last_fft_idx;
+
+                if resolution_changed || diff >= full_redraw_threshold {
+                    let expected_len = MAX_HISTORY * current_height * 4;
+                    local_pixels_buffer[..expected_len].copy_from_slice(&layer.pixels[..expected_len]);
                     full_redraw_needed = true;
                 } else if diff > 0 {
                     let diff_usize = diff as usize;
                     let head = layer.head;
                     let height = layer.freq_bins;
 
-                    if head >= diff_usize {
-                        let start_x = head - diff_usize;
-                        let mut img = Image { width: diff as u16, height: height as u16, bytes: vec![0; diff_usize * height * 4] };
+                    // Inline closure to extract new columns from the shared layer to our local flat buffer
+                    let mut copy_delta = |start_x: usize, width: usize| {
                         for y in 0..height {
-                            let src_row = y * MAX_HISTORY * 4;
-                            let dst_row = y * diff_usize * 4;
-                            img.bytes[dst_row .. dst_row + diff_usize * 4]
-                                .copy_from_slice(&layer.pixels[src_row + start_x * 4 .. src_row + (start_x + diff_usize) * 4]);
+                            let row_start = y * MAX_HISTORY * 4;
+                            let src_idx = row_start + start_x * 4;
+                            let len = width * 4;
+                            local_pixels_buffer[src_idx .. src_idx + len].copy_from_slice(&layer.pixels[src_idx .. src_idx + len]);
                         }
-                        delta_images.push((start_x as f32, img));
+                        push_delta(&mut delta_updates, start_x, width, MAX_DELTA_WIDTH);
+                    };
+
+                    if head >= diff_usize {
+                        copy_delta(head - diff_usize, diff_usize);
                     } else {
                         let part1_len = diff_usize - head;
-                        let start_x = MAX_HISTORY - part1_len;
-                        
-                        let mut img1 = Image { width: part1_len as u16, height: height as u16, bytes: vec![0; part1_len * height * 4] };
-                        for y in 0..height {
-                            let src_row = y * MAX_HISTORY * 4;
-                            let dst_row = y * part1_len * 4;
-                            img1.bytes[dst_row .. dst_row + part1_len * 4]
-                                .copy_from_slice(&layer.pixels[src_row + start_x * 4 .. src_row + MAX_HISTORY * 4]);
-                        }
-                        delta_images.push((start_x as f32, img1));
-
-                        if head > 0 {
-                            let mut img2 = Image { width: head as u16, height: height as u16, bytes: vec![0; head * height * 4] };
-                            for y in 0..height {
-                                let src_row = y * MAX_HISTORY * 4;
-                                let dst_row = y * head * 4;
-                                img2.bytes[dst_row .. dst_row + head * 4]
-                                    .copy_from_slice(&layer.pixels[src_row .. src_row + head * 4]);
-                            }
-                            delta_images.push((0.0, img2));
-                        }
+                        copy_delta(MAX_HISTORY - part1_len, part1_len);
+                        if head > 0 { copy_delta(0, head); }
                     }
                 }
                 
-                if actual_fft_idx != last_fft_idx {
+                if resolution_changed {
                     let prev_mode_updates = layers[last_fft_idx].total_updates;
                     let diff_from_last = actual_total_updates as f64 - prev_mode_updates as f64;
                     smooth_head_pos += diff_from_last;
@@ -1234,28 +1278,43 @@ async fn main() {
             }
         }
 
+        // --- Zero-Allocation Precise GPU Update Logic ---
         if full_redraw_needed {
-            let img = Image {
-                width: MAX_HISTORY as u16, height: current_height as u16,
-                bytes: local_pixels_buffer[..(MAX_HISTORY * current_height * 4)].to_vec(),
-            };
-            let tex = Texture2D::from_image(&img);
+            let total_bytes = MAX_HISTORY * current_height * 4;
+            full_img.bytes[..total_bytes].copy_from_slice(&local_pixels_buffer[..total_bytes]);
+            full_tex.update(&full_img);
             
             let mut cam = Camera2D::from_display_rect(Rect::new(0.0, 0.0, MAX_HISTORY as f32, current_height as f32));
             cam.render_target = Some(render_targets[actual_fft_idx].clone());
             set_camera(&cam);
-            draw_texture(&tex, 0.0, 0.0, WHITE);
+            draw_texture_ex(&full_tex, 0.0, 0.0, WHITE, DrawTextureParams {
+                source: Some(Rect::new(0.0, 0.0, MAX_HISTORY as f32, current_height as f32)),
+                dest_size: Some(vec2(MAX_HISTORY as f32, current_height as f32)),
+                ..Default::default()
+            });
             set_default_camera();
             last_rendered_updates[actual_fft_idx] = actual_total_updates;
-        } else if !delta_images.is_empty() {
+
+        } else if !delta_updates.is_empty() {
             let mut cam = Camera2D::from_display_rect(Rect::new(0.0, 0.0, MAX_HISTORY as f32, current_height as f32));
             cam.render_target = Some(render_targets[actual_fft_idx].clone());
             set_camera(&cam);
             
-            for (x, img) in delta_images {
-                let tex = Texture2D::from_image(&img);
-                tex.set_filter(FilterMode::Nearest); 
-                draw_texture(&tex, x, 0.0, WHITE);
+            for update in &delta_updates {
+                for y in 0..current_height {
+                    let src_row = y * MAX_HISTORY * 4;
+                    let dst_row = y * MAX_DELTA_WIDTH * 4;
+                    let start_idx = src_row + (update.start_x as usize) * 4;
+                    let len = update.width * 4;
+                    // Move only the new data block into the pre-allocated reusable texture Image struct
+                    delta_img.bytes[dst_row .. dst_row + len].copy_from_slice(&local_pixels_buffer[start_idx .. start_idx + len]);
+                }
+                delta_tex.update(&delta_img);
+                draw_texture_ex(&delta_tex, update.start_x, 0.0, WHITE, DrawTextureParams {
+                    source: Some(Rect::new(0.0, 0.0, update.width as f32, current_height as f32)),
+                    dest_size: Some(vec2(update.width as f32, current_height as f32)),
+                    ..Default::default()
+                });
             }
             set_default_camera();
             last_rendered_updates[actual_fft_idx] = actual_total_updates;
@@ -1324,7 +1383,7 @@ async fn main() {
             ScaleType::Linear => 0.0f32,
             ScaleType::Mel => 1.0f32,
             ScaleType::Logarithmic => 2.0f32,
-            ScaleType::Chromatic => 3.0f32,
+            ScaleType::Bark => 3.0f32,
         };
         let is_cqt = if actual_fft_idx >= RESOLUTIONS.len() { 1.0f32 } else { 0.0f32 };
         
@@ -1440,11 +1499,10 @@ async fn main() {
                         let log_max = max_freq.log2();
                         2.0f32.powf(log_min + norm_freq * (log_max - log_min))
                     },
-                    ScaleType::Chromatic => {
-                        let min_freq = 16.35159f32;
-                        let log_min = min_freq.log2();
-                        let log_max = max_freq.log2();
-                        2.0f32.powf(log_min + norm_freq * (log_max - log_min))
+                    ScaleType::Bark => {
+                        let bark_max = 6.0 * (max_freq / 600.0).asinh();
+                        let current_bark = norm_freq * bark_max;
+                        600.0 * (current_bark / 6.0).sinh()
                     }
                 };
 
@@ -1685,13 +1743,12 @@ fn compute_column_colors(
     data: &[f32], 
     freq_bins: usize, 
     tilt_curve: &[f32],
+    lut: &IntensityLut,
 ) {
     for i in 0..freq_bins {
         let y = (freq_bins - 1) - i; 
         let magnitude = data[i] * tilt_curve[i]; 
-        
-        let intensity = ((magnitude * 2000.0).ln() / 8.0).clamp(0.0, 1.0);
-        let val = (intensity * 255.0) as u8;
+        let val = lut.get(magnitude);
 
         let idx = y * 4;
         col_buffer[idx] = val;     // R
@@ -1708,13 +1765,13 @@ fn paint_column_fast(
     data: &[f32], 
     freq_bins: usize, 
     tilt_curve: &[f32],
+    lut: &IntensityLut,
 ) {
     let x_offset = col_idx * 4;
     for i in 0..freq_bins {
         let y = (freq_bins - 1) - i; 
         let magnitude = data[i] * tilt_curve[i];
-        let intensity = ((magnitude * 2000.0).ln() / 8.0).clamp(0.0, 1.0);
-        let val = (intensity * 255.0) as u8;
+        let val = lut.get(magnitude);
 
         let idx = (y * MAX_HISTORY * 4) + x_offset;
         pixels[idx] = val;     // R
@@ -1742,9 +1799,9 @@ fn hz_to_pitch(hz: f32) -> (String, f32) {
 fn cycle_scale(s: ScaleType) -> ScaleType {
     match s {
         ScaleType::Linear => ScaleType::Mel,
-        ScaleType::Mel => ScaleType::Logarithmic,
-        ScaleType::Logarithmic => ScaleType::Chromatic,
-        ScaleType::Chromatic => ScaleType::Linear,
+        ScaleType::Mel => ScaleType::Bark,
+        ScaleType::Bark => ScaleType::Logarithmic,
+        ScaleType::Logarithmic => ScaleType::Linear,
     }
 }
 
@@ -1792,13 +1849,10 @@ fn freq_to_screen_pos(freq: f32, scale: ScaleType) -> f32 {
             let log_max = max_freq.log2();
             (log_f - log_min) / (log_max - log_min)
         },
-        ScaleType::Chromatic => {
-            let min_freq = 16.35159f32;
-            if freq <= min_freq { return -1.0; } // Ensure off-screen handling
-            let log_f = freq.log2();
-            let log_min = min_freq.log2();
-            let log_max = max_freq.log2();
-            (log_f - log_min) / (log_max - log_min)
+        ScaleType::Bark => {
+            let bark_val = 6.0 * (freq / 600.0).asinh();
+            let bark_max = 6.0 * (max_freq / 600.0).asinh();
+            bark_val / bark_max
         }
     }
 }
@@ -1813,35 +1867,66 @@ fn draw_note_ruler(scale: ScaleType, dir: ScrollDirection) {
         let norm_pos = freq_to_screen_pos(freq, scale);
         if norm_pos < 0.0 || norm_pos > 1.0 { continue; } 
         
-        let (x, y, is_c) = match dir {
-            ScrollDirection::RTL => (w, h * (1.0 - norm_pos), midi % 12 == 0),
-            ScrollDirection::LTR => (0.0, h * (1.0 - norm_pos), midi % 12 == 0),
-            ScrollDirection::UTD => (w * norm_pos, 0.0, midi % 12 == 0),
-            ScrollDirection::DTU => (w * norm_pos, h, midi % 12 == 0),
+        let note_mod = midi % 12;
+        let is_c = note_mod == 0;
+
+        let (x, y) = match dir {
+            ScrollDirection::RTL => (w, h * (1.0 - norm_pos)),
+            ScrollDirection::LTR => (0.0, h * (1.0 - norm_pos)),
+            ScrollDirection::UTD => (w * norm_pos, 0.0),
+            ScrollDirection::DTU => (w * norm_pos, h),
+        };
+
+        // Determine what text label to draw based on the note and current scale
+        let label = if is_c {
+            let octave = (midi / 12) - 1;
+            Some(format!("C{}", octave))
+        } else if scale == ScaleType::Logarithmic {
+            match note_mod {
+                1 | 3 | 6 | 8 | 10 => Some("#".to_string()),
+                2 => Some("D".to_string()),
+                4 => Some("E".to_string()),
+                5 => Some("F".to_string()),
+                7 => Some("G".to_string()),
+                9 => Some("A".to_string()),
+                11 => Some("B".to_string()),
+                _ => None,
+            }
+        } else {
+            None
         };
 
         if dir == ScrollDirection::RTL || dir == ScrollDirection::LTR {
             let tick_len = if is_c { 15.0 } else { 5.0 };
             let start_x = if dir == ScrollDirection::RTL { x - tick_len } else { x };
             draw_line(start_x, y, start_x + tick_len, y, 1.0, WHITE);
-            if is_c {
-                let octave = (midi / 12) - 1;
-                let text_x = if dir == ScrollDirection::RTL { x - 35.0 } else { x + 20.0 };
-                draw_text(&format!("C{}", octave), text_x, y + 4.0, 15.0, WHITE);
+            
+            if let Some(text) = label {
+                // Adjust text 10px closer to the edge for non-C notes
+                let text_x = if dir == ScrollDirection::RTL { 
+                    x - if is_c { 32.0 } else { 16.0 } 
+                } else { 
+                    x + if is_c { 20.0 } else { 10.0 } 
+                };
+                draw_text(&text, text_x, y + 4.0, 15.0, WHITE);
             }
         } else {
             let tick_len = if is_c { 15.0 } else { 5.0 };
             let start_y = if dir == ScrollDirection::DTU { y - tick_len } else { y };
             draw_line(x, start_y, x, start_y + tick_len, 1.0, WHITE);
-            if is_c {
-                let octave = (midi / 12) - 1;
-                let text_y = if dir == ScrollDirection::DTU { y - 20.0 } else { y + 30.0 };
-                draw_text(&format!("C{}", octave), x - 5.0, text_y, 15.0, WHITE);
+            
+            if let Some(text) = label {
+                // Adjust text 10px closer to the edge for non-C notes
+                let text_y = if dir == ScrollDirection::DTU { 
+                    y - if is_c { 20.0 } else { 10.0 } 
+                } else { 
+                    y + if is_c { 30.0 } else { 20.0 } 
+                };
+                draw_text(&text, x - 5.0, text_y, 15.0, WHITE);
             }
         }
     }
 }
-
 struct UiStat {
     label: &'static str,
     hotkey: Option<char>,
@@ -1884,7 +1969,7 @@ fn draw_ui_overlay(settings: &AppSettings, show_tweaks: bool) {
         UiStat { label: "Flow",   hotkey: Some('F'), value: dir_str.to_string(),   color: SKYBLUE },
         UiStat { label: "Resolution",    hotkey: Some('R'), value: res_str,               color: VIOLET },
         UiStat { label: "Window",    hotkey: Some('W'), value: hist_str,              color: PINK },
-        UiStat { label: "Audio Src",     hotkey: Some('X'), value: src_str.to_string(),   color: GREEN },
+        UiStat { label: "Audio Src",     hotkey: Some('A'), value: src_str.to_string(),   color: GREEN },
         UiStat { label: "IIR Bass",     hotkey: Some('I'), value: iir_str.to_string(),   color: LIME },
         UiStat { label: "Tweaks",       hotkey: Some('T'), value: tweaks_str.to_string(), color: WHITE },
     ];
