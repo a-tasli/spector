@@ -1015,23 +1015,26 @@ async fn main() {
                         let start_sample = audio_head + max_fft - state.window_size;
                         let audio_slice = &rolling_audio[start_sample .. start_sample + state.window_size];
                         
-                        let buffer = &mut state.scratch_buffer;
-                        buffer.fill(Complex { re: 0.0, im: 0.0 });
-                        for (i, (&a, &w)) in audio_slice.iter().zip(state.window.iter()).enumerate() {
-                            buffer[i] = Complex { re: a * w, im: 0.0 };
+                        // 1. Avoid redundant zero-initialization of the active window slice
+                        let (active_buf, pad_buf) = state.scratch_buffer.split_at_mut(state.window_size);
+                        for (dst, (&a, &w)) in active_buf.iter_mut().zip(audio_slice.iter().zip(state.window.iter())) {
+                            *dst = Complex { re: a * w, im: 0.0 };
                         }
+                        pad_buf.fill(Complex { re: 0.0, im: 0.0 });
                         
-                        state.fft.process(buffer);
+                        state.fft.process(&mut state.scratch_buffer);
                         
                         let scale = 2.0 / state.window_size as f32; 
                         let broadband_comp = (state.window_size as f32 / 2048.0).sqrt(); 
                         let cqt_makeup_gain = local_dsp_config.stft_boost.sqrt() * local_dsp_config.halo_sharp; 
+                        let display_factor = broadband_comp * cqt_makeup_gain; // 2. Hoist combined multiplier
                         
                         let half_size = state.fft_size / 2;
                         let freq_res = SAMPLE_RATE as f32 / state.fft_size as f32;
                         let sr_over_hop = SAMPLE_RATE as f32 / (2.0 * std::f32::consts::PI * state.hop_size as f32);
+                        let inv_two_pi = 1.0 / two_pi; // 3. Precompute reciprocal for fast phase wrap
                         
-                        for (bin, (((&c, mag), prev_phase), true_freq)) in buffer[0..half_size].iter()
+                        for (bin, (((&c, mag), prev_phase), true_freq)) in state.scratch_buffer[0..half_size].iter()
                             .zip(&mut state.last_mags)
                             .zip(&mut state.prev_phases)
                             .zip(&mut state.last_true_freqs)
@@ -1045,7 +1048,7 @@ async fn main() {
                             
                             // FAST BRANCHLESS PHASE WRAP
                             let diff = phase_diff - state.expected_advances[bin];
-                            let diff_wrapped = diff - two_pi * (diff / two_pi).round();
+                            let diff_wrapped = diff - two_pi * (diff * inv_two_pi).round();
                                 
                             let offset_hz = diff_wrapped * sr_over_hop;
                             *true_freq = state.bin_freqs[bin] + offset_hz;
@@ -1065,7 +1068,7 @@ async fn main() {
                             // Eliminates the need to carry confidence memory over to the CQT loop!
                             *mag = raw_mag * phase_confidence;
                             
-                            let display_mag = *mag * broadband_comp * cqt_makeup_gain;
+                            let display_mag = *mag * display_factor;
                             let prev_disp = state.display_mags[bin];
                             let decay = state.decays[bin];
                             
