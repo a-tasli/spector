@@ -5,6 +5,7 @@ use std::thread;
 use std::time::Duration;
 use std::net::UdpSocket;
 use std::sync::mpsc::sync_channel;
+use std::collections::VecDeque;
 
 // PulseAudio bindings for audio capture
 use libpulse_binding::sample::{Spec, Format};
@@ -13,18 +14,43 @@ use libpulse_binding::def::BufferAttr;
 use libpulse_simple_binding::Simple;
 
 // --- CONFIG ---
-const SAMPLE_RATE: u32 = 44100;
-const MIN_HOP_SIZE: usize = 256; 
-const CQT_HOP_SIZE: usize = 512; 
-const USE_PHASE_CONFIDENCE_FILTER: bool = true;
+const BASE_SAMPLE_RATE: u32 = 44100;
+const SR_MULT: u32 = 2; // Tweak this! (1, 2, 4, etc.)
+const SAMPLE_RATE: u32 = BASE_SAMPLE_RATE * SR_MULT;
+
+// Lock the screen's top frequency to human hearing, even if processing ultrasonics
+const MAX_DISPLAY_FREQ: f32 = 22050.0; 
+
+// Scale hops so scroll speed stays perfectly constant
+const MIN_HOP_SIZE: usize = 128;
+const CQT_HOP_SIZE: usize = (512 * SR_MULT) as usize; 
+const USE_PHASE_CONFIDENCE_FILTER: bool = false;
 
 // --- SPECTRAL OVERSAMPLING (Zero-Padding) ---
 const SPECTRAL_OVERSAMPLING: bool = false;
 const OVERSAMPLE_TARGET: usize = 16384; 
 
 // Variable resolutions and their corresponding Variable Hop Sizes
-const RESOLUTIONS: [usize; 4] = [1024, 2048, 4096, 8192];
-const HOP_SIZES: [usize; 4] = [256, 512, 512, 512];
+const RESOLUTIONS: [usize; 4] = [2*1024, 2*4096, 3*4096, 2*8192];
+const HOP_SIZES: [usize; 4] = [256, 256, 128, 128];
+
+// --- STFT RESOLUTION MAPPING ---
+// Toggle this to true to force the engine to use the boundaries defined below
+const MANUAL_STFT_MAPPING: bool = true;
+
+struct ManualMapping {
+    max_freq: f32,
+    res_idx: usize,
+}
+
+// Define your manual frequency boundaries here (applied if MANUAL_STFT_MAPPING is true).
+// Any frequency <= `max_freq` will be assigned the resolution at `res_idx` in the RESOLUTIONS array.
+const MANUAL_MAPPINGS: [ManualMapping; 4] = [
+    ManualMapping { max_freq: 10.0, res_idx: 3 },            // Bass -> Largest window (e.g., 8192)
+    ManualMapping { max_freq: 120.0, res_idx: 2 },           // Low-Mids
+    ManualMapping { max_freq: 640.0, res_idx: 1 },           // High-Mids
+    ManualMapping { max_freq: MAX_DISPLAY_FREQ, res_idx: 0 }, // Treble -> Smallest window (e.g., 1024)
+];
 
 const CQT_BINS: usize = 1200; 
 const IIR_CROSSOVER_LOWER_HZ: f32 = 100.0; 
@@ -86,8 +112,8 @@ impl Default for DspConfig {
             pink_noise_tilt: 0.0,
             peak_weight: 0.5,
             rms_weight: 0.5,
-            psd_normalization: false,
-            peak_density_dampening: 0.0,
+            psd_normalization: true,
+            peak_density_dampening: 1.0,
             decay_low: 0.0,
             decay_high: 0.0,
             splat_low: 3.0,
@@ -268,6 +294,10 @@ impl Biquad {
         let y = self.b0 * x + self.z1;
         self.z1 = self.b1 * x - self.a1 * y + self.z2;
         self.z2 = self.b2 * x - self.a2 * y;
+        
+        // Flush denormals to prevent CPU microcode spikes during silence
+        if self.z1.abs() < 1e-10 { self.z1 = 0.0; }
+        if self.z2.abs() < 1e-10 { self.z2 = 0.0; }
         y
     }
 }
@@ -330,7 +360,7 @@ fn build_cqt_map(sample_rate: u32, stft_specs: &[(usize, usize)], peak_damp_amou
     let mut iir_filters = Vec::new();
     
     let min_freq = 20.0_f32;
-    let max_freq = sample_rate as f32 / 2.0;
+    let max_freq = MAX_DISPLAY_FREQ;
     let log_min = min_freq.log2();
     let log_max = max_freq.log2();
     
@@ -359,15 +389,32 @@ fn build_cqt_map(sample_rate: u32, stft_specs: &[(usize, usize)], peak_damp_amou
         }
 
         let ideal_n_float = 4.0 * sample_rate as f32 / bw_hz;
-        let ideal_n = ideal_n_float as usize;
         
         let mut best_idx = 0;
-        let mut min_diff = usize::MAX;
-        for (i, &(win_res, _)) in stft_specs.iter().enumerate() {
-            let diff = (win_res as isize - ideal_n as isize).unsigned_abs();
-            if diff < min_diff {
-                min_diff = diff;
-                best_idx = i;
+
+        if MANUAL_STFT_MAPPING {
+            for mapping in MANUAL_MAPPINGS.iter() {
+                if freq <= mapping.max_freq {
+                    best_idx = mapping.res_idx;
+                    break;
+                }
+            }
+            // Fallback safety boundary check in case configuration changes
+            if best_idx >= stft_specs.len() {
+                best_idx = stft_specs.len() - 1;
+            }
+        } else {
+            // Logarithmic (Ratio-based) dynamic selection for accurate perceptual match
+            let mut min_log_diff = f32::MAX;
+            for (i, &(win_res, _)) in stft_specs.iter().enumerate() {
+                let actual_n = win_res as f32;
+                // Ratio difference: |log2(actual) - log2(ideal)|
+                let log_diff = (actual_n.log2() - ideal_n_float.log2()).abs();
+                
+                if log_diff < min_log_diff {
+                    min_log_diff = log_diff;
+                    best_idx = i;
+                }
             }
         }
         
@@ -480,61 +527,62 @@ varying lowp vec4 color;
 uniform sampler2D Texture;
 uniform sampler2D colormap;
 uniform float scale_type;
-uniform float sample_rate;
+uniform float nyquist_freq;
+uniform float max_display_freq;
 uniform float is_cqt_texture;
 
 void main() {
     float norm_f = 1.0 - uv.y; 
     float min_log_freq = 20.0;
-    float max_freq = sample_rate / 2.0;
 
     if (is_cqt_texture > 0.5) {
         float current_hz;
         if (scale_type > 2.5) {
-            float arg = max_freq / 600.0;
+            float arg = max_display_freq / 600.0;
             float bark_max = 6.0 * log(arg + sqrt(arg * arg + 1.0));
             float current_bark = norm_f * bark_max;
             float z_over_6 = current_bark / 6.0;
             current_hz = 600.0 * (exp(z_over_6) - exp(-z_over_6)) / 2.0;
         } else if (scale_type > 1.5) {
             float log_min = log2(min_log_freq);
-            float log_max = log2(max_freq);
+            float log_max = log2(max_display_freq);
             current_hz = exp2(log_min + norm_f * (log_max - log_min));
         } else if (scale_type > 0.5) {
-            float mel_max = 2595.0 * (log(1.0 + max_freq / 700.0) / 2.30258509299);
+            float mel_max = 2595.0 * (log(1.0 + max_display_freq / 700.0) / 2.30258509299);
             float current_mel = norm_f * mel_max;
             current_hz = 700.0 * (exp((current_mel / 2595.0) * 2.30258509299) - 1.0);
         } else {
-            current_hz = norm_f * max_freq;
+            current_hz = norm_f * max_display_freq;
         }
         
         if (current_hz < min_log_freq) {
             norm_f = 0.0; 
         } else {
-            norm_f = (log2(current_hz) - log2(min_log_freq)) / (log2(max_freq) - log2(min_log_freq));
+            norm_f = (log2(current_hz) - log2(min_log_freq)) / (log2(max_display_freq) - log2(min_log_freq));
             norm_f = clamp(norm_f, 0.0, 1.0);
         }
     } else {
+        float current_hz;
         if (scale_type > 2.5) {
-            float arg = max_freq / 600.0;
+            float arg = max_display_freq / 600.0;
             float bark_max = 6.0 * log(arg + sqrt(arg * arg + 1.0));
             float current_bark = norm_f * bark_max;
             float z_over_6 = current_bark / 6.0;
-            float current_hz = 600.0 * (exp(z_over_6) - exp(-z_over_6)) / 2.0;
-            norm_f = clamp(current_hz / max_freq, 0.0, 1.0);
+            current_hz = 600.0 * (exp(z_over_6) - exp(-z_over_6)) / 2.0;
         } else if (scale_type > 1.5) {
-            float min_freq = 20.0;
-            float log_min = log2(min_freq);
-            float log_max = log2(max_freq);
+            float log_min = log2(min_log_freq);
+            float log_max = log2(max_display_freq);
             float current_log = log_min + norm_f * (log_max - log_min);
-            float current_hz = exp2(current_log);
-            norm_f = clamp(current_hz / max_freq, 0.0, 1.0);
+            current_hz = exp2(current_log);
         } else if (scale_type > 0.5) {
-            float mel_max = 2595.0 * (log(1.0 + max_freq / 700.0) / 2.30258509299);
+            float mel_max = 2595.0 * (log(1.0 + max_display_freq / 700.0) / 2.30258509299);
             float current_mel = norm_f * mel_max;
-            float current_hz = 700.0 * (exp((current_mel / 2595.0) * 2.30258509299) - 1.0);
-            norm_f = clamp(current_hz / max_freq, 0.0, 1.0);
+            current_hz = 700.0 * (exp((current_mel / 2595.0) * 2.30258509299) - 1.0);
+        } else {
+            current_hz = norm_f * max_display_freq;
         }
+        // Properly map to the Texture's true Nyquist limit
+        norm_f = clamp(current_hz / nyquist_freq, 0.0, 1.0);
     }
 
     vec2 sample_uv = vec2(uv.x, norm_f);
@@ -620,8 +668,9 @@ async fn main() {
 
     let shared_layers = Arc::new(Mutex::new(layers));
     
-    // --- REPLACED HEAP_RB WITH BLOCKING CHANNEL ---
+    // ZERO ALLOCATION AUDIO QUEUE: Uses Object Pools
     let (audio_tx, audio_rx) = sync_channel::<Vec<f32>>(100);
+    let (recycle_tx, recycle_rx) = sync_channel::<Vec<f32>>(100);
 
     // ==========================================
     // --- THREAD A: RECORDER (Audio Ingest) ---
@@ -631,29 +680,37 @@ async fn main() {
     thread::spawn(move || {
         let mut current_source = AudioSource::SinkMonitor;
 
-        let open_stream = |source: AudioSource| -> Option<Simple> {
-            let device_name = match source {
+        // Fetch the active audio device via pactl
+        let get_device_name = |source: AudioSource| -> Option<String> {
+            match source {
                 AudioSource::SinkMonitor => {
                     if let Ok(output) = std::process::Command::new("pactl").arg("get-default-sink").output() {
                         let sink_name = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                        format!("{}.monitor", sink_name) 
+                        Some(format!("{}.monitor", sink_name))
                     } else {
-                        return None;
+                        None
                     }
                 },
                 AudioSource::Microphone => {
                     if let Ok(output) = std::process::Command::new("pactl").arg("get-default-source").output() {
-                        String::from_utf8_lossy(&output.stdout).trim().to_string()
+                        Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
                     } else {
-                        return None;
+                        None
                     }
                 }
-            };
+            }
+        };
 
+        // Cache the result so we don't query it 10x per second during silence!
+        let mut cached_device_name = get_device_name(current_source);
+
+        let open_stream = |device_name: Option<&String>| -> Option<Simple> {
+            let dev_name = device_name?;
             let spec = Spec { format: Format::F32le, channels: 1, rate: SAMPLE_RATE };
             let frag_size = (SAMPLE_RATE as u32 * 4 * 15) / 1000; 
             let attr = BufferAttr {
-                maxlength: u32::MAX, tlength: u32::MAX, prebuf: u32::MAX, minreq: u32::MAX,
+                maxlength: frag_size * 4, // <-- FIX: Caps the server backlog to ~60ms to eliminate wake-up latency
+                tlength: u32::MAX, prebuf: u32::MAX, minreq: u32::MAX,
                 fragsize: frag_size,
             };
 
@@ -661,36 +718,46 @@ async fn main() {
                 None,
                 if cfg!(feature = "bg") { "spector-bg" } else { "spector" },
                 Direction::Record,
-                Some(&device_name),
+                Some(dev_name),
                 "Recorder", &spec,
                 None,
                 Some(&attr)
             ).ok()
         };
 
-        let mut stream = open_stream(current_source);
+        let mut stream = open_stream(cached_device_name.as_ref());
         let mut buf = [0u8; 4096];
 
         loop {
             if let Ok(settings) = shared_settings_recorder.try_lock() {
                 if settings.audio_source != current_source {
                     current_source = settings.audio_source;
-                    stream = open_stream(current_source);
+                    // Source changed: Re-query pactl and cache the new device name!
+                    cached_device_name = get_device_name(current_source);
+                    stream = open_stream(cached_device_name.as_ref());
                 }
             }
 
             if let Some(ref s) = stream {
                 if let Ok(_) = s.read(&mut buf) {
                     let floats: &[f32] = unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const f32, buf.len() / 4) };
+                    
+                    // RECYCLED MEMORY: Pulls an empty Vec from the pool or allocates one if pool is empty
+                    let mut chunk = recycle_rx.try_recv().unwrap_or_else(|_| Vec::with_capacity(1024));
+                    chunk.clear();
+                    chunk.extend_from_slice(floats);
+                    
                     // Push chunk to blocking channel! This wakes up the waiting Brain Thread.
-                    let _ = audio_tx.send(floats.to_vec());
+                    let _ = audio_tx.send(chunk);
                 } else {
-                    thread::sleep(Duration::from_millis(100));
-                    stream = open_stream(current_source);
+                    // SOLUTION 2: Stream read failed (likely suspended). 
+                    // Keep the connection ALIVE and just wait a tiny bit instead of thrashing IPC!
+                    thread::sleep(Duration::from_millis(50));
                 }
             } else {
+                // Only recreate the stream if it's completely missing (None)
                 thread::sleep(Duration::from_millis(100));
-                stream = open_stream(current_source);
+                stream = open_stream(cached_device_name.as_ref());
             }
         }
     });
@@ -703,8 +770,12 @@ async fn main() {
 
     thread::spawn(move || {
         let max_fft = *RESOLUTIONS.iter().max().unwrap();
-        let mut rolling_audio = vec![0.0; max_fft];
-        let mut pending_buffer = Vec::with_capacity(4096);
+        
+        // DOUBLE BUFFER: 2x the max window size to eliminate all memory-shifting array rotations
+        let mut rolling_audio = vec![0.0; max_fft * 2];
+        let mut audio_head = 0; 
+
+        let mut pending_buffer: VecDeque<f32> = VecDeque::with_capacity(8192);
         let lut = IntensityLut::new(); // Optimized Pre-computed lookups
 
         let mut local_dsp_config = DspConfig::default();
@@ -763,11 +834,11 @@ async fn main() {
                 let half_size = state.fft_size / 2;
                 let freq_res = SAMPLE_RATE as f32 / state.fft_size as f32;
                 let min_log = 20.0f32.log2();
-                let log_range = (SAMPLE_RATE as f32 / 2.0).log2() - min_log;
+                let log_range_stft = (SAMPLE_RATE as f32 / 2.0).log2() - min_log; // Use true Nyquist limit for STFT scaling
                 
                 for bin in 0..half_size {
                     let freq = bin as f32 * freq_res;
-                    let norm = if freq >= 20.0 { ((freq.log2() - min_log) / log_range).clamp(0.0, 1.0) } else { 0.0 };
+                    let norm = if freq >= 20.0 { ((freq.log2() - min_log) / log_range_stft).clamp(0.0, 1.0) } else { 0.0 };
                     state.decays[bin] = config.decay_low + (config.decay_high - config.decay_low) * norm;
                     
                     if freq > 20.0 {
@@ -781,10 +852,10 @@ async fn main() {
             }
             
             let min_log = 20.0f32.log2();
-            let log_range = (SAMPLE_RATE as f32 / 2.0).log2() - min_log;
+            let log_range_cqt = MAX_DISPLAY_FREQ.log2() - min_log; // Map CQT tilt to the visible Display limit
             for bin in 0..CQT_BINS {
                 let norm = bin as f32 / (CQT_BINS - 1) as f32;
-                let octaves_above_min = norm * log_range;
+                let octaves_above_min = norm * log_range_cqt;
                 let tilt_db = octaves_above_min * config.pink_noise_tilt;
                 let tilt_val = 10.0f32.powf(tilt_db / 20.0);
                 tilt_curves[RESOLUTIONS.len()][bin] = tilt_val;
@@ -802,7 +873,7 @@ async fn main() {
         let mut iir_blend_weights = vec![0.0f32; CQT_BINS];
         for bin in 0..CQT_BINS {
             let norm = bin as f32 / (CQT_BINS - 1) as f32;
-            let freq = 2.0_f32.powf(20.0f32.log2() + norm * ((SAMPLE_RATE as f32 / 2.0).log2() - 20.0f32.log2()));
+            let freq = 2.0_f32.powf(20.0f32.log2() + norm * (MAX_DISPLAY_FREQ.log2() - 20.0f32.log2()));
             if freq <= IIR_CROSSOVER_LOWER_HZ {
                 iir_blend_weights[bin] = 1.0;
             } else if freq >= IIR_CROSSOVER_UPPER_HZ {
@@ -822,9 +893,12 @@ async fn main() {
         let mut prev_cqt_col_with_iir = vec![0.0f32; CQT_BINS];
 
         let min_log_f = 20.0f32.log2();
-        let log_range_f = (SAMPLE_RATE as f32 / 2.0).log2() - min_log_f;
+        let log_range_f = MAX_DISPLAY_FREQ.log2() - min_log_f;
         let log_range_inv = 1.0 / log_range_f;
         let two_pi = 2.0 * std::f32::consts::PI;
+
+        let mut last_recv_time = std::time::Instant::now();
+        let cqt_hop_duration = std::time::Duration::from_secs_f32(CQT_HOP_SIZE as f32 / SAMPLE_RATE as f32);
 
         loop {
             let mut redraw_requested = false;
@@ -853,24 +927,69 @@ async fn main() {
                 }
             }
 
-            // --- DEEP SLEEP SYNCHRONIZATION ---
+            // --- DEEP SLEEP SYNCHRONIZATION (LOW POWER) ---
             if pending_buffer.len() < MIN_HOP_SIZE {
-                if let Ok(mut new_data) = audio_rx.recv() { // <--- CPU GOES TO SLEEP HERE (0% Usage)
-                    pending_buffer.append(&mut new_data);
+                // Wake up every 50ms (20Hz) instead of running a hot loop
+                match audio_rx.recv_timeout(std::time::Duration::from_millis(50)) {
+                    Ok(new_data) => {
+                        pending_buffer.extend(new_data.iter());
+                        let _ = recycle_tx.try_send(new_data);
+                        last_recv_time = std::time::Instant::now();
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        // PulseAudio is suspended. BYPASS the FFT engine completely!
+                        let elapsed = last_recv_time.elapsed();
+                        
+                        if elapsed >= cqt_hop_duration {
+                            let missed_hops = (elapsed.as_secs_f32() / cqt_hop_duration.as_secs_f32()) as u64;
+                            
+                            if let Ok(mut layers) = layers_ref.lock() {
+                                for layer in layers.iter_mut() {
+                                    for _ in 0..missed_hops {
+                                        let head_idx = layer.head;
+                                        // Write pure black pixels directly to the render buffer
+                                        for y in 0..layer.freq_bins {
+                                            let dst_idx = (y * MAX_HISTORY * 4) + (head_idx * 4);
+                                            layer.pixels[dst_idx] = 0;     // R
+                                            layer.pixels[dst_idx+1] = 0;   // G
+                                            layer.pixels[dst_idx+2] = 0;   // B
+                                            layer.pixels[dst_idx+3] = 255; // A
+                                        }
+                                        layer.head = (layer.head + 1) % MAX_HISTORY;
+                                        layer.total_updates += 1; // Tells the GPU to scroll!
+                                    }
+                                }
+                            }
+                            
+                            // Instantly crush lingering audio buffers to zero so the 
+                            // visualizer doesn't "smear" the last loud note forever
+                            for state in stft_states.iter_mut() {
+                                state.display_mags.fill(0.0);
+                                state.last_mags.fill(0.0);
+                            }
+                            local_cqt_col_no_iir.fill(0.0);
+                            local_cqt_col_with_iir.fill(0.0);
+                            
+                            // Advance the clock to prevent drift
+                            last_recv_time += cqt_hop_duration * (missed_hops as u32);
+                        }
+                    }
+                    Err(_) => {}
                 }
             }
 
-            while let Ok(mut extra_data) = audio_rx.try_recv() {
-                pending_buffer.append(&mut extra_data);
+            // Catch any massive data bursts when PulseAudio wakes up
+            while let Ok(extra_data) = audio_rx.try_recv() {
+                pending_buffer.extend(extra_data.iter());
+                let _ = recycle_tx.try_send(extra_data);
+                last_recv_time = std::time::Instant::now(); 
             }
 
             while pending_buffer.len() >= MIN_HOP_SIZE {
                 
-                rolling_audio.rotate_left(MIN_HOP_SIZE);
-                let start_idx = rolling_audio.len() - MIN_HOP_SIZE;
-
-                let mut i = 0;
-                for sample in pending_buffer.drain(0..MIN_HOP_SIZE) {
+                // Ring Buffer Logic completely avoids moving array indices (O(1) memory writes!)
+                for _ in 0..MIN_HOP_SIZE {
+                    let sample = pending_buffer.pop_front().unwrap();
                     for (bin_idx, biquad, _) in iir_filters.iter_mut() {
                         let filtered = biquad.process(sample);
                         iir_power_accum[*bin_idx] += filtered * filtered;
@@ -880,8 +999,11 @@ async fn main() {
                             iir_peak_accum[*bin_idx] = abs_f;
                         }
                     }
-                    rolling_audio[start_idx + i] = sample;
-                    i += 1;
+                    
+                    // The Double Buffer Trick allows perfectly contiguous reads later
+                    rolling_audio[audio_head] = sample;
+                    rolling_audio[audio_head + max_fft] = sample;
+                    audio_head = (audio_head + 1) % max_fft;
                 }
                 iir_samples_accum += MIN_HOP_SIZE;
                 
@@ -889,8 +1011,9 @@ async fn main() {
                     state.samples_since_last += MIN_HOP_SIZE;
                     
                     if state.samples_since_last >= state.hop_size {
-                        let start_sample = rolling_audio.len() - state.window_size;
-                        let audio_slice = &rolling_audio[start_sample..];
+                        // Extract perfectly continuous slice thanks to double buffering!
+                        let start_sample = audio_head + max_fft - state.window_size;
+                        let audio_slice = &rolling_audio[start_sample .. start_sample + state.window_size];
                         
                         let buffer = &mut state.scratch_buffer;
                         buffer.fill(Complex { re: 0.0, im: 0.0 });
@@ -946,11 +1069,13 @@ async fn main() {
                             let prev_disp = state.display_mags[bin];
                             let decay = state.decays[bin];
                             
-                            state.display_mags[bin] = if display_mag > prev_disp {
+                            let mut next_disp = if display_mag > prev_disp {
                                 display_mag
                             } else {
                                 (display_mag * (1.0 - decay)) + (prev_disp * decay)
                             };
+                            if next_disp < 1e-10 { next_disp = 0.0; }
+                            state.display_mags[bin] = next_disp;
                         }
                         
                         state.samples_since_last -= state.hop_size;
@@ -1060,12 +1185,14 @@ async fn main() {
                         let decay = cqt_decays[bin];
                         
                         let prev_no = prev_cqt_col_no_iir[bin];
-                        let final_no = if current_no_iir > prev_no { current_no_iir } else { (current_no_iir * (1.0 - decay)) + (prev_no * decay) };
+                        let mut final_no = if current_no_iir > prev_no { current_no_iir } else { (current_no_iir * (1.0 - decay)) + (prev_no * decay) };
+                        if final_no < 1e-10 { final_no = 0.0; }
                         prev_cqt_col_no_iir[bin] = final_no;
                         local_cqt_col_no_iir[bin] = final_no;
                         
                         let prev_with = prev_cqt_col_with_iir[bin];
-                        let final_with = if current_with_iir > prev_with { current_with_iir } else { (current_with_iir * (1.0 - decay)) + (prev_with * decay) };
+                        let mut final_with = if current_with_iir > prev_with { current_with_iir } else { (current_with_iir * (1.0 - decay)) + (prev_with * decay) };
+                        if final_with < 1e-10 { final_with = 0.0; }
                         prev_cqt_col_with_iir[bin] = final_with;
                         local_cqt_col_with_iir[bin] = final_with;
                     }
@@ -1150,7 +1277,8 @@ async fn main() {
         MaterialParams {
             uniforms: vec![
                 UniformDesc::new("scale_type", UniformType::Float1),
-                UniformDesc::new("sample_rate", UniformType::Float1),
+                UniformDesc::new("nyquist_freq", UniformType::Float1),
+                UniformDesc::new("max_display_freq", UniformType::Float1),
                 UniformDesc::new("is_cqt_texture", UniformType::Float1),
             ],
             textures: vec!["colormap".to_string()],
@@ -1160,7 +1288,11 @@ async fn main() {
 
     let max_stft_height = if SPECTRAL_OVERSAMPLING { OVERSAMPLE_TARGET / 2 } else { *RESOLUTIONS.iter().max().unwrap() / 2 };
     let max_possible_height = max_stft_height.max(CQT_BINS);
+    
     let mut local_pixels_buffer = vec![0u8; MAX_HISTORY * max_possible_height * 4];
+    
+    // Fast memory clone buffer (Unblocks Thread B instantly)
+    let mut cloned_layer_pixels = vec![0u8; MAX_HISTORY * max_possible_height * 4];
 
     // --- PRE-ALLOCATED TEXTURES & IMAGES FOR PRECISE UPDATE DRIVER OPTIMIZATIONS ---
     const MAX_DELTA_WIDTH: usize = 256;
@@ -1261,47 +1393,21 @@ async fn main() {
         let mut full_redraw_needed = false;
         let mut delta_updates: Vec<DeltaUpdate> = Vec::new();
 
+        let mut head = 0;
+        let mut height = 0;
+        let expected_len = MAX_HISTORY * current_height * 4;
+        let resolution_changed = actual_fft_idx != last_fft_idx;
+
+        // NEW: Fast Mutex Scope
         {
             if let Ok(layers) = shared_layers.lock() {
                 let layer = &layers[actual_fft_idx];
                 actual_total_updates = layer.total_updates;
+                head = layer.head;
+                height = layer.freq_bins;
                 
-                let prev_updates = last_rendered_updates[actual_fft_idx];
-                let diff = if actual_total_updates > prev_updates { actual_total_updates - prev_updates } else { 0 };
-                
-                let full_redraw_threshold = (MAX_HISTORY / 2) as u64;
-
-                // FIX: Force a full redraw if we just switched resolutions
-                let resolution_changed = actual_fft_idx != last_fft_idx;
-
-                if resolution_changed || diff >= full_redraw_threshold {
-                    let expected_len = MAX_HISTORY * current_height * 4;
-                    local_pixels_buffer[..expected_len].copy_from_slice(&layer.pixels[..expected_len]);
-                    full_redraw_needed = true;
-                } else if diff > 0 {
-                    let diff_usize = diff as usize;
-                    let head = layer.head;
-                    let height = layer.freq_bins;
-
-                    // Inline closure to extract new columns from the shared layer to our local flat buffer
-                    let mut copy_delta = |start_x: usize, width: usize| {
-                        for y in 0..height {
-                            let row_start = y * MAX_HISTORY * 4;
-                            let src_idx = row_start + start_x * 4;
-                            let len = width * 4;
-                            local_pixels_buffer[src_idx .. src_idx + len].copy_from_slice(&layer.pixels[src_idx .. src_idx + len]);
-                        }
-                        push_delta(&mut delta_updates, start_x, width, MAX_DELTA_WIDTH);
-                    };
-
-                    if head >= diff_usize {
-                        copy_delta(head - diff_usize, diff_usize);
-                    } else {
-                        let part1_len = diff_usize - head;
-                        copy_delta(MAX_HISTORY - part1_len, part1_len);
-                        if head > 0 { copy_delta(0, head); }
-                    }
-                }
+                // Extremely fast flat contiguous memory clone to release the lock immediately
+                cloned_layer_pixels[..expected_len].copy_from_slice(&layer.pixels[..expected_len]);
                 
                 if resolution_changed {
                     let prev_mode_updates = layers[last_fft_idx].total_updates;
@@ -1309,6 +1415,36 @@ async fn main() {
                     smooth_head_pos += diff_from_last;
                     last_fft_idx = actual_fft_idx;
                 }
+            }
+        } // LOCK DROPS HERE instantly allowing Thread B to continue writing!
+
+        let prev_updates = last_rendered_updates[actual_fft_idx];
+        let diff = if actual_total_updates > prev_updates { actual_total_updates - prev_updates } else { 0 };
+        let full_redraw_threshold = (MAX_HISTORY / 2) as u64;
+
+        if resolution_changed || diff >= full_redraw_threshold {
+            local_pixels_buffer[..expected_len].copy_from_slice(&cloned_layer_pixels[..expected_len]);
+            full_redraw_needed = true;
+        } else if diff > 0 {
+            let diff_usize = diff as usize;
+
+            // Uses the freed `cloned_layer_pixels` memory for the slower strided CPU copy
+            let mut copy_delta = |start_x: usize, width: usize| {
+                for y in 0..height {
+                    let row_start = y * MAX_HISTORY * 4;
+                    let src_idx = row_start + start_x * 4;
+                    let len = width * 4;
+                    local_pixels_buffer[src_idx .. src_idx + len].copy_from_slice(&cloned_layer_pixels[src_idx .. src_idx + len]);
+                }
+                push_delta(&mut delta_updates, start_x, width, MAX_DELTA_WIDTH);
+            };
+
+            if head >= diff_usize {
+                copy_delta(head - diff_usize, diff_usize);
+            } else {
+                let part1_len = diff_usize - head;
+                copy_delta(MAX_HISTORY - part1_len, part1_len);
+                if head > 0 { copy_delta(0, head); }
             }
         }
 
@@ -1422,7 +1558,8 @@ async fn main() {
         let is_cqt = if actual_fft_idx >= RESOLUTIONS.len() { 1.0f32 } else { 0.0f32 };
         
         shader_material.set_uniform("scale_type", scale_uniform_val);
-        shader_material.set_uniform("sample_rate", SAMPLE_RATE as f32);
+        shader_material.set_uniform("nyquist_freq", SAMPLE_RATE as f32 / 2.0);
+        shader_material.set_uniform("max_display_freq", MAX_DISPLAY_FREQ);
         shader_material.set_uniform("is_cqt_texture", is_cqt);
         shader_material.set_texture("colormap", colormap_texture.clone());
         gl_use_material(&shader_material);
@@ -1519,7 +1656,7 @@ async fn main() {
             };
 
             if norm_time >= 0.0 && norm_time <= 1.0 && norm_freq >= 0.0 && norm_freq <= 1.0 {
-                let max_freq = SAMPLE_RATE as f32 / 2.0;
+                let max_freq = MAX_DISPLAY_FREQ;
                 let current_hz = match local_settings.scale_type {
                     ScaleType::Linear => norm_freq * max_freq,
                     ScaleType::Mel => {
@@ -1565,7 +1702,7 @@ async fn main() {
                             (norm_cqt * layer.freq_bins as f32) as usize
                         }
                     } else {
-                        ((current_hz / max_freq) * layer.freq_bins as f32) as usize
+                        ((current_hz / (SAMPLE_RATE as f32 / 2.0)) * layer.freq_bins as f32) as usize
                     };
                     
                     let bin_idx = bin_idx.clamp(0, layer.freq_bins.saturating_sub(1));
@@ -1606,7 +1743,8 @@ async fn main() {
                     let diff_hz = (f2 - f1).abs();
                     let sign_str = if raw_semitones >= 0.0 { "+" } else { "" };
                     
-                    let drag_tooltip = format!("{}{:.2} st | {}{:.1} Hz", sign_str, raw_semitones, sign_str, diff_hz);
+                    let interval_name = get_interval_name(raw_semitones);
+                    let drag_tooltip = format!("{}{:.2} st ({}) | {}{:.1} Hz", sign_str, raw_semitones, interval_name, sign_str, diff_hz);
                     let drag_text_size = measure_text(&drag_tooltip, None, 20, 1.0);
                     
                     let mut d_tooltip_x = mx + 15.0;
@@ -1830,6 +1968,60 @@ fn hz_to_pitch(hz: f32) -> (String, f32) {
     (format!("{}{}{}", note_names[note_idx], octave, cent_str), cents)
 }
 
+fn get_interval_name(semitones: f32) -> String {
+    let st = semitones.abs().round() as usize;
+    match st {
+        0 => "Unison".to_string(),
+        1 => "Minor 2nd".to_string(),
+        2 => "Major 2nd".to_string(),
+        3 => "Minor 3rd".to_string(),
+        4 => "Major 3rd".to_string(),
+        5 => "Perfect 4th".to_string(),
+        6 => "Tritone".to_string(),
+        7 => "Perfect 5th".to_string(),
+        8 => "Minor 6th".to_string(),
+        9 => "Major 6th".to_string(),
+        10 => "Minor 7th".to_string(),
+        11 => "Major 7th".to_string(),
+        12 => "Octave".to_string(),
+        13 => "Minor 9th".to_string(),
+        14 => "Major 9th".to_string(),
+        15 => "Minor 10th".to_string(),
+        16 => "Major 10th".to_string(),
+        17 => "Perfect 11th".to_string(),
+        18 => "Augmented 11th".to_string(),
+        19 => "Perfect 12th".to_string(),
+        20 => "Minor 13th".to_string(),
+        21 => "Major 13th".to_string(),
+        22 => "Minor 14th".to_string(),
+        23 => "Major 14th".to_string(),
+        24 => "2 Octaves".to_string(),
+        _ => {
+            let octaves = st / 12;
+            let remainder = st % 12;
+            if remainder == 0 {
+                format!("{} Octaves", octaves)
+            } else {
+                let base_name = match remainder {
+                    1 => "Minor 2nd",
+                    2 => "Major 2nd",
+                    3 => "Minor 3rd",
+                    4 => "Major 3rd",
+                    5 => "Perfect 4th",
+                    6 => "Tritone",
+                    7 => "Perfect 5th",
+                    8 => "Minor 6th",
+                    9 => "Major 6th",
+                    10 => "Minor 7th",
+                    11 => "Major 7th",
+                    _ => "",
+                };
+                format!("{} Octaves + {}", octaves, base_name)
+            }
+        }
+    }
+}
+
 fn cycle_scale(s: ScaleType) -> ScaleType {
     match s {
         ScaleType::Linear => ScaleType::Mel,
@@ -1867,7 +2059,7 @@ fn cycle_direction(d: ScrollDirection) -> ScrollDirection {
 }
 
 fn freq_to_screen_pos(freq: f32, scale: ScaleType) -> f32 {
-    let max_freq = SAMPLE_RATE as f32 / 2.0;
+    let max_freq = MAX_DISPLAY_FREQ;
     match scale {
         ScaleType::Linear => freq / max_freq,
         ScaleType::Mel => {
@@ -1897,7 +2089,7 @@ fn draw_note_ruler(scale: ScaleType, dir: ScrollDirection) {
 
     for midi in 21..109 {
         let freq = 440.0 * 2.0f32.powf((midi as f32 - 69.0) / 12.0);
-        if freq > (SAMPLE_RATE as f32 / 2.0) { break; }
+        if freq > MAX_DISPLAY_FREQ { break; }
         let norm_pos = freq_to_screen_pos(freq, scale);
         if norm_pos < 0.0 || norm_pos > 1.0 { continue; } 
         
