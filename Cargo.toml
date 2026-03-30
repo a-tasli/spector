@@ -14,6 +14,8 @@ path = "src/main.rs"
 required-features = ["bg"]
 
 [dependencies]
+eframe = "0.34.1"
+wgpu = "29"
 macroquad = "0.4"          # The Game Engine
 #egui-macroquad = "0.17"
 ringbuf = "0.3"            # Thread Bridge

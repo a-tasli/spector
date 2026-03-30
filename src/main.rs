@@ -1,1960 +1,149 @@
-use macroquad::prelude::*;
-use rustfft::{FftPlanner, num_complex::Complex};
+use eframe::egui;
+use eframe::wgpu::util::DeviceExt;
 use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::Duration;
-use std::net::UdpSocket;
-use std::sync::mpsc::sync_channel;
-use std::collections::VecDeque;
 
-// PulseAudio bindings for audio capture
-use libpulse_binding::sample::{Spec, Format};
-use libpulse_binding::stream::Direction;
-use libpulse_binding::def::BufferAttr;
-use libpulse_simple_binding::Simple;
+mod audio; 
 
-// --- CONFIG ---
-const BASE_SAMPLE_RATE: u32 = 44100;
-const SR_MULT: u32 = 2; // Tweak this! (1, 2, 4, etc.)
-const SAMPLE_RATE: u32 = BASE_SAMPLE_RATE * SR_MULT;
-
-// Lock the screen's top frequency to human hearing, even if processing ultrasonics
-const MAX_DISPLAY_FREQ: f32 = 22050.0; 
-
-// Scale hops so scroll speed stays perfectly constant
-const MIN_HOP_SIZE: usize = 128;
-const CQT_HOP_SIZE: usize = (512 * SR_MULT) as usize; 
-const USE_PHASE_CONFIDENCE_FILTER: bool = false;
-
-// --- SPECTRAL OVERSAMPLING (Zero-Padding) ---
-const SPECTRAL_OVERSAMPLING: bool = false;
-const OVERSAMPLE_TARGET: usize = 16384; 
-
-// Variable resolutions and their corresponding Variable Hop Sizes
-const RESOLUTIONS: [usize; 4] = [2*1024, 2*4096, 3*4096, 2*8192];
-const HOP_SIZES: [usize; 4] = [256, 256, 128, 128];
-
-// --- STFT RESOLUTION MAPPING ---
-// Toggle this to true to force the engine to use the boundaries defined below
-const MANUAL_STFT_MAPPING: bool = true;
-
-struct ManualMapping {
-    max_freq: f32,
-    res_idx: usize,
-}
-
-// Define your manual frequency boundaries here (applied if MANUAL_STFT_MAPPING is true).
-// Any frequency <= `max_freq` will be assigned the resolution at `res_idx` in the RESOLUTIONS array.
-const MANUAL_MAPPINGS: [ManualMapping; 4] = [
-    ManualMapping { max_freq: 10.0, res_idx: 3 },            // Bass -> Largest window (e.g., 8192)
-    ManualMapping { max_freq: 120.0, res_idx: 2 },           // Low-Mids
-    ManualMapping { max_freq: 640.0, res_idx: 1 },           // High-Mids
-    ManualMapping { max_freq: MAX_DISPLAY_FREQ, res_idx: 0 }, // Treble -> Smallest window (e.g., 1024)
-];
-
-const CQT_BINS: usize = 1200; 
-const IIR_CROSSOVER_LOWER_HZ: f32 = 100.0; 
-const IIR_CROSSOVER_UPPER_HZ: f32 = 350.0; 
-
-// View length is 2520, but the Ring Buffer is 2800 to give the write-head an invisible margin!
-const MAX_VIEW_LEN: usize = 2520; 
-const MAX_HISTORY: usize = 2800; 
 const TARGET_DISPLAY_WIDTH: f32 = 2520.0;
 
-#[cfg(feature = "bg")]
-const DRAW_UI: bool = false;
+// --- WGSL GPU Shader ---
+const SHADER_WGSL: &str = r#"
+struct VertexOutput {
+    @builtin(position) clip_position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
 
-#[cfg(not(feature = "bg"))]
-const DRAW_UI: bool = true;
-
-// --- EXPLICIT MEMORY LAYOUTS FOR RAW IPC TRANSMISSION ---
-#[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum ColorMapType { 
-    Magma, Inferno, Viridis, Plasma, Turbo, Cubehelix, 
-    Cividis, Warm, Cool, Sinebow, 
-    Greys, InvertedGreys, InvertedMagma 
+@vertex
+fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
+    var out: VertexOutput;
+    let x = f32((vertex_index << 1u) & 2u);
+    let y = f32(vertex_index & 2u);
+    out.clip_position = vec4<f32>(x * 2.0 - 1.0, 1.0 - y * 2.0, 0.0, 1.0);
+    out.uv = vec2<f32>(x, y);
+    return out;
 }
 
-#[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum ScrollDirection { RTL, LTR, DTU, UTD }
+@group(0) @binding(0) var ring_tex: texture_2d<f32>;
+@group(0) @binding(1) var ring_sampler: sampler;
+@group(0) @binding(2) var colormap_tex: texture_2d<f32>;
+@group(0) @binding(3) var colormap_sampler: sampler;
+@group(0) @binding(4) var ymap_tex: texture_2d<f32>;
+@group(0) @binding(5) var ymap_sampler: sampler;
+@group(0) @binding(6) var mask_tex: texture_2d<f32>; // NEW: 1D Sparsity Mask
 
-#[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum AudioSource { SinkMonitor, Microphone }
+struct Uniforms {
+    scroll_offset: f32,
+    view_width_norm: f32,
+    direction: u32,
+    _padding: u32,
+};
+@group(0) @binding(7) var<uniform> uniforms: Uniforms;
 
-#[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum ScaleType { Linear, Mel, Logarithmic, Bark }
+@fragment
+fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    var time_uv: f32;
+    var freq_uv: f32;
+
+    if (uniforms.direction == 0u) { time_uv = in.uv.x; freq_uv = in.uv.y; } 
+    else if (uniforms.direction == 1u) { time_uv = 1.0 - in.uv.x; freq_uv = in.uv.y; } 
+    else if (uniforms.direction == 2u) { time_uv = in.uv.y; freq_uv = 1.0 - in.uv.x; } 
+    else { time_uv = 1.0 - in.uv.y; freq_uv = in.uv.x; }
+
+    let sample_u = fract(uniforms.scroll_offset - uniforms.view_width_norm + (time_uv * uniforms.view_width_norm));
+
+    // The Shader Trick: Evaluate the 1D Sparsity mask instantly
+    let mask_val = textureSample(mask_tex, ring_sampler, vec2<f32>(sample_u, 0.5)).r;
+    if (mask_val < 0.5) {
+        return vec4<f32>(0.0, 0.0, 0.0, 1.0); // Perfect void
+    }
+
+    let map_val = textureSample(ymap_tex, ymap_sampler, vec2<f32>(1.0 - freq_uv, 0.5));
+    let mapped_y = map_val.r + map_val.g / 256.0;
+
+    let intensity = textureSample(ring_tex, ring_sampler, vec2<f32>(sample_u, mapped_y)).r;
+    return textureSample(colormap_tex, colormap_sampler, vec2<f32>(intensity, 0.5));
+}
+"#;
 
 #[repr(C)]
-#[derive(Clone, Copy, PartialEq)]
-struct DspConfig {
-    pink_noise_tilt: f32,
-    peak_weight: f32,
-    rms_weight: f32,
-    psd_normalization: bool,
-    peak_density_dampening: f32,
-    decay_low: f32,
-    decay_high: f32,
-    splat_low: f32,
-    splat_high: f32,
-    halo_raw: f32,
-    halo_sharp: f32,
-    stft_boost: f32,
-    iir_boost: f32,
+#[derive(Copy, Clone, Debug)]
+struct ShaderUniforms {
+    scroll_offset: f32,
+    view_width_norm: f32,
+    direction: u32,
+    _padding: u32,
 }
 
-impl Default for DspConfig {
-    fn default() -> Self {
-        Self {
-            pink_noise_tilt: 0.0,
-            peak_weight: 0.5,
-            rms_weight: 0.5,
-            psd_normalization: true,
-            peak_density_dampening: 1.0,
-            decay_low: 0.0,
-            decay_high: 0.0,
-            splat_low: 3.0,
-            splat_high: 0.0,
-            halo_raw: 0.0,
-            halo_sharp: 1.0,
-            stft_boost: 5.0,
-            iir_boost: 5.0,
-        }
-    }
-}
+// ----------------------------------------------------
+// LUT Generators
+// ----------------------------------------------------
 
-/// Shared state synchronized via Mutex locally, and UDP globally.
-#[repr(C)]
-#[derive(Clone, Copy, PartialEq)]
-struct AppSettings {
-    scale_type: ScaleType,
-    colormap: ColorMapType,
-    audio_source: AudioSource,
-    dir: ScrollDirection,
-    iir_enabled: bool,
-    redraw_flag: bool,
-    fft_idx: u32,
-    view_len: u32,
-    dsp_config: DspConfig,
-}
-
-impl Default for AppSettings {
-    fn default() -> Self {
-        Self {
-            scale_type: ScaleType::Logarithmic,
-            colormap: ColorMapType::Magma,
-            audio_source: AudioSource::SinkMonitor,
-            dir: ScrollDirection::RTL,
-            iir_enabled: false,
-            redraw_flag: false,
-            fft_idx: RESOLUTIONS.len() as u32,
-            view_len: MAX_VIEW_LEN as u32,
-            dsp_config: DspConfig::default(),
-        }
-    }
-}
-
-// Memory-safe raw byte conversion for the UDP socket
-fn to_bytes(settings: &AppSettings) -> &[u8] {
-    unsafe {
-        std::slice::from_raw_parts(
-            (settings as *const AppSettings) as *const u8,
-            std::mem::size_of::<AppSettings>(),
-        )
-    }
-}
-
-fn from_bytes(bytes: &[u8]) -> Option<AppSettings> {
-    if bytes.len() == std::mem::size_of::<AppSettings>() {
-        let mut settings: AppSettings = unsafe { std::mem::zeroed() };
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                bytes.as_ptr(),
-                (&mut settings as *mut AppSettings) as *mut u8,
-                bytes.len(),
-            );
-        }
-        Some(settings)
-    } else {
-        None
-    }
-}
-
-// 1D Colormap Generator for the GPU Shader
-struct ColorLut {
-    bytes: Vec<[u8; 3]>,
-}
-
-impl ColorLut {
-    fn new(map_type: ColorMapType) -> Self {
-        let mut bytes = Vec::with_capacity(256);
-        for i in 0..=255 {
-            let mut val = i as f64 / 255.0;
-            
-            let gradient = match map_type {
-                ColorMapType::Magma => colorous::MAGMA,
-                ColorMapType::Inferno => colorous::INFERNO,
-                ColorMapType::Viridis => colorous::VIRIDIS,
-                ColorMapType::Plasma => colorous::PLASMA,
-                ColorMapType::Turbo => colorous::TURBO,
-                ColorMapType::Cubehelix => colorous::CUBEHELIX,
-                ColorMapType::Cividis => colorous::CIVIDIS,
-                ColorMapType::Warm => colorous::WARM,
-                ColorMapType::Cool => colorous::COOL,
-                ColorMapType::Sinebow => colorous::SINEBOW,
-                // Greys naturally goes from White (0.0) to Black (1.0).
-                ColorMapType::Greys => colorous::GREYS,
-                // Inverted versions flip the intensity input so 0.0 accesses the 'loud' end of the map
-                ColorMapType::InvertedGreys => { val = 1.0 - val; colorous::GREYS },
-                ColorMapType::InvertedMagma => { val = 1.0 - val; colorous::MAGMA },
-            };
-
-            let c = gradient.eval_continuous(val);
-            bytes.push([c.r, c.g, c.b]);
-        }
-        Self { bytes }
-    }
-}
-
-fn create_colormap_texture(lut: &ColorLut) -> Texture2D {
+fn generate_colormap_bytes(map_type: audio::ColorMapType) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(256 * 4);
-    for i in 0..256 {
-        let rgb = lut.bytes[i];
-        bytes.push(rgb[0]); bytes.push(rgb[1]); bytes.push(rgb[2]); bytes.push(255);
+    for i in 0..=255 {
+        let mut val = i as f64 / 255.0;
+        let gradient = match map_type {
+            audio::ColorMapType::Magma => colorous::MAGMA,
+            audio::ColorMapType::Inferno => colorous::INFERNO,
+            audio::ColorMapType::Viridis => colorous::VIRIDIS,
+            audio::ColorMapType::Plasma => colorous::TURBO,
+            audio::ColorMapType::Turbo => colorous::TURBO,
+            audio::ColorMapType::Cubehelix => colorous::CUBEHELIX,
+            audio::ColorMapType::Cividis => colorous::CIVIDIS,
+            audio::ColorMapType::Warm => colorous::WARM,
+            audio::ColorMapType::Cool => colorous::COOL,
+            audio::ColorMapType::Sinebow => colorous::SINEBOW,
+            audio::ColorMapType::Greys => colorous::GREYS,
+            audio::ColorMapType::InvertedGreys => { val = 1.0 - val; colorous::GREYS },
+            audio::ColorMapType::InvertedMagma => { val = 1.0 - val; colorous::MAGMA },
+        };
+        let c = gradient.eval_continuous(val);
+        bytes.extend_from_slice(&[c.r, c.g, c.b, 255]);
     }
-    let img = Image { width: 256, height: 1, bytes };
-    let tex = Texture2D::from_image(&img);
-    tex.set_filter(FilterMode::Linear);
-    tex
+    bytes
 }
 
-// DSP Intensity Pre-computation Look-Up Table
-struct IntensityLut {
-    table: Vec<u8>,
-}
+fn generate_y_mapping_bytes(scale_type: audio::ScaleType, is_cqt: bool, max_freq: f32, nyquist: f32) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(1024 * 4);
+    let min_log_freq: f32 = 20.0;
 
-impl IntensityLut {
-    fn new() -> Self {
-        let mut table = vec![0; 65536];
-        for i in 0..65536 {
-            let mag = (i as f32 / 65535.0) * 2.0; 
-            let val_in = mag * 2000.0;
-            let intensity = if val_in > 1.0 { (val_in.ln() / 8.0).clamp(0.0, 1.0) } else { 0.0 };
-            table[i] = (intensity * 255.0) as u8;
-        }
-        Self { table }
-    }
-
-    #[inline(always)]
-    fn get(&self, mag: f32) -> u8 {
-        if mag <= 0.0 { return 0; }
-        if mag >= 2.0 { return 255; }
-        let norm = mag / 2.0;
-        let idx = (norm * 65535.0) as usize;
-        self.table[idx]
-    }
-}
-
-// Reverted to Hann window for tight main-lobe frequency resolution.
-fn generate_hann_window(size: usize) -> Vec<f32> {
-    (0..size)
-        .map(|i| 0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / size as f32).cos()))
-        .collect()
-}
-
-// --- Professional IIR Biquad Filter (Direct Form II Transposed) ---
-#[derive(Clone)]
-struct Biquad {
-    b0: f32, b1: f32, b2: f32,
-    a1: f32, a2: f32,
-    z1: f32, z2: f32,
-}
-
-impl Biquad {
-    fn bandpass(fs: f32, f0: f32, q: f32) -> Self {
-        let w0 = 2.0 * std::f32::consts::PI * f0 / fs;
-        let alpha = w0.sin() / (2.0 * q);
-        let a0 = 1.0 + alpha;
-        Self {
-            b0: alpha / a0,
-            b1: 0.0,
-            b2: -alpha / a0,
-            a1: (-2.0 * w0.cos()) / a0,
-            a2: (1.0 - alpha) / a0,
-            z1: 0.0,
-            z2: 0.0,
-        }
-    }
-
-    #[inline(always)]
-    fn process(&mut self, x: f32) -> f32 {
-        let y = self.b0 * x + self.z1;
-        self.z1 = self.b1 * x - self.a1 * y + self.z2;
-        self.z2 = self.b2 * x - self.a2 * y;
-        
-        // Flush denormals to prevent CPU microcode spikes during silence
-        if self.z1.abs() < 1e-10 { self.z1 = 0.0; }
-        if self.z2.abs() < 1e-10 { self.z2 = 0.0; }
-        y
-    }
-}
-
-// --- Professional Multi-Rate Sparse Matrix Kernel ---
-#[derive(Clone)]
-struct CqtInstruction {
-    cqt_bin_idx: usize,
-    fft_idx: usize,
-    b_start: usize,
-    weights: Vec<f32>,
-    weight_sum: f32,
-    peak_dampening: f32,
-}
-
-struct SplatKernel {
-    half_width: isize,
-    weights: Vec<f32>,
-    weights_sqrt: Vec<f32>, // Precalculated to save 1,000,000+ sqrt() calls/sec
-}
-
-fn build_splat_kernels(splat_low: f32, splat_high: f32) -> Vec<SplatKernel> {
-    (0..CQT_BINS).map(|bin| {
-        let norm = bin as f32 / (CQT_BINS - 1) as f32;
-        let spread = splat_low + (splat_high - splat_low) * norm;
-        let mut half_width = spread.ceil() as isize;
-        
-        let mut weights = Vec::new();
-        let mut sum = 0.0;
-        
-        for s in -half_width..=half_width {
-            let d = s.abs() as f32;
-            let w = if d <= spread {
-                0.5 * (1.0 + (std::f32::consts::PI * d / spread.max(0.0001)).cos())
-            } else {
-                0.0
-            };
-            weights.push(w);
-            sum += w;
-        }
-        
-        if sum > 0.0 {
-            for w in &mut weights { *w /= sum; }
-        } else {
-            weights = vec![1.0];
-            half_width = 0;
-        }
-        
-        let mut weights_sqrt = Vec::with_capacity(weights.len());
-        for w in &weights {
-            weights_sqrt.push(w.sqrt());
-        }
-        
-        SplatKernel { half_width, weights, weights_sqrt }
-    }).collect()
-}
-
-fn build_cqt_map(sample_rate: u32, stft_specs: &[(usize, usize)], peak_damp_amount: f32) -> (Vec<CqtInstruction>, Vec<(usize, Biquad, f32)>) {
-    let mut stft_map = Vec::with_capacity(CQT_BINS);
-    let mut iir_filters = Vec::new();
-    
-    let min_freq = 20.0_f32;
-    let max_freq = MAX_DISPLAY_FREQ;
-    let log_min = min_freq.log2();
-    let log_max = max_freq.log2();
-    
-    for bin in 0..CQT_BINS {
-        let norm = bin as f32 / (CQT_BINS - 1) as f32;
-        let freq = 2.0_f32.powf(log_min + norm * (log_max - log_min));
-        
-        let musical_bw = freq / 24.0;
-        let erb = 24.7 * (4.37 * (freq / 1000.0) + 1.0);
-        let mut bw_hz = if freq < 250.0 {
-            musical_bw
-        } else {
-            let t = ((freq - 250.0) / 1000.0).clamp(0.0, 1.0);
-            musical_bw * (1.0 - t) + (erb * 1.2) * t
+    for i in 0..1024 {
+        let norm_f = i as f32 / 1023.0;
+        let current_hz = match scale_type {
+            audio::ScaleType::Bark => {
+                let arg = max_freq / 600.0;
+                let bark_max = 6.0 * (arg + (arg * arg + 1.0).sqrt()).ln();
+                600.0 * ((norm_f * bark_max) / 6.0).sinh()
+            },
+            audio::ScaleType::Logarithmic => {
+                2.0f32.powf(min_log_freq.log2() + norm_f * (max_freq.log2() - min_log_freq.log2()))
+            },
+            audio::ScaleType::Mel => {
+                let mel_max = 2595.0 * (1.0 + max_freq / 700.0).log10();
+                700.0 * (10.0f32.powf((norm_f * mel_max) / 2595.0) - 1.0)
+            },
+            audio::ScaleType::Linear => norm_f * max_freq,
         };
 
-        if freq < IIR_CROSSOVER_UPPER_HZ {
-            let q_factor = freq / bw_hz;
-            iir_filters.push((bin, Biquad::bandpass(sample_rate as f32, freq, q_factor), bw_hz));
-        }
-        
-        let (max_win_size, _) = stft_specs[stft_specs.len() - 1];
-        let min_stft_bw = sample_rate as f32 / max_win_size as f32;
-        if bw_hz < min_stft_bw * 1.5 {
-            bw_hz = min_stft_bw * 1.5;
-        }
-
-        let ideal_n_float = 4.0 * sample_rate as f32 / bw_hz;
-        
-        let mut best_idx = 0;
-
-        if MANUAL_STFT_MAPPING {
-            for mapping in MANUAL_MAPPINGS.iter() {
-                if freq <= mapping.max_freq {
-                    best_idx = mapping.res_idx;
-                    break;
-                }
-            }
-            // Fallback safety boundary check in case configuration changes
-            if best_idx >= stft_specs.len() {
-                best_idx = stft_specs.len() - 1;
+        let mut mapped_y = 0.0;
+        if is_cqt {
+            if current_hz >= min_log_freq {
+                mapped_y = (current_hz.log2() - min_log_freq.log2()) / (max_freq.log2() - min_log_freq.log2());
             }
         } else {
-            // Logarithmic (Ratio-based) dynamic selection for accurate perceptual match
-            let mut min_log_diff = f32::MAX;
-            for (i, &(win_res, _)) in stft_specs.iter().enumerate() {
-                let actual_n = win_res as f32;
-                // Ratio difference: |log2(actual) - log2(ideal)|
-                let log_diff = (actual_n.log2() - ideal_n_float.log2()).abs();
-                
-                if log_diff < min_log_diff {
-                    min_log_diff = log_diff;
-                    best_idx = i;
-                }
-            }
-        }
-        
-        let (win_res, fft_size) = stft_specs[best_idx];
-        
-        let density_mismatch = win_res as f32 / ideal_n_float;
-        let target_dampening = 1.0 / density_mismatch.powf(0.5);
-        let peak_dampening = 1.0 + (target_dampening - 1.0) * peak_damp_amount;
-
-        let freq_res = sample_rate as f32 / fft_size as f32;
-        let center_bin = freq / freq_res;
-        let mut bw_bins = bw_hz / freq_res;
-        
-        if bw_bins < 2.0 { bw_bins = 2.0; } 
-        
-        let start_bin = (center_bin - bw_bins / 2.0).floor() as usize;
-        let end_bin = (center_bin + bw_bins / 2.0).ceil() as usize;
-        
-        let start_bin = start_bin.clamp(0, fft_size / 2 - 1);
-        let end_bin = end_bin.clamp(start_bin, fft_size / 2 - 1);
-        
-        let mut weights = Vec::new();
-        let mut max_w = 0.0;
-        
-        for b in start_bin..=end_bin {
-            let dist = (b as f32 - center_bin).abs();
-            let w = if dist <= bw_bins / 2.0 {
-                0.5 * (1.0 + (std::f32::consts::PI * dist / (bw_bins / 2.0)).cos())
-            } else {
-                0.0
-            };
-            weights.push(w);
-            if w > max_w { max_w = w; }
-        }
-        
-        if max_w > 0.0 {
-            for w in &mut weights { *w /= max_w; }
-        } else if weights.is_empty() && start_bin < fft_size/2 {
-            weights.push(1.0);
+            mapped_y = current_hz / nyquist;
         }
 
-        let weight_sum = weights.iter().sum::<f32>().max(0.0001);
-
-        stft_map.push(CqtInstruction {
-            cqt_bin_idx: bin,
-            fft_idx: best_idx,
-            b_start: start_bin,
-            weights,
-            weight_sum,
-            peak_dampening,
-        });
+        let mapped_clamp = mapped_y.clamp(0.0, 1.0);
+        let val_u16 = (mapped_clamp * 65535.0) as u16;
+        bytes.extend_from_slice(&[(val_u16 >> 8) as u8, (val_u16 & 0xFF) as u8, 0, 255]);
     }
-    (stft_map, iir_filters)
+    bytes
 }
 
-struct SpectrogramLayer {
-    freq_bins: usize,
-    pixels: Vec<u8>,     
-    head: usize,         
-    total_updates: u64,  
-}
-
-impl SpectrogramLayer {
-    fn new(freq_bins: usize) -> Self {
-        Self {
-            freq_bins,
-            pixels: vec![0u8; MAX_HISTORY * freq_bins * 4],
-            head: 0,
-            total_updates: 0,
-        }
-    }
-}
-
-struct StftState {
-    window_size: usize,
-    fft_size: usize,
-    hop_size: usize,
-    samples_since_last: usize,
-    bin_freqs: Vec<f32>,          // Precomputed array eliminates inner-loop multiplications
-    expected_advances: Vec<f32>,  // Precomputed array eliminates inner-loop multiplications
-    prev_phases: Vec<f32>,
-    last_mags: Vec<f32>,
-    display_mags: Vec<f32>, 
-    last_true_freqs: Vec<f32>,
-    decays: Vec<f32>, 
-    fft: Arc<dyn rustfft::Fft<f32>>,
-    window: Vec<f32>,
-    scratch_buffer: Vec<Complex<f32>>, 
-}
-
-const VERTEX_SHADER: &str = r#"#version 100
-attribute vec3 position;
-attribute vec2 texcoord;
-attribute vec4 color0;
-varying lowp vec2 uv;
-varying lowp vec4 color;
-uniform mat4 Model;
-uniform mat4 Projection;
-void main() {
-    gl_Position = Projection * Model * vec4(position, 1.0);
-    color = color0;
-    uv = texcoord;
-}
-"#;
-
-const FRAGMENT_SHADER: &str = r#"#version 100
-precision highp float;
-varying lowp vec2 uv;
-varying lowp vec4 color;
-uniform sampler2D Texture;
-uniform sampler2D colormap;
-uniform float scale_type;
-uniform float nyquist_freq;
-uniform float max_display_freq;
-uniform float is_cqt_texture;
-
-void main() {
-    float norm_f = 1.0 - uv.y; 
-    float min_log_freq = 20.0;
-
-    if (is_cqt_texture > 0.5) {
-        float current_hz;
-        if (scale_type > 2.5) {
-            float arg = max_display_freq / 600.0;
-            float bark_max = 6.0 * log(arg + sqrt(arg * arg + 1.0));
-            float current_bark = norm_f * bark_max;
-            float z_over_6 = current_bark / 6.0;
-            current_hz = 600.0 * (exp(z_over_6) - exp(-z_over_6)) / 2.0;
-        } else if (scale_type > 1.5) {
-            float log_min = log2(min_log_freq);
-            float log_max = log2(max_display_freq);
-            current_hz = exp2(log_min + norm_f * (log_max - log_min));
-        } else if (scale_type > 0.5) {
-            float mel_max = 2595.0 * (log(1.0 + max_display_freq / 700.0) / 2.30258509299);
-            float current_mel = norm_f * mel_max;
-            current_hz = 700.0 * (exp((current_mel / 2595.0) * 2.30258509299) - 1.0);
-        } else {
-            current_hz = norm_f * max_display_freq;
-        }
-        
-        if (current_hz < min_log_freq) {
-            norm_f = 0.0; 
-        } else {
-            norm_f = (log2(current_hz) - log2(min_log_freq)) / (log2(max_display_freq) - log2(min_log_freq));
-            norm_f = clamp(norm_f, 0.0, 1.0);
-        }
-    } else {
-        float current_hz;
-        if (scale_type > 2.5) {
-            float arg = max_display_freq / 600.0;
-            float bark_max = 6.0 * log(arg + sqrt(arg * arg + 1.0));
-            float current_bark = norm_f * bark_max;
-            float z_over_6 = current_bark / 6.0;
-            current_hz = 600.0 * (exp(z_over_6) - exp(-z_over_6)) / 2.0;
-        } else if (scale_type > 1.5) {
-            float log_min = log2(min_log_freq);
-            float log_max = log2(max_display_freq);
-            float current_log = log_min + norm_f * (log_max - log_min);
-            current_hz = exp2(current_log);
-        } else if (scale_type > 0.5) {
-            float mel_max = 2595.0 * (log(1.0 + max_display_freq / 700.0) / 2.30258509299);
-            float current_mel = norm_f * mel_max;
-            current_hz = 700.0 * (exp((current_mel / 2595.0) * 2.30258509299) - 1.0);
-        } else {
-            current_hz = norm_f * max_display_freq;
-        }
-        // Properly map to the Texture's true Nyquist limit
-        norm_f = clamp(current_hz / nyquist_freq, 0.0, 1.0);
-    }
-
-    vec2 sample_uv = vec2(uv.x, norm_f);
-    float intensity = texture2D(Texture, sample_uv).r;
-    gl_FragColor = texture2D(colormap, vec2(intensity, 0.5));
-}
-"#;
-
-fn window_conf() -> Conf {
-    Conf {
-        window_title: if cfg!(feature = "bg") { "spector-bg" } else { "spector" }.to_owned(),
-        window_width: 1024,
-        window_height: 768,
-        high_dpi: true,
-        window_resizable: true,
-        ..Default::default()
-    }
-}
-
-// Delta chunker helper
-struct DeltaUpdate {
-    start_x: f32,
-    width: usize,
-}
-
-fn push_delta(updates: &mut Vec<DeltaUpdate>, start_x: usize, width: usize, max_delta: usize) {
-    let mut remaining = width;
-    let mut curr_x = start_x;
-    while remaining > 0 {
-        let chunk = remaining.min(max_delta);
-        updates.push(DeltaUpdate { start_x: curr_x as f32, width: chunk });
-        curr_x += chunk;
-        remaining -= chunk;
-    }
-}
-
-#[macroquad::main(window_conf)]
-async fn main() {
-    let mut layers = Vec::new();
-    for &size in RESOLUTIONS.iter() {
-        let actual_fft = if SPECTRAL_OVERSAMPLING { OVERSAMPLE_TARGET.max(size) } else { size };
-        layers.push(SpectrogramLayer::new(actual_fft / 2));
-    }
-    layers.push(SpectrogramLayer::new(CQT_BINS)); 
-    layers.push(SpectrogramLayer::new(CQT_BINS)); 
-
-    let shared_settings = Arc::new(Mutex::new(AppSettings::default()));
-
-    // ==========================================
-    // --- UDP IPC LISTENER (Cross-Instance Sync)
-    // ==========================================
-    let shared_settings_recv = shared_settings.clone();
-    let mut bind_port = 44101;
-    let mut receiver = None;
-    
-    // Finds the first available port allowing up to 10 instances to run
-    for p in 44101..=44110 {
-        if let Ok(socket) = UdpSocket::bind(format!("127.0.0.1:{}", p)) {
-            socket.set_nonblocking(false).ok();
-            bind_port = p;
-            receiver = Some(socket);
-            break;
-        }
-    }
-
-    if let Some(socket) = receiver {
-        thread::spawn(move || {
-            let mut buf = [0u8; 1024];
-            loop {
-                if let Ok((len, _)) = socket.recv_from(&mut buf) {
-                    if let Some(new_settings) = from_bytes(&buf[..len]) {
-                        if let Ok(mut s) = shared_settings_recv.lock() {
-                            *s = new_settings;
-                        }
-                    }
-                }
-            }
-        });
-    }
-
-    // UDP Sender allows the UI thread to push its changes out
-    let udp_sender = UdpSocket::bind("127.0.0.1:0").ok();
-
-    let shared_layers = Arc::new(Mutex::new(layers));
-    
-    // ZERO ALLOCATION AUDIO QUEUE: Uses Object Pools
-    let (audio_tx, audio_rx) = sync_channel::<Vec<f32>>(100);
-    let (recycle_tx, recycle_rx) = sync_channel::<Vec<f32>>(100);
-
-    // ==========================================
-    // --- THREAD A: RECORDER (Audio Ingest) ---
-    // ==========================================
-    let shared_settings_recorder = shared_settings.clone();
-    
-    thread::spawn(move || {
-        let mut current_source = AudioSource::SinkMonitor;
-
-        // Fetch the active audio device via pactl
-        let get_device_name = |source: AudioSource| -> Option<String> {
-            match source {
-                AudioSource::SinkMonitor => {
-                    if let Ok(output) = std::process::Command::new("pactl").arg("get-default-sink").output() {
-                        let sink_name = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                        Some(format!("{}.monitor", sink_name))
-                    } else {
-                        None
-                    }
-                },
-                AudioSource::Microphone => {
-                    if let Ok(output) = std::process::Command::new("pactl").arg("get-default-source").output() {
-                        Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
-                    } else {
-                        None
-                    }
-                }
-            }
-        };
-
-        // Cache the result so we don't query it 10x per second during silence!
-        let mut cached_device_name = get_device_name(current_source);
-
-        let open_stream = |device_name: Option<&String>| -> Option<Simple> {
-            let dev_name = device_name?;
-            let spec = Spec { format: Format::F32le, channels: 1, rate: SAMPLE_RATE };
-            let frag_size = (SAMPLE_RATE as u32 * 4 * 15) / 1000; 
-            let attr = BufferAttr {
-                maxlength: frag_size * 4, // <-- FIX: Caps the server backlog to ~60ms to eliminate wake-up latency
-                tlength: u32::MAX, prebuf: u32::MAX, minreq: u32::MAX,
-                fragsize: frag_size,
-            };
-
-            Simple::new(
-                None,
-                if cfg!(feature = "bg") { "spector-bg" } else { "spector" },
-                Direction::Record,
-                Some(dev_name),
-                "Recorder", &spec,
-                None,
-                Some(&attr)
-            ).ok()
-        };
-
-        let mut stream = open_stream(cached_device_name.as_ref());
-        let mut buf = [0u8; 4096];
-
-        loop {
-            if let Ok(settings) = shared_settings_recorder.try_lock() {
-                if settings.audio_source != current_source {
-                    current_source = settings.audio_source;
-                    // Source changed: Re-query pactl and cache the new device name!
-                    cached_device_name = get_device_name(current_source);
-                    stream = open_stream(cached_device_name.as_ref());
-                }
-            }
-
-            if let Some(ref s) = stream {
-                if let Ok(_) = s.read(&mut buf) {
-                    let floats: &[f32] = unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const f32, buf.len() / 4) };
-                    
-                    // RECYCLED MEMORY: Pulls an empty Vec from the pool or allocates one if pool is empty
-                    let mut chunk = recycle_rx.try_recv().unwrap_or_else(|_| Vec::with_capacity(1024));
-                    chunk.clear();
-                    chunk.extend_from_slice(floats);
-                    
-                    // Push chunk to blocking channel! This wakes up the waiting Brain Thread.
-                    let _ = audio_tx.send(chunk);
-                } else {
-                    // SOLUTION 2: Stream read failed (likely suspended). 
-                    // Keep the connection ALIVE and just wait a tiny bit instead of thrashing IPC!
-                    thread::sleep(Duration::from_millis(50));
-                }
-            } else {
-                // Only recreate the stream if it's completely missing (None)
-                thread::sleep(Duration::from_millis(100));
-                stream = open_stream(cached_device_name.as_ref());
-            }
-        }
-    });
-
-    // ====================================================
-    // --- THREAD B: BRAIN (FFT & Pixel Processing) ---
-    // ====================================================
-    let layers_ref = shared_layers.clone();
-    let settings_ref = shared_settings.clone();
-
-    thread::spawn(move || {
-        let max_fft = *RESOLUTIONS.iter().max().unwrap();
-        
-        // DOUBLE BUFFER: 2x the max window size to eliminate all memory-shifting array rotations
-        let mut rolling_audio = vec![0.0; max_fft * 2];
-        let mut audio_head = 0; 
-
-        let mut pending_buffer: VecDeque<f32> = VecDeque::with_capacity(8192);
-        let lut = IntensityLut::new(); // Optimized Pre-computed lookups
-
-        let mut local_dsp_config = DspConfig::default();
-
-        let stft_specs: Vec<(usize, usize)> = RESOLUTIONS.iter().map(|&res| {
-            let actual_fft = if SPECTRAL_OVERSAMPLING { OVERSAMPLE_TARGET.max(res) } else { res };
-            (res, actual_fft)
-        }).collect();
-
-        let mut planner = FftPlanner::new();
-        let mut stft_states: Vec<StftState> = stft_specs.iter().zip(HOP_SIZES.iter()).map(|(&(win_size, fft_size), &hop_size)| {
-            let freq_res = SAMPLE_RATE as f32 / fft_size as f32;
-            let hop_advance = 2.0 * std::f32::consts::PI * hop_size as f32 / fft_size as f32;
-            StftState {
-                window_size: win_size,
-                fft_size,
-                hop_size,
-                samples_since_last: hop_size,
-                bin_freqs: (0..fft_size / 2).map(|b| b as f32 * freq_res).collect(),
-                expected_advances: (0..fft_size / 2).map(|b| b as f32 * hop_advance).collect(),
-                prev_phases: vec![0.0; fft_size / 2],
-                last_mags: vec![0.0; fft_size / 2],
-                display_mags: vec![0.0; fft_size / 2],
-                last_true_freqs: vec![0.0; fft_size / 2],
-                decays: vec![0.0; fft_size / 2], 
-                fft: planner.plan_fft_forward(fft_size),
-                window: generate_hann_window(win_size),
-                scratch_buffer: vec![Complex { re: 0.0, im: 0.0 }; fft_size],
-            }
-        }).collect();
-
-        let mut float_history: Vec<Vec<f32>> = (0..=RESOLUTIONS.len() + 1).map(|i| {
-            let size = if i < RESOLUTIONS.len() { stft_states[i].fft_size / 2 } else { CQT_BINS };
-            vec![0.0f32; MAX_HISTORY * size]
-        }).collect();
-
-        let mut local_cqt_col_no_iir = vec![0.0; CQT_BINS];
-        let mut local_cqt_col_with_iir = vec![0.0; CQT_BINS];
-
-        let mut tilt_curves: Vec<Vec<f32>> = (0..=RESOLUTIONS.len() + 1).map(|i| {
-            let size = if i < RESOLUTIONS.len() { stft_states[i].fft_size / 2 } else { CQT_BINS };
-            vec![1.0f32; size]
-        }).collect();
-        let mut cqt_decays = vec![0.0f32; CQT_BINS];
-
-        let mut splat_kernels = build_splat_kernels(local_dsp_config.splat_low, local_dsp_config.splat_high);
-        let (mut stft_cqt_map, mut iir_filters) = build_cqt_map(SAMPLE_RATE, &stft_specs, local_dsp_config.peak_density_dampening);
-
-        let mut scratch_cols: Vec<Vec<u8>> = (0..=RESOLUTIONS.len() + 1).map(|i| {
-            let size = if i < RESOLUTIONS.len() { stft_states[i].fft_size / 2 } else { CQT_BINS };
-            vec![0u8; size * 4]
-        }).collect();
-
-        let mut rebuild_dsp_caches = |config: &DspConfig, stft_states: &mut Vec<StftState>, tilt_curves: &mut Vec<Vec<f32>>, cqt_decays: &mut Vec<f32>, splat_kernels: &mut Vec<SplatKernel>, stft_cqt_map: &mut Vec<CqtInstruction>| {
-            for (i, state) in stft_states.iter_mut().enumerate() {
-                let half_size = state.fft_size / 2;
-                let freq_res = SAMPLE_RATE as f32 / state.fft_size as f32;
-                let min_log = 20.0f32.log2();
-                let log_range_stft = (SAMPLE_RATE as f32 / 2.0).log2() - min_log; // Use true Nyquist limit for STFT scaling
-                
-                for bin in 0..half_size {
-                    let freq = bin as f32 * freq_res;
-                    let norm = if freq >= 20.0 { ((freq.log2() - min_log) / log_range_stft).clamp(0.0, 1.0) } else { 0.0 };
-                    state.decays[bin] = config.decay_low + (config.decay_high - config.decay_low) * norm;
-                    
-                    if freq > 20.0 {
-                        let octaves_above_min = freq.log2() - min_log;
-                        let tilt_db = octaves_above_min * config.pink_noise_tilt;
-                        tilt_curves[i][bin] = 10.0f32.powf(tilt_db / 20.0);
-                    } else {
-                        tilt_curves[i][bin] = 1.0;
-                    }
-                }
-            }
-            
-            let min_log = 20.0f32.log2();
-            let log_range_cqt = MAX_DISPLAY_FREQ.log2() - min_log; // Map CQT tilt to the visible Display limit
-            for bin in 0..CQT_BINS {
-                let norm = bin as f32 / (CQT_BINS - 1) as f32;
-                let octaves_above_min = norm * log_range_cqt;
-                let tilt_db = octaves_above_min * config.pink_noise_tilt;
-                let tilt_val = 10.0f32.powf(tilt_db / 20.0);
-                tilt_curves[RESOLUTIONS.len()][bin] = tilt_val;
-                tilt_curves[RESOLUTIONS.len()+1][bin] = tilt_val;
-                cqt_decays[bin] = config.decay_low + (config.decay_high - config.decay_low) * norm;
-            }
-            
-            *splat_kernels = build_splat_kernels(config.splat_low, config.splat_high);
-            let (new_map, _) = build_cqt_map(SAMPLE_RATE, &stft_specs, config.peak_density_dampening);
-            *stft_cqt_map = new_map;
-        };
-
-        rebuild_dsp_caches(&local_dsp_config, &mut stft_states, &mut tilt_curves, &mut cqt_decays, &mut splat_kernels, &mut stft_cqt_map);
-
-        let mut iir_blend_weights = vec![0.0f32; CQT_BINS];
-        for bin in 0..CQT_BINS {
-            let norm = bin as f32 / (CQT_BINS - 1) as f32;
-            let freq = 2.0_f32.powf(20.0f32.log2() + norm * (MAX_DISPLAY_FREQ.log2() - 20.0f32.log2()));
-            if freq <= IIR_CROSSOVER_LOWER_HZ {
-                iir_blend_weights[bin] = 1.0;
-            } else if freq >= IIR_CROSSOVER_UPPER_HZ {
-                iir_blend_weights[bin] = 0.0;
-            } else {
-                let t = (freq - IIR_CROSSOVER_LOWER_HZ) / (IIR_CROSSOVER_UPPER_HZ - IIR_CROSSOVER_LOWER_HZ);
-                iir_blend_weights[bin] = 0.5 * (1.0 + (std::f32::consts::PI * t).cos()); 
-            }
-        }
-
-        let mut iir_power_accum = vec![0.0f32; CQT_BINS];
-        let mut iir_peak_accum = vec![0.0f32; CQT_BINS];
-        let mut iir_samples_accum = 0;
-        let mut cqt_samples_since_last = 0;
-        
-        let mut prev_cqt_col_no_iir = vec![0.0f32; CQT_BINS];
-        let mut prev_cqt_col_with_iir = vec![0.0f32; CQT_BINS];
-
-        let min_log_f = 20.0f32.log2();
-        let log_range_f = MAX_DISPLAY_FREQ.log2() - min_log_f;
-        let log_range_inv = 1.0 / log_range_f;
-        let two_pi = 2.0 * std::f32::consts::PI;
-
-        let mut last_recv_time = std::time::Instant::now();
-        let cqt_hop_duration = std::time::Duration::from_secs_f32(CQT_HOP_SIZE as f32 / SAMPLE_RATE as f32);
-
-        loop {
-            let mut redraw_requested = false;
-
-            if let Ok(mut s) = settings_ref.lock() {
-                if s.redraw_flag {
-                    redraw_requested = true;
-                    s.redraw_flag = false; // Brain thread correctly resets the flag
-                }
-                if s.dsp_config != local_dsp_config {
-                    local_dsp_config = s.dsp_config;
-                    rebuild_dsp_caches(&local_dsp_config, &mut stft_states, &mut tilt_curves, &mut cqt_decays, &mut splat_kernels, &mut stft_cqt_map);
-                }
-            }
-
-            if redraw_requested {
-                if let Ok(mut layers) = layers_ref.lock() {
-                    for (i, layer) in layers.iter_mut().enumerate() {
-                        for t in 0..MAX_HISTORY {
-                            let start = t * layer.freq_bins;
-                            let slice = &float_history[i][start..start + layer.freq_bins];
-                            paint_column_fast(&mut layer.pixels, t, slice, layer.freq_bins, &tilt_curves[i], &lut);
-                        }
-                        layer.total_updates += (MAX_HISTORY * 2) as u64; 
-                    }
-                }
-            }
-
-            // --- DEEP SLEEP SYNCHRONIZATION (LOW POWER) ---
-            if pending_buffer.len() < MIN_HOP_SIZE {
-                // Wake up every 50ms (20Hz) instead of running a hot loop
-                match audio_rx.recv_timeout(std::time::Duration::from_millis(50)) {
-                    Ok(new_data) => {
-                        pending_buffer.extend(new_data.iter());
-                        let _ = recycle_tx.try_send(new_data);
-                        last_recv_time = std::time::Instant::now();
-                    }
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                        // PulseAudio is suspended. BYPASS the FFT engine completely!
-                        let elapsed = last_recv_time.elapsed();
-                        
-                        if elapsed >= cqt_hop_duration {
-                            let missed_hops = (elapsed.as_secs_f32() / cqt_hop_duration.as_secs_f32()) as u64;
-                            
-                            if let Ok(mut layers) = layers_ref.lock() {
-                                for layer in layers.iter_mut() {
-                                    for _ in 0..missed_hops {
-                                        let head_idx = layer.head;
-                                        // Write pure black pixels directly to the render buffer
-                                        for y in 0..layer.freq_bins {
-                                            let dst_idx = (y * MAX_HISTORY * 4) + (head_idx * 4);
-                                            layer.pixels[dst_idx] = 0;     // R
-                                            layer.pixels[dst_idx+1] = 0;   // G
-                                            layer.pixels[dst_idx+2] = 0;   // B
-                                            layer.pixels[dst_idx+3] = 255; // A
-                                        }
-                                        layer.head = (layer.head + 1) % MAX_HISTORY;
-                                        layer.total_updates += 1; // Tells the GPU to scroll!
-                                    }
-                                }
-                            }
-                            
-                            // Instantly crush lingering audio buffers to zero so the 
-                            // visualizer doesn't "smear" the last loud note forever
-                            for state in stft_states.iter_mut() {
-                                state.display_mags.fill(0.0);
-                                state.last_mags.fill(0.0);
-                            }
-                            local_cqt_col_no_iir.fill(0.0);
-                            local_cqt_col_with_iir.fill(0.0);
-                            
-                            // Advance the clock to prevent drift
-                            last_recv_time += cqt_hop_duration * (missed_hops as u32);
-                        }
-                    }
-                    Err(_) => {}
-                }
-            }
-
-            // Catch any massive data bursts when PulseAudio wakes up
-            while let Ok(extra_data) = audio_rx.try_recv() {
-                pending_buffer.extend(extra_data.iter());
-                let _ = recycle_tx.try_send(extra_data);
-                last_recv_time = std::time::Instant::now(); 
-            }
-
-            while pending_buffer.len() >= MIN_HOP_SIZE {
-                
-                // Ring Buffer Logic completely avoids moving array indices (O(1) memory writes!)
-                for _ in 0..MIN_HOP_SIZE {
-                    let sample = pending_buffer.pop_front().unwrap();
-                    for (bin_idx, biquad, _) in iir_filters.iter_mut() {
-                        let filtered = biquad.process(sample);
-                        iir_power_accum[*bin_idx] += filtered * filtered;
-                        
-                        let abs_f = filtered.abs();
-                        if abs_f > iir_peak_accum[*bin_idx] {
-                            iir_peak_accum[*bin_idx] = abs_f;
-                        }
-                    }
-                    
-                    // The Double Buffer Trick allows perfectly contiguous reads later
-                    rolling_audio[audio_head] = sample;
-                    rolling_audio[audio_head + max_fft] = sample;
-                    audio_head = (audio_head + 1) % max_fft;
-                }
-                iir_samples_accum += MIN_HOP_SIZE;
-                
-                for state in stft_states.iter_mut() {
-                    state.samples_since_last += MIN_HOP_SIZE;
-                    
-                    if state.samples_since_last >= state.hop_size {
-                        // Extract perfectly continuous slice thanks to double buffering!
-                        let start_sample = audio_head + max_fft - state.window_size;
-                        let audio_slice = &rolling_audio[start_sample .. start_sample + state.window_size];
-                        
-                        // 1. Avoid redundant zero-initialization of the active window slice
-                        let (active_buf, pad_buf) = state.scratch_buffer.split_at_mut(state.window_size);
-                        for (dst, (&a, &w)) in active_buf.iter_mut().zip(audio_slice.iter().zip(state.window.iter())) {
-                            *dst = Complex { re: a * w, im: 0.0 };
-                        }
-                        pad_buf.fill(Complex { re: 0.0, im: 0.0 });
-                        
-                        state.fft.process(&mut state.scratch_buffer);
-                        
-                        let scale = 2.0 / state.window_size as f32; 
-                        let broadband_comp = (state.window_size as f32 / 2048.0).sqrt(); 
-                        let cqt_makeup_gain = local_dsp_config.stft_boost.sqrt() * local_dsp_config.halo_sharp; 
-                        let display_factor = broadband_comp * cqt_makeup_gain; // 2. Hoist combined multiplier
-                        
-                        let half_size = state.fft_size / 2;
-                        let freq_res = SAMPLE_RATE as f32 / state.fft_size as f32;
-                        let sr_over_hop = SAMPLE_RATE as f32 / (2.0 * std::f32::consts::PI * state.hop_size as f32);
-                        let inv_two_pi = 1.0 / two_pi; // 3. Precompute reciprocal for fast phase wrap
-                        
-                        for (bin, (((&c, mag), prev_phase), true_freq)) in state.scratch_buffer[0..half_size].iter()
-                            .zip(&mut state.last_mags)
-                            .zip(&mut state.prev_phases)
-                            .zip(&mut state.last_true_freqs)
-                            .enumerate() 
-                        {
-                            let raw_mag = c.norm() * scale;
-                            let phase = c.im.atan2(c.re);
-                            
-                            let phase_diff = phase - *prev_phase;
-                            *prev_phase = phase;
-                            
-                            // FAST BRANCHLESS PHASE WRAP
-                            let diff = phase_diff - state.expected_advances[bin];
-                            let diff_wrapped = diff - two_pi * (diff * inv_two_pi).round();
-                                
-                            let offset_hz = diff_wrapped * sr_over_hop;
-                            *true_freq = state.bin_freqs[bin] + offset_hz;
-                            
-                            // FAST INLINE CONFIDENCE PENALTY
-                            // 1.3333333 is exactly 1.0 / 0.75, completely avoiding division
-                            let deviation_norm = (offset_hz / freq_res) * 1.3333333_f32; 
-                            let dev_sq = deviation_norm * deviation_norm;
-                            let dev_6 = dev_sq * dev_sq * dev_sq;
-                            let phase_confidence = if USE_PHASE_CONFIDENCE_FILTER {
-                                1.0 / (1.0 + dev_6)
-                            } else {
-                                1.0
-                            };
-                            
-                            // Instantly crushes the ghost phase magnitude to zero. 
-                            // Eliminates the need to carry confidence memory over to the CQT loop!
-                            *mag = raw_mag * phase_confidence;
-                            
-                            let display_mag = *mag * display_factor;
-                            let prev_disp = state.display_mags[bin];
-                            let decay = state.decays[bin];
-                            
-                            let mut next_disp = if display_mag > prev_disp {
-                                display_mag
-                            } else {
-                                (display_mag * (1.0 - decay)) + (prev_disp * decay)
-                            };
-                            if next_disp < 1e-10 { next_disp = 0.0; }
-                            state.display_mags[bin] = next_disp;
-                        }
-                        
-                        state.samples_since_last -= state.hop_size;
-                    }
-                }
-
-                cqt_samples_since_last += MIN_HOP_SIZE;
-
-                if cqt_samples_since_last >= CQT_HOP_SIZE {
-                    let min_stft_weight_sum = stft_cqt_map.first().map(|inst| inst.weight_sum).unwrap_or(1.0);
-                    let min_iir_bw = iir_filters.first().map(|&(_, _, bw)| bw).unwrap_or(1.0);
-
-                    let mut raw_cqt_power = vec![0.0f32; CQT_BINS];
-                    let mut raw_cqt_peak = vec![0.0f32; CQT_BINS];
-                    let mut sharp_cqt_power = vec![0.0f32; CQT_BINS];
-                    let mut sharp_cqt_peak = vec![0.0f32; CQT_BINS];
-                    
-                    let mut stft_amplitudes = vec![0.0f32; CQT_BINS];
-                    let mut iir_amplitudes = vec![0.0f32; CQT_BINS];
-                    
-                    if iir_samples_accum > 0 {
-                        let inv_samples = 1.0 / iir_samples_accum as f32;
-                        for &(bin, _, bw) in iir_filters.iter() {
-                            let norm_factor = if local_dsp_config.psd_normalization { bw / min_iir_bw } else { 1.0 };
-                            let rms = ((iir_power_accum[bin] * inv_samples) / norm_factor).sqrt();
-                            let peak = iir_peak_accum[bin]; 
-                            
-                            let hybrid = (peak * local_dsp_config.peak_weight) + (rms * local_dsp_config.rms_weight);
-                            iir_amplitudes[bin] = hybrid * local_dsp_config.iir_boost; 
-                        }
-                        for &(bin, _, _) in iir_filters.iter() {
-                            iir_power_accum[bin] = 0.0;
-                            iir_peak_accum[bin] = 0.0;
-                        }
-                        iir_samples_accum = 0;
-                    }
-
-                    let stft_boost = local_dsp_config.stft_boost;
-                    let stft_boost_sqrt = stft_boost.sqrt(); // Hoisted Constant!
-
-                    for inst in stft_cqt_map.iter() {
-                        let state = &stft_states[inst.fft_idx];
-                        let default_bin = inst.cqt_bin_idx;
-                        let norm_factor = if local_dsp_config.psd_normalization { inst.weight_sum / min_stft_weight_sum } else { 1.0 };
-                        
-                        let resolution_comp = state.window_size as f32 / 2048.0;
-                        let comp_mag_factor = resolution_comp.sqrt();
-                        let peak_dampening = inst.peak_dampening;
-                        
-                        let start = inst.b_start;
-                        let end = start + inst.weights.len();
-                        
-                        let mags = &state.last_mags[start..end];
-                        let freqs = &state.last_true_freqs[start..end];
-                        
-                        for ((&mag, &true_freq), &w) in mags.iter().zip(freqs).zip(&inst.weights) {
-                            let energy = (((mag * mag) * w) / norm_factor) * resolution_comp;
-                            raw_cqt_power[default_bin] += energy; 
-                            
-                            let comp_mag = (mag * comp_mag_factor) * peak_dampening; 
-                            if comp_mag > raw_cqt_peak[default_bin] {
-                                raw_cqt_peak[default_bin] = comp_mag;
-                            }
-                            
-                            if true_freq >= 20.0 {
-                                // Fast log2 scaling matching screen layout
-                                let norm = (true_freq.log2() - min_log_f) * log_range_inv;
-                                let target_bin = (norm * (CQT_BINS - 1) as f32).round() as isize;
-                                
-                                if target_bin >= 0 && target_bin < CQT_BINS as isize {
-                                    let boosted_energy = energy * stft_boost;
-                                    let boosted_mag = comp_mag * stft_boost_sqrt; 
-                                    
-                                    let splat = &splat_kernels[target_bin as usize];
-                                    
-                                    // Utilizes Pre-computed s_weight_sqrt array!
-                                    // Eliminates the massive 4-array memory zip() bottleneck!
-                                    for ((s, &s_weight), &s_weight_sqrt) in (-splat.half_width..=splat.half_width).zip(&splat.weights).zip(&splat.weights_sqrt) {
-                                        let offset_bin = target_bin + s;
-                                        if offset_bin >= 0 && offset_bin < CQT_BINS as isize {
-                                            let ob = offset_bin as usize;
-                                            sharp_cqt_power[ob] += boosted_energy * s_weight;
-                                            
-                                            let s_mag = boosted_mag * s_weight_sqrt;
-                                            if s_mag > sharp_cqt_peak[ob] {
-                                                sharp_cqt_peak[ob] = s_mag;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    
-                    for bin in 0..CQT_BINS {
-                        let raw_hybrid = (raw_cqt_peak[bin] * local_dsp_config.peak_weight) + (raw_cqt_power[bin].sqrt() * local_dsp_config.rms_weight);
-                        let sharp_hybrid = (sharp_cqt_peak[bin] * local_dsp_config.peak_weight) + (sharp_cqt_power[bin].sqrt() * local_dsp_config.rms_weight);
-                        
-                        stft_amplitudes[bin] = (raw_hybrid * local_dsp_config.halo_raw) + (sharp_hybrid * local_dsp_config.halo_sharp);
-                        
-                        let iir_w = iir_blend_weights[bin];
-                        let stft_w = 1.0 - iir_w;
-
-                        let current_no_iir = stft_amplitudes[bin];
-                        let current_with_iir = (iir_amplitudes[bin] * iir_w) + (stft_amplitudes[bin] * stft_w);
-                        
-                        let decay = cqt_decays[bin];
-                        
-                        let prev_no = prev_cqt_col_no_iir[bin];
-                        let mut final_no = if current_no_iir > prev_no { current_no_iir } else { (current_no_iir * (1.0 - decay)) + (prev_no * decay) };
-                        if final_no < 1e-10 { final_no = 0.0; }
-                        prev_cqt_col_no_iir[bin] = final_no;
-                        local_cqt_col_no_iir[bin] = final_no;
-                        
-                        let prev_with = prev_cqt_col_with_iir[bin];
-                        let mut final_with = if current_with_iir > prev_with { current_with_iir } else { (current_with_iir * (1.0 - decay)) + (prev_with * decay) };
-                        if final_with < 1e-10 { final_with = 0.0; }
-                        prev_cqt_col_with_iir[bin] = final_with;
-                        local_cqt_col_with_iir[bin] = final_with;
-                    }
-
-                    for i in 0..=RESOLUTIONS.len() + 1 {
-                        let freq_bins = if i < RESOLUTIONS.len() { stft_states[i].fft_size / 2 } else { CQT_BINS };
-                        let data_source = if i < RESOLUTIONS.len() {
-                            &stft_states[i].display_mags
-                        } else if i == RESOLUTIONS.len() {
-                            &local_cqt_col_no_iir
-                        } else {
-                            &local_cqt_col_with_iir
-                        };
-
-                        compute_column_colors(&mut scratch_cols[i], data_source, freq_bins, &tilt_curves[i], &lut);
-                    }
-
-                    if let Ok(mut layers) = layers_ref.lock() {
-                        for i in 0..=RESOLUTIONS.len() + 1 {
-                            let layer = &mut layers[i];
-                            let head_idx = layer.head;
-                            let freq_bins = layer.freq_bins;
-                            
-                            let data_source = if i < RESOLUTIONS.len() {
-                                &stft_states[i].display_mags
-                            } else if i == RESOLUTIONS.len() {
-                                &local_cqt_col_no_iir
-                            } else {
-                                &local_cqt_col_with_iir
-                            };
-
-                            let float_start = head_idx * freq_bins;
-                            let copy_len = data_source.len().min(freq_bins);
-                            if float_start + copy_len <= float_history[i].len() {
-                                float_history[i][float_start..float_start+copy_len].copy_from_slice(&data_source[0..copy_len]);
-                            }
-
-                            for y in 0..freq_bins {
-                                let src_idx = y * 4;
-                                let dst_idx = (y * MAX_HISTORY * 4) + (head_idx * 4);
-                                layer.pixels[dst_idx..dst_idx+4].copy_from_slice(&scratch_cols[i][src_idx..src_idx+4]);
-                            }
-
-                            layer.head = (layer.head + 1) % MAX_HISTORY;
-                            layer.total_updates += 1;
-                        }
-                    }
-                    
-                    cqt_samples_since_last -= CQT_HOP_SIZE;
-                }
-            }
-        }
-    });
-
-    // ===============================================
-    // --- THREAD C: FACE (UI & GPU Rendering) ---
-    // ===============================================
-    let mut render_targets = Vec::new();
-    for i in 0..=RESOLUTIONS.len() + 1 {
-        let height = if i < RESOLUTIONS.len() {
-            let res = RESOLUTIONS[i];
-            let actual_fft = if SPECTRAL_OVERSAMPLING { OVERSAMPLE_TARGET.max(res) } else { res };
-            actual_fft / 2
-        } else { CQT_BINS };
-        let rt = render_target(MAX_HISTORY as u32, height as u32);
-        rt.texture.set_filter(FilterMode::Linear);
-        render_targets.push(rt);
-    }
-    let mut last_rendered_updates = vec![0u64; RESOLUTIONS.len() + 2];
-
-    let mut local_settings = AppSettings::default();
-    let mut last_broadcast_settings = local_settings;
-
-    let mut last_fft_idx = RESOLUTIONS.len(); 
-    let mut smooth_head_pos: f64 = 0.0;
-    
-    let mut current_lut_type = local_settings.colormap;
-    let mut colormap_texture = create_colormap_texture(&ColorLut::new(current_lut_type));
-
-    let shader_material = load_material(
-        ShaderSource::Glsl { vertex: VERTEX_SHADER, fragment: FRAGMENT_SHADER },
-        MaterialParams {
-            uniforms: vec![
-                UniformDesc::new("scale_type", UniformType::Float1),
-                UniformDesc::new("nyquist_freq", UniformType::Float1),
-                UniformDesc::new("max_display_freq", UniformType::Float1),
-                UniformDesc::new("is_cqt_texture", UniformType::Float1),
-            ],
-            textures: vec!["colormap".to_string()],
-            ..Default::default()
-        },
-    ).unwrap();
-
-    let max_stft_height = if SPECTRAL_OVERSAMPLING { OVERSAMPLE_TARGET / 2 } else { *RESOLUTIONS.iter().max().unwrap() / 2 };
-    let max_possible_height = max_stft_height.max(CQT_BINS);
-    
-    let mut local_pixels_buffer = vec![0u8; MAX_HISTORY * max_possible_height * 4];
-    
-    // Fast memory clone buffer (Unblocks Thread B instantly)
-    let mut cloned_layer_pixels = vec![0u8; MAX_HISTORY * max_possible_height * 4];
-
-    // --- PRE-ALLOCATED TEXTURES & IMAGES FOR PRECISE UPDATE DRIVER OPTIMIZATIONS ---
-    const MAX_DELTA_WIDTH: usize = 256;
-    let mut delta_img = Image { 
-        width: MAX_DELTA_WIDTH as u16, 
-        height: max_possible_height as u16, 
-        bytes: vec![0; MAX_DELTA_WIDTH * max_possible_height * 4] 
-    };
-    let delta_tex = Texture2D::from_image(&delta_img);
-    delta_tex.set_filter(FilterMode::Nearest);
-
-    let mut full_img = Image {
-        width: MAX_HISTORY as u16,
-        height: max_possible_height as u16,
-        bytes: vec![0; MAX_HISTORY * max_possible_height * 4]
-    };
-    let full_tex = Texture2D::from_image(&full_img);
-    full_tex.set_filter(FilterMode::Nearest);
-
-    // Native Custom UI State
-    let mut show_advanced_ui = false;
-    let mut active_slider: Option<usize> = None;
-    let mut drag_start_freq: Option<f32> = None;
-
-    loop {
-        let mut ui_wants_input = false;
-
-        // --- 1. RECEIVE INCOMING UDP SYNCS ---
-        if let Ok(s) = shared_settings.lock() {
-            if *s != last_broadcast_settings {
-                local_settings = *s;
-                last_broadcast_settings = *s;
-                if local_settings.colormap != current_lut_type {
-                    current_lut_type = local_settings.colormap;
-                    colormap_texture = create_colormap_texture(&ColorLut::new(current_lut_type));
-                }
-            }
-        }
-
-        let (mx, my) = mouse_position();
-        let m_down = is_mouse_button_down(MouseButton::Left);
-        let m_pressed = is_mouse_button_pressed(MouseButton::Left);
-
-        if !m_down { drag_start_freq = None; }
-        if is_key_pressed(KeyCode::T) { show_advanced_ui = !show_advanced_ui; }
-
-        let menu_x = 20.0;
-        let menu_y = 60.0; 
-        let menu_w = 320.0;
-        let menu_h = 640.0;
-
-        if show_advanced_ui {
-            if mx >= menu_x && mx <= menu_x + menu_w && my >= menu_y && my <= menu_y + menu_h {
-                ui_wants_input = true;
-            }
-            if active_slider.is_some() {
-                ui_wants_input = true;
-            }
-        }
-
-        // --- 2. PROCESS LOCAL INPUTS ---
-        if !ui_wants_input {
-            if is_key_pressed(KeyCode::S) { local_settings.scale_type = cycle_scale(local_settings.scale_type); } 
-            if is_key_pressed(KeyCode::C) { 
-                local_settings.colormap = cycle_colormap(local_settings.colormap); 
-                current_lut_type = local_settings.colormap;
-                colormap_texture = create_colormap_texture(&ColorLut::new(current_lut_type));
-            }
-            if is_key_pressed(KeyCode::F) { local_settings.dir = cycle_direction(local_settings.dir); }
-            if is_key_pressed(KeyCode::R) { local_settings.fft_idx = ((local_settings.fft_idx + 1) % (RESOLUTIONS.len() as u32 + 1)) as u32; } 
-            if is_key_pressed(KeyCode::I) { local_settings.iir_enabled = !local_settings.iir_enabled; }
-            if is_key_pressed(KeyCode::A) { 
-                local_settings.audio_source = match local_settings.audio_source {
-                    AudioSource::SinkMonitor => AudioSource::Microphone,
-                    AudioSource::Microphone => AudioSource::SinkMonitor,
-                };
-            }
-            if is_key_pressed(KeyCode::W) {
-                local_settings.view_len = if local_settings.view_len == MAX_VIEW_LEN as u32 { (MAX_VIEW_LEN / 2) as u32 } else { MAX_VIEW_LEN as u32 };
-            }
-        }
-
-        let actual_fft_idx = if local_settings.fft_idx as usize == RESOLUTIONS.len() {
-            if local_settings.iir_enabled { RESOLUTIONS.len() + 1 } else { RESOLUTIONS.len() }
-        } else {
-            local_settings.fft_idx as usize
-        };
-
-        let current_height = if actual_fft_idx >= RESOLUTIONS.len() {
-            CQT_BINS
-        } else {
-            let res = RESOLUTIONS[actual_fft_idx];
-            let actual_fft = if SPECTRAL_OVERSAMPLING { OVERSAMPLE_TARGET.max(res) } else { res };
-            actual_fft / 2 
-        };
-
-        let mut actual_total_updates = 0u64;
-        let mut full_redraw_needed = false;
-        let mut delta_updates: Vec<DeltaUpdate> = Vec::new();
-
-        let mut head = 0;
-        let mut height = 0;
-        let expected_len = MAX_HISTORY * current_height * 4;
-        let resolution_changed = actual_fft_idx != last_fft_idx;
-
-        // NEW: Fast Mutex Scope
-        {
-            if let Ok(layers) = shared_layers.lock() {
-                let layer = &layers[actual_fft_idx];
-                actual_total_updates = layer.total_updates;
-                head = layer.head;
-                height = layer.freq_bins;
-                
-                // Extremely fast flat contiguous memory clone to release the lock immediately
-                cloned_layer_pixels[..expected_len].copy_from_slice(&layer.pixels[..expected_len]);
-                
-                if resolution_changed {
-                    let prev_mode_updates = layers[last_fft_idx].total_updates;
-                    let diff_from_last = actual_total_updates as f64 - prev_mode_updates as f64;
-                    smooth_head_pos += diff_from_last;
-                    last_fft_idx = actual_fft_idx;
-                }
-            }
-        } // LOCK DROPS HERE instantly allowing Thread B to continue writing!
-
-        let prev_updates = last_rendered_updates[actual_fft_idx];
-        let diff = if actual_total_updates > prev_updates { actual_total_updates - prev_updates } else { 0 };
-        let full_redraw_threshold = (MAX_HISTORY / 2) as u64;
-
-        if resolution_changed || diff >= full_redraw_threshold {
-            local_pixels_buffer[..expected_len].copy_from_slice(&cloned_layer_pixels[..expected_len]);
-            full_redraw_needed = true;
-        } else if diff > 0 {
-            let diff_usize = diff as usize;
-
-            // Uses the freed `cloned_layer_pixels` memory for the slower strided CPU copy
-            let mut copy_delta = |start_x: usize, width: usize| {
-                for y in 0..height {
-                    let row_start = y * MAX_HISTORY * 4;
-                    let src_idx = row_start + start_x * 4;
-                    let len = width * 4;
-                    local_pixels_buffer[src_idx .. src_idx + len].copy_from_slice(&cloned_layer_pixels[src_idx .. src_idx + len]);
-                }
-                push_delta(&mut delta_updates, start_x, width, MAX_DELTA_WIDTH);
-            };
-
-            if head >= diff_usize {
-                copy_delta(head - diff_usize, diff_usize);
-            } else {
-                let part1_len = diff_usize - head;
-                copy_delta(MAX_HISTORY - part1_len, part1_len);
-                if head > 0 { copy_delta(0, head); }
-            }
-        }
-
-        // --- Zero-Allocation Precise GPU Update Logic ---
-        if full_redraw_needed {
-            let total_bytes = MAX_HISTORY * current_height * 4;
-            full_img.bytes[..total_bytes].copy_from_slice(&local_pixels_buffer[..total_bytes]);
-            full_tex.update(&full_img);
-            
-            let mut cam = Camera2D::from_display_rect(Rect::new(0.0, 0.0, MAX_HISTORY as f32, current_height as f32));
-            cam.render_target = Some(render_targets[actual_fft_idx].clone());
-            set_camera(&cam);
-            draw_texture_ex(&full_tex, 0.0, 0.0, WHITE, DrawTextureParams {
-                source: Some(Rect::new(0.0, 0.0, MAX_HISTORY as f32, current_height as f32)),
-                dest_size: Some(vec2(MAX_HISTORY as f32, current_height as f32)),
-                ..Default::default()
-            });
-            set_default_camera();
-            last_rendered_updates[actual_fft_idx] = actual_total_updates;
-
-        } else if !delta_updates.is_empty() {
-            let mut cam = Camera2D::from_display_rect(Rect::new(0.0, 0.0, MAX_HISTORY as f32, current_height as f32));
-            cam.render_target = Some(render_targets[actual_fft_idx].clone());
-            set_camera(&cam);
-            
-            for update in &delta_updates {
-                for y in 0..current_height {
-                    let src_row = y * MAX_HISTORY * 4;
-                    let dst_row = y * MAX_DELTA_WIDTH * 4;
-                    let start_idx = src_row + (update.start_x as usize) * 4;
-                    let len = update.width * 4;
-                    // Move only the new data block into the pre-allocated reusable texture Image struct
-                    delta_img.bytes[dst_row .. dst_row + len].copy_from_slice(&local_pixels_buffer[start_idx .. start_idx + len]);
-                }
-                delta_tex.update(&delta_img);
-                draw_texture_ex(&delta_tex, update.start_x, 0.0, WHITE, DrawTextureParams {
-                    source: Some(Rect::new(0.0, 0.0, update.width as f32, current_height as f32)),
-                    dest_size: Some(vec2(update.width as f32, current_height as f32)),
-                    ..Default::default()
-                });
-            }
-            set_default_camera();
-            last_rendered_updates[actual_fft_idx] = actual_total_updates;
-        }
-
-        clear_background(BLACK);
-        let sw = screen_width();
-        let sh = screen_height();
-
-        let target_pos = actual_total_updates as f64;
-        let diff = target_pos - smooth_head_pos;
-        let dt = get_frame_time() as f64;
-        
-        smooth_head_pos += diff * (15.0 * dt).min(1.0); 
-        if diff.abs() > 50.0 { smooth_head_pos = target_pos; } 
-        
-        let head_snapped = (smooth_head_pos.rem_euclid(MAX_HISTORY as f64)).floor() as f32;
-        let head_offset = head_snapped;
-
-        let (screen_time_dim, _screen_freq_dim) = match local_settings.dir {
-            ScrollDirection::RTL | ScrollDirection::LTR => (sw, sh),
-            ScrollDirection::DTU | ScrollDirection::UTD => (sh, sw),
-        };
-
-        let scale_factor = TARGET_DISPLAY_WIDTH / (local_settings.view_len as f32);
-        let needed_source_w = screen_time_dim / scale_factor;
-
-        let (final_source_w, _) = if needed_source_w <= local_settings.view_len as f32 {
-            (needed_source_w, screen_time_dim)
-        } else {
-            (local_settings.view_len as f32, screen_time_dim)
-        };
-
-        let final_source_w_snapped = final_source_w;
-        let start_pos_unwrapped = head_offset - final_source_w_snapped;
-        let tex_w = MAX_HISTORY as f32;
-        let tex_h = current_height as f32;
-
-        let is_horizontal = match local_settings.dir {
-            ScrollDirection::RTL | ScrollDirection::LTR => true,
-            _ => false
-        };
-
-        let (src1, src2) = if start_pos_unwrapped < 0.0 {
-            let overflow = start_pos_unwrapped.abs();
-            let s1 = Rect::new(tex_w - overflow, 0.0, overflow, tex_h);
-            let s2 = if head_offset > 0.001 {
-                Some(Rect::new(0.0, 0.0, head_offset, tex_h))
-            } else {
-                None
-            };
-            (Some(s1), s2)
-        } else {
-            let s1 = Rect::new(start_pos_unwrapped, 0.0, final_source_w_snapped, tex_h);
-            (Some(s1), None)
-        };
-
-        let dst1_len = src1.map(|r| r.w * scale_factor).unwrap_or(0.0);
-        let dst2_len = src2.map(|r| r.w * scale_factor).unwrap_or(0.0);
-        let total_draw_len = dst1_len + dst2_len;
-        let start_pos_screen = (screen_time_dim - total_draw_len) / 2.0;
-
-        let texture_to_draw = &render_targets[actual_fft_idx].texture;
-
-        let scale_uniform_val = match local_settings.scale_type {
-            ScaleType::Linear => 0.0f32,
-            ScaleType::Mel => 1.0f32,
-            ScaleType::Logarithmic => 2.0f32,
-            ScaleType::Bark => 3.0f32,
-        };
-        let is_cqt = if actual_fft_idx >= RESOLUTIONS.len() { 1.0f32 } else { 0.0f32 };
-        
-        shader_material.set_uniform("scale_type", scale_uniform_val);
-        shader_material.set_uniform("nyquist_freq", SAMPLE_RATE as f32 / 2.0);
-        shader_material.set_uniform("max_display_freq", MAX_DISPLAY_FREQ);
-        shader_material.set_uniform("is_cqt_texture", is_cqt);
-        shader_material.set_texture("colormap", colormap_texture.clone());
-        gl_use_material(&shader_material);
-
-        if is_horizontal {
-            let is_ltr = local_settings.dir == ScrollDirection::LTR;
-            let flip_x = is_ltr;
-
-            if is_ltr {
-                if let Some(s2) = src2 {
-                    draw_texture_ex(texture_to_draw, start_pos_screen, 0.0, WHITE, DrawTextureParams {
-                        dest_size: Some(vec2(dst2_len, sh)), source: Some(s2), flip_x, ..Default::default()
-                    });
-                }
-                if let Some(s1) = src1 {
-                    draw_texture_ex(texture_to_draw, start_pos_screen + dst2_len, 0.0, WHITE, DrawTextureParams {
-                        dest_size: Some(vec2(dst1_len, sh)), source: Some(s1), flip_x, ..Default::default()
-                    });
-                }
-            } else {
-                if let Some(s1) = src1 {
-                    draw_texture_ex(texture_to_draw, start_pos_screen, 0.0, WHITE, DrawTextureParams {
-                        dest_size: Some(vec2(dst1_len, sh)), source: Some(s1), flip_x, ..Default::default()
-                    });
-                }
-                if let Some(s2) = src2 {
-                    draw_texture_ex(texture_to_draw, start_pos_screen + dst1_len, 0.0, WHITE, DrawTextureParams {
-                        dest_size: Some(vec2(dst2_len, sh)), source: Some(s2), flip_x, ..Default::default()
-                    });
-                }
-            }
-        } else {
-            let is_fire = local_settings.dir == ScrollDirection::DTU;
-            if is_fire {
-                if let Some(s1) = src1 {
-                    let h = dst1_len;
-                    let x = (sw - h) / 2.0;
-                    let y = start_pos_screen + (h - sw) / 2.0;
-                    draw_texture_ex(texture_to_draw, x, y, WHITE, DrawTextureParams {
-                        dest_size: Some(vec2(h, sw)), source: Some(s1), rotation: std::f32::consts::FRAC_PI_2, ..Default::default()
-                    });
-                }
-                if let Some(s2) = src2 {
-                    let h = dst2_len;
-                    let y_offset = start_pos_screen + dst1_len;
-                    let x = (sw - h) / 2.0;
-                    let y = y_offset + (h - sw) / 2.0;
-                    draw_texture_ex(texture_to_draw, x, y, WHITE, DrawTextureParams {
-                        dest_size: Some(vec2(h, sw)), source: Some(s2), rotation: std::f32::consts::FRAC_PI_2, ..Default::default()
-                    });
-                }
-            } else {
-                if let Some(s2) = src2 {
-                    let h = dst2_len;
-                    let x = (sw - h) / 2.0;
-                    let y = start_pos_screen + (h - sw) / 2.0;
-                    draw_texture_ex(texture_to_draw, x, y, WHITE, DrawTextureParams {
-                        dest_size: Some(vec2(h, sw)), source: Some(s2), rotation: -std::f32::consts::FRAC_PI_2, flip_y: true, ..Default::default()
-                    });
-                }
-                if let Some(s1) = src1 {
-                    let h = dst1_len;
-                    let y_offset = start_pos_screen + dst2_len;
-                    let x = (sw - h) / 2.0;
-                    let y = y_offset + (h - sw) / 2.0;
-                    draw_texture_ex(texture_to_draw, x, y, WHITE, DrawTextureParams {
-                        dest_size: Some(vec2(h, sw)), source: Some(s1), rotation: -std::f32::consts::FRAC_PI_2, flip_y: true, ..Default::default()
-                    });
-                }
-            }
-        }
-
-        gl_use_default_material();
-
-        draw_note_ruler(local_settings.scale_type, local_settings.dir);
-        if DRAW_UI { draw_ui_overlay(&local_settings, show_advanced_ui); }
-
-        if DRAW_UI && !ui_wants_input {
-            // --- Interactive Mouse Crosshair (Frequency/Note Peeking) ---
-            let norm_time = if total_draw_len > 0.0 {
-                match local_settings.dir {
-                    ScrollDirection::RTL => (start_pos_screen + total_draw_len - mx) / total_draw_len,
-                    ScrollDirection::LTR => (mx - start_pos_screen) / total_draw_len,
-                    ScrollDirection::DTU => (start_pos_screen + total_draw_len - my) / total_draw_len,
-                    ScrollDirection::UTD => (my - start_pos_screen) / total_draw_len,
-                }
-            } else {
-                -1.0
-            };
-
-            let norm_freq = match local_settings.dir {
-                ScrollDirection::RTL | ScrollDirection::LTR => 1.0 - (my / sh),
-                ScrollDirection::DTU | ScrollDirection::UTD => mx / sw, 
-            };
-
-            if norm_time >= 0.0 && norm_time <= 1.0 && norm_freq >= 0.0 && norm_freq <= 1.0 {
-                let max_freq = MAX_DISPLAY_FREQ;
-                let current_hz = match local_settings.scale_type {
-                    ScaleType::Linear => norm_freq * max_freq,
-                    ScaleType::Mel => {
-                        let mel_max = 2595.0 * (1.0 + max_freq / 700.0).log10();
-                        let current_mel = norm_freq * mel_max;
-                        700.0 * (10.0f32.powf(current_mel / 2595.0) - 1.0)
-                    },
-                    ScaleType::Logarithmic => {
-                        let min_freq = 20.0f32;
-                        let log_min = min_freq.log2();
-                        let log_max = max_freq.log2();
-                        2.0f32.powf(log_min + norm_freq * (log_max - log_min))
-                    },
-                    ScaleType::Bark => {
-                        let bark_max = 6.0 * (max_freq / 600.0).asinh();
-                        let current_bark = norm_freq * bark_max;
-                        600.0 * (current_bark / 6.0).sinh()
-                    }
-                };
-
-                if m_pressed {
-                    drag_start_freq = Some(current_hz);
-                }
-
-                let drawn_time_seconds = (final_source_w_snapped * CQT_HOP_SIZE as f32) / SAMPLE_RATE as f32;
-                let time_ago = norm_time * drawn_time_seconds;
-                let (note_name, _) = hz_to_pitch(current_hz);
-
-                draw_line(mx, 0.0, mx, sh, 1.0, Color::new(1.0, 1.0, 1.0, 0.3));
-                draw_line(0.0, my, sw, my, 1.0, Color::new(1.0, 1.0, 1.0, 0.3));
-
-                let mut intensity_u8 = 0;
-                if let Ok(layers) = shared_layers.lock() {
-                    let layer = &layers[actual_fft_idx];
-                    
-                    let exact_col = (head_offset - (norm_time * final_source_w_snapped) - 1.0).floor();
-                    let ring_buffer_col = exact_col.rem_euclid(MAX_HISTORY as f32) as usize;
-                    
-                    let bin_idx = if actual_fft_idx >= RESOLUTIONS.len() {
-                        let min_f = 20.0f32;
-                        if current_hz <= min_f { 0 } else {
-                            let norm_cqt = (current_hz.log2() - min_f.log2()) / (max_freq.log2() - min_f.log2());
-                            (norm_cqt * layer.freq_bins as f32) as usize
-                        }
-                    } else {
-                        ((current_hz / (SAMPLE_RATE as f32 / 2.0)) * layer.freq_bins as f32) as usize
-                    };
-                    
-                    let bin_idx = bin_idx.clamp(0, layer.freq_bins.saturating_sub(1));
-                    
-                    let y = (layer.freq_bins - 1) - bin_idx;
-                    let pixel_idx = (y * MAX_HISTORY * 4) + (ring_buffer_col * 4);
-                    
-                    if pixel_idx < layer.pixels.len() {
-                        intensity_u8 = layer.pixels[pixel_idx];
-                    }
-                }
-
-                let exact_mag = ((intensity_u8 as f32 / 255.0) * 8.0).exp() / 2000.0;
-                let db = if exact_mag > 0.0001 { 20.0 * exact_mag.log10() } else { -100.0 };
-
-                // Handle Drag-to-Select Rendering
-                if let Some(f1) = drag_start_freq {
-                    let norm_start_pos = freq_to_screen_pos(f1, local_settings.scale_type);
-                    
-                    if local_settings.dir == ScrollDirection::RTL || local_settings.dir == ScrollDirection::LTR {
-                        let start_y = sh * (1.0 - norm_start_pos);
-                        let min_y = start_y.min(my);
-                        let max_y = start_y.max(my);
-                        draw_rectangle(0.0, min_y, sw, max_y - min_y, Color::new(1.0, 0.8, 0.3, 0.2));
-                        draw_line(0.0, start_y, sw, start_y, 1.0, Color::new(1.0, 0.8, 0.3, 0.8));
-                        draw_line(0.0, my, sw, my, 1.0, Color::new(1.0, 0.8, 0.3, 0.8));
-                    } else {
-                        let start_x = sw * norm_start_pos;
-                        let min_x = start_x.min(mx);
-                        let max_x = start_x.max(mx);
-                        draw_rectangle(min_x, 0.0, max_x - min_x, sh, Color::new(1.0, 0.8, 0.3, 0.2));
-                        draw_line(start_x, 0.0, start_x, sh, 1.0, Color::new(1.0, 0.8, 0.3, 0.8));
-                        draw_line(mx, 0.0, mx, sh, 1.0, Color::new(1.0, 0.8, 0.3, 0.8));
-                    }
-
-                    let f2 = current_hz;
-                    let raw_semitones = 12.0 * (f2 / f1).log2();
-                    let diff_hz = (f2 - f1).abs();
-                    let sign_str = if raw_semitones >= 0.0 { "+" } else { "" };
-                    
-                    let interval_name = get_interval_name(raw_semitones);
-                    let drag_tooltip = format!("{}{:.2} st ({}) | {}{:.1} Hz", sign_str, raw_semitones, interval_name, sign_str, diff_hz);
-                    let drag_text_size = measure_text(&drag_tooltip, None, 20, 1.0);
-                    
-                    let mut d_tooltip_x = mx + 15.0;
-                    let mut d_tooltip_y = my - 25.0;
-                    if d_tooltip_x + drag_text_size.width + 10.0 > sw { d_tooltip_x = mx - drag_text_size.width - 15.0; }
-                    if d_tooltip_y - 20.0 < 0.0 { d_tooltip_y = my + 45.0; }
-
-                    draw_rectangle(d_tooltip_x, d_tooltip_y - 10.0, drag_text_size.width + 10.0, 25.0, Color::new(0.3, 0.1, 0.0, 0.6));
-                    draw_text(&drag_tooltip, d_tooltip_x + 5.0, d_tooltip_y + 8.0, 20.0, Color::new(1.0, 0.9, 0.5, 1.0));
-                }
-
-                let tooltip_text = format!("-{:.2}s | {:.1} Hz | {} | {:.1} dB", time_ago, current_hz, note_name, db);
-                let text_size = measure_text(&tooltip_text, None, 20, 1.0);
-                
-                let mut tooltip_x = mx + 15.0;
-                let mut tooltip_y = my + 15.0;
-                if tooltip_x + text_size.width + 10.0 > sw { tooltip_x = mx - text_size.width - 15.0; }
-                if tooltip_y + 25.0 > sh { tooltip_y = my - 25.0; }
-
-                draw_rectangle(tooltip_x, tooltip_y - 20.0, text_size.width + 10.0, 25.0, Color::new(0.0, 0.0, 0.0, 0.8));
-                draw_text(&tooltip_text, tooltip_x + 5.0, tooltip_y - 2.0, 20.0, WHITE);
-            }
-        }
-
-        // --- Native Macroquad Advanced UI Overlay ---
-        if DRAW_UI && show_advanced_ui {
-            draw_rectangle(menu_x, menu_y, menu_w, menu_h, Color::new(0.0, 0.0, 0.0, 0.85));
-            draw_rectangle_lines(menu_x, menu_y, menu_w, menu_h, 2.0, Color::new(0.3, 0.3, 0.3, 1.0));
-            
-            draw_text("DSP Engine Tweaks", menu_x + 15.0, menu_y + 30.0, 24.0, WHITE);
-            
-            let mut cy = menu_y + 60.0;
-            let mut id = 0;
-            
-            draw_text("Signal Pipeline", menu_x + 15.0, cy, 18.0, ORANGE); cy += 25.0;
-            draw_slider("Pink Noise Tilt (dB/Oct)", &mut local_settings.dsp_config.pink_noise_tilt, -6.0, 6.0, menu_x + 15.0, cy, 180.0, (mx, my), m_down, m_pressed, &mut active_slider, id); id += 1; cy += 35.0;
-            draw_checkbox("PSD Normalization", &mut local_settings.dsp_config.psd_normalization, menu_x + 15.0, cy, (mx, my), m_pressed); cy += 30.0;
-            draw_slider("Density Dampening", &mut local_settings.dsp_config.peak_density_dampening, 0.0, 2.0, menu_x + 15.0, cy, 180.0, (mx, my), m_down, m_pressed, &mut active_slider, id); id += 1; cy += 45.0;
-
-            draw_text("Dynamics & Decay", menu_x + 15.0, cy, 18.0, ORANGE); cy += 25.0;
-            draw_slider("Peak Weight", &mut local_settings.dsp_config.peak_weight, 0.0, 1.0, menu_x + 15.0, cy, 180.0, (mx, my), m_down, m_pressed, &mut active_slider, id); id += 1; cy += 35.0;
-            draw_slider("RMS Weight", &mut local_settings.dsp_config.rms_weight, 0.0, 1.0, menu_x + 15.0, cy, 180.0, (mx, my), m_down, m_pressed, &mut active_slider, id); id += 1; cy += 35.0;
-            draw_slider("Phosphor Decay (Bass)", &mut local_settings.dsp_config.decay_low, 0.0, 0.1, menu_x + 15.0, cy, 180.0, (mx, my), m_down, m_pressed, &mut active_slider, id); id += 1; cy += 35.0;
-            draw_slider("Phosphor Decay (Treble)", &mut local_settings.dsp_config.decay_high, 0.0, 0.1, menu_x + 15.0, cy, 180.0, (mx, my), m_down, m_pressed, &mut active_slider, id); id += 1; cy += 45.0;
-
-            draw_text("CQT Kernel Splatting", menu_x + 15.0, cy, 18.0, ORANGE); cy += 25.0;
-            draw_slider("Splat Spread (Bass)", &mut local_settings.dsp_config.splat_low, 0.0, 10.0, menu_x + 15.0, cy, 180.0, (mx, my), m_down, m_pressed, &mut active_slider, id); id += 1; cy += 35.0;
-            draw_slider("Splat Spread (Treble)", &mut local_settings.dsp_config.splat_high, 0.0, 5.0, menu_x + 15.0, cy, 180.0, (mx, my), m_down, m_pressed, &mut active_slider, id); id += 1; cy += 35.0;
-            draw_slider("Halo Raw Blend", &mut local_settings.dsp_config.halo_raw, 0.0, 10.0, menu_x + 15.0, cy, 180.0, (mx, my), m_down, m_pressed, &mut active_slider, id); id += 1; cy += 35.0;
-            draw_slider("Halo Sharp Blend", &mut local_settings.dsp_config.halo_sharp, 0.0, 10.0, menu_x + 15.0, cy, 180.0, (mx, my), m_down, m_pressed, &mut active_slider, id); id += 1; cy += 45.0;
-
-            draw_text("Makeup Gains", menu_x + 15.0, cy, 18.0, ORANGE); cy += 25.0;
-            draw_slider("STFT Boost Gain", &mut local_settings.dsp_config.stft_boost, 1.0, 20.0, menu_x + 15.0, cy, 180.0, (mx, my), m_down, m_pressed, &mut active_slider, id); id += 1; cy += 35.0;
-            draw_slider("IIR Boost Gain", &mut local_settings.dsp_config.iir_boost, 1.0, 20.0, menu_x + 15.0, cy, 180.0, (mx, my), m_down, m_pressed, &mut active_slider, id); 
-        }
-
-        // --- 3. BROADCAST LOCAL CHANGES VIA UDP ---
-        // Exclude redraw_flag from equality check so we don't trigger infinite loops
-        let mut diff = local_settings;
-        diff.redraw_flag = false;
-        let mut last_diff = last_broadcast_settings;
-        last_diff.redraw_flag = false;
-
-        if diff != last_diff {
-            last_broadcast_settings = local_settings;
-            if let Ok(mut s) = shared_settings.lock() {
-                *s = local_settings;
-            }
-
-            // Sync with all background threads out in the wild!
-            if let Some(ref sock) = udp_sender {
-                let bytes = to_bytes(&local_settings);
-                for p in 44101..=44110 {
-                    if p != bind_port {
-                        let _ = sock.send_to(bytes, format!("127.0.0.1:{}", p));
-                    }
-                }
-            }
-        }
-
-        next_frame().await
-    }
-}
-
-// --- Custom Macroquad UI Components ---
-
-fn draw_slider(
-    label: &str,
-    val: &mut f32,
-    min: f32,
-    max: f32,
-    x: f32,
-    y: f32,
-    w: f32,
-    mouse_pos: (f32, f32),
-    mouse_down: bool,
-    mouse_pressed: bool,
-    active_id: &mut Option<usize>,
-    my_id: usize,
-) -> bool {
-    let mut changed = false;
-    draw_text(label, x, y - 4.0, 16.0, WHITE);
-    
-    let is_hovered = mouse_pos.0 >= x && mouse_pos.0 <= x + w + 30.0 && mouse_pos.1 >= y - 10.0 && mouse_pos.1 <= y + 20.0;
-
-    if mouse_pressed && is_hovered {
-        *active_id = Some(my_id);
-    }
-
-    if mouse_down && *active_id == Some(my_id) {
-        let norm = ((mouse_pos.0 - x) / w).clamp(0.0, 1.0);
-        let new_val = min + norm * (max - min);
-        if (*val - new_val).abs() > f32::EPSILON {
-            *val = new_val;
-            changed = true;
-        }
-    }
-
-    if !mouse_down && *active_id == Some(my_id) {
-        *active_id = None;
-    }
-
-    draw_line(x, y + 10.0, x + w, y + 10.0, 4.0, GRAY);
-    
-    let norm = (*val - min) / (max - min);
-    let hx = x + norm * w;
-    let color = if *active_id == Some(my_id) { YELLOW } else if is_hovered { LIGHTGRAY } else { WHITE };
-    draw_circle(hx, y + 10.0, 6.0, color);
-    
-    let val_str = format!("{:.2}", val);
-    draw_text(&val_str, x + w + 10.0, y + 14.0, 16.0, color);
-
-    changed
-}
-
-fn draw_checkbox(
-    label: &str,
-    val: &mut bool,
-    x: f32,
-    y: f32,
-    mouse_pos: (f32, f32),
-    mouse_pressed: bool,
-) -> bool {
-    let mut changed = false;
-    let box_size = 14.0;
-    
-    let is_hovered = mouse_pos.0 >= x && mouse_pos.0 <= x + 200.0 && mouse_pos.1 >= y - box_size && mouse_pos.1 <= y + 5.0;
-
-    if mouse_pressed && is_hovered {
-        *val = !*val;
-        changed = true;
-    }
-
-    let color = if is_hovered { YELLOW } else { WHITE };
-
-    draw_rectangle_lines(x, y - box_size + 2.0, box_size, box_size, 2.0, color);
-    if *val {
-        draw_rectangle(x + 3.0, y - box_size + 5.0, box_size - 6.0, box_size - 6.0, color);
-    }
-    draw_text(label, x + box_size + 10.0, y, 16.0, color);
-
-    changed
-}
-
-#[inline(always)]
-fn compute_column_colors(
-    col_buffer: &mut [u8], 
-    data: &[f32], 
-    freq_bins: usize, 
-    tilt_curve: &[f32],
-    lut: &IntensityLut,
-) {
-    for i in 0..freq_bins {
-        let y = (freq_bins - 1) - i; 
-        let magnitude = data[i] * tilt_curve[i]; 
-        let val = lut.get(magnitude);
-
-        let idx = y * 4;
-        col_buffer[idx] = val;     // R
-        col_buffer[idx+1] = val;   // G
-        col_buffer[idx+2] = val;   // B
-        col_buffer[idx+3] = 255;   // A
-    }
-}
-
-#[inline(always)]
-fn paint_column_fast(
-    pixels: &mut [u8], 
-    col_idx: usize, 
-    data: &[f32], 
-    freq_bins: usize, 
-    tilt_curve: &[f32],
-    lut: &IntensityLut,
-) {
-    let x_offset = col_idx * 4;
-    for i in 0..freq_bins {
-        let y = (freq_bins - 1) - i; 
-        let magnitude = data[i] * tilt_curve[i];
-        let val = lut.get(magnitude);
-
-        let idx = (y * MAX_HISTORY * 4) + x_offset;
-        pixels[idx] = val;     // R
-        pixels[idx+1] = val;   // G
-        pixels[idx+2] = val;   // B
-        pixels[idx+3] = 255;   // A
-    }
-}
+// ----------------------------------------------------
+// UI Logic Additions
+// ----------------------------------------------------
 
 fn hz_to_pitch(hz: f32) -> (String, f32) {
     if hz < 16.35 { return ("-".to_string(), 0.0); } 
@@ -1974,111 +163,34 @@ fn hz_to_pitch(hz: f32) -> (String, f32) {
 fn get_interval_name(semitones: f32) -> String {
     let st = semitones.abs().round() as usize;
     match st {
-        0 => "Unison".to_string(),
-        1 => "Minor 2nd".to_string(),
-        2 => "Major 2nd".to_string(),
-        3 => "Minor 3rd".to_string(),
-        4 => "Major 3rd".to_string(),
-        5 => "Perfect 4th".to_string(),
-        6 => "Tritone".to_string(),
-        7 => "Perfect 5th".to_string(),
-        8 => "Minor 6th".to_string(),
-        9 => "Major 6th".to_string(),
-        10 => "Minor 7th".to_string(),
-        11 => "Major 7th".to_string(),
+        0 => "Unison".to_string(), 1 => "Minor 2nd".to_string(), 2 => "Major 2nd".to_string(),
+        3 => "Minor 3rd".to_string(), 4 => "Major 3rd".to_string(), 5 => "Perfect 4th".to_string(),
+        6 => "Tritone".to_string(), 7 => "Perfect 5th".to_string(), 8 => "Minor 6th".to_string(),
+        9 => "Major 6th".to_string(), 10 => "Minor 7th".to_string(), 11 => "Major 7th".to_string(),
         12 => "Octave".to_string(),
-        13 => "Minor 9th".to_string(),
-        14 => "Major 9th".to_string(),
-        15 => "Minor 10th".to_string(),
-        16 => "Major 10th".to_string(),
-        17 => "Perfect 11th".to_string(),
-        18 => "Augmented 11th".to_string(),
-        19 => "Perfect 12th".to_string(),
-        20 => "Minor 13th".to_string(),
-        21 => "Major 13th".to_string(),
-        22 => "Minor 14th".to_string(),
-        23 => "Major 14th".to_string(),
-        24 => "2 Octaves".to_string(),
         _ => {
             let octaves = st / 12;
             let remainder = st % 12;
-            if remainder == 0 {
-                format!("{} Octaves", octaves)
-            } else {
-                let base_name = match remainder {
-                    1 => "Minor 2nd",
-                    2 => "Major 2nd",
-                    3 => "Minor 3rd",
-                    4 => "Major 3rd",
-                    5 => "Perfect 4th",
-                    6 => "Tritone",
-                    7 => "Perfect 5th",
-                    8 => "Minor 6th",
-                    9 => "Major 6th",
-                    10 => "Minor 7th",
-                    11 => "Major 7th",
-                    _ => "",
-                };
-                format!("{} Octaves + {}", octaves, base_name)
-            }
+            if remainder == 0 { format!("{} Octaves", octaves) } else { format!("{} Octaves +", octaves) }
         }
     }
 }
 
-fn cycle_scale(s: ScaleType) -> ScaleType {
-    match s {
-        ScaleType::Linear => ScaleType::Mel,
-        ScaleType::Mel => ScaleType::Bark,
-        ScaleType::Bark => ScaleType::Logarithmic,
-        ScaleType::Logarithmic => ScaleType::Linear,
-    }
-}
-
-fn cycle_colormap(c: ColorMapType) -> ColorMapType {
-    match c {
-        ColorMapType::Magma => ColorMapType::Inferno,
-        ColorMapType::Inferno => ColorMapType::Viridis,
-        ColorMapType::Viridis => ColorMapType::Plasma,
-        ColorMapType::Plasma => ColorMapType::Turbo,
-        ColorMapType::Turbo => ColorMapType::Cubehelix,
-        ColorMapType::Cubehelix => ColorMapType::Cividis,
-        ColorMapType::Cividis => ColorMapType::Warm,
-        ColorMapType::Warm => ColorMapType::Cool,
-        ColorMapType::Cool => ColorMapType::Sinebow,
-        ColorMapType::Sinebow => ColorMapType::Greys,
-        ColorMapType::Greys => ColorMapType::InvertedGreys,
-        ColorMapType::InvertedGreys => ColorMapType::InvertedMagma,
-        ColorMapType::InvertedMagma => ColorMapType::Magma,
-    }
-}
-
-fn cycle_direction(d: ScrollDirection) -> ScrollDirection {
-    match d {
-        ScrollDirection::RTL => ScrollDirection::LTR,
-        ScrollDirection::LTR => ScrollDirection::DTU,
-        ScrollDirection::DTU => ScrollDirection::UTD,
-        ScrollDirection::UTD => ScrollDirection::RTL,
-    }
-}
-
-fn freq_to_screen_pos(freq: f32, scale: ScaleType) -> f32 {
-    let max_freq = MAX_DISPLAY_FREQ;
+fn freq_to_norm_pos(freq: f32, scale: audio::ScaleType) -> f32 {
+    let max_freq = audio::MAX_DISPLAY_FREQ;
     match scale {
-        ScaleType::Linear => freq / max_freq,
-        ScaleType::Mel => {
+        audio::ScaleType::Linear => freq / max_freq,
+        audio::ScaleType::Mel => {
             let mel_val = 2595.0 * (1.0 + freq / 700.0).log10();
             let mel_max = 2595.0 * (1.0 + max_freq / 700.0).log10();
             mel_val / mel_max
         },
-        ScaleType::Logarithmic => {
+        audio::ScaleType::Logarithmic => {
             let min_freq = 20.0f32;
-            if freq <= min_freq { return -1.0; } // Ensure off-screen handling
-            let log_f = freq.log2();
-            let log_min = min_freq.log2();
-            let log_max = max_freq.log2();
-            (log_f - log_min) / (log_max - log_min)
+            if freq <= min_freq { return -1.0; }
+            (freq.log2() - min_freq.log2()) / (max_freq.log2() - min_freq.log2())
         },
-        ScaleType::Bark => {
+        audio::ScaleType::Bark => {
             let bark_val = 6.0 * (freq / 600.0).asinh();
             let bark_max = 6.0 * (max_freq / 600.0).asinh();
             bark_val / bark_max
@@ -2086,152 +198,695 @@ fn freq_to_screen_pos(freq: f32, scale: ScaleType) -> f32 {
     }
 }
 
-fn draw_note_ruler(scale: ScaleType, dir: ScrollDirection) {
-    let w = screen_width();
-    let h = screen_height();
-
+fn draw_note_ruler(ui: &egui::Ui, rect: egui::Rect, scale: audio::ScaleType, dir: audio::ScrollDirection) {
+    let max_freq = audio::MAX_DISPLAY_FREQ;
+    let painter = ui.painter();
+    
     for midi in 21..109 {
         let freq = 440.0 * 2.0f32.powf((midi as f32 - 69.0) / 12.0);
-        if freq > MAX_DISPLAY_FREQ { break; }
-        let norm_pos = freq_to_screen_pos(freq, scale);
-        if norm_pos < 0.0 || norm_pos > 1.0 { continue; } 
+        if freq > max_freq { break; }
+        
+        let norm_pos = freq_to_norm_pos(freq, scale);
+        if norm_pos < 0.0 || norm_pos > 1.0 { continue; }
         
         let note_mod = midi % 12;
         let is_c = note_mod == 0;
-
-        let (x, y) = match dir {
-            ScrollDirection::RTL => (w, h * (1.0 - norm_pos)),
-            ScrollDirection::LTR => (0.0, h * (1.0 - norm_pos)),
-            ScrollDirection::UTD => (w * norm_pos, 0.0),
-            ScrollDirection::DTU => (w * norm_pos, h),
-        };
-
-        // Determine what text label to draw based on the note and current scale
+        let tick_len = if is_c { 15.0 } else { 5.0 };
+        
         let label = if is_c {
-            let octave = (midi / 12) - 1;
-            Some(format!("C{}", octave))
-        } else if scale == ScaleType::Logarithmic {
+            Some(format!("C{}", (midi / 12) - 1))
+        } else if scale == audio::ScaleType::Logarithmic {
             match note_mod {
-                1 | 3 | 6 | 8 | 10 => Some("#".to_string()),
-                2 => Some("D".to_string()),
-                4 => Some("E".to_string()),
-                5 => Some("F".to_string()),
-                7 => Some("G".to_string()),
-                9 => Some("A".to_string()),
-                11 => Some("B".to_string()),
+                1|3|6|8|10 => Some("#".to_string()),
+                2 => Some("D".to_string()), 4 => Some("E".to_string()),
+                5 => Some("F".to_string()), 7 => Some("G".to_string()),
+                9 => Some("A".to_string()), 11 => Some("B".to_string()),
                 _ => None,
             }
-        } else {
-            None
+        } else { None };
+
+        let color = egui::Color32::from_white_alpha(180);
+
+        match dir {
+            audio::ScrollDirection::RTL | audio::ScrollDirection::LTR => {
+                let y = rect.max.y - norm_pos * rect.height();
+                let (start_x, end_x, align) = if dir == audio::ScrollDirection::RTL {
+                    (rect.max.x - tick_len, rect.max.x, egui::Align2::RIGHT_CENTER)
+                } else {
+                    (rect.min.x, rect.min.x + tick_len, egui::Align2::LEFT_CENTER)
+                };
+                
+                painter.line_segment([egui::pos2(start_x, y), egui::pos2(end_x, y)], egui::Stroke::new(1.0, color));
+                if let Some(text) = label {
+                    let text_x = if dir == audio::ScrollDirection::RTL { start_x - 5.0 } else { end_x + 5.0 };
+                    painter.text(egui::pos2(text_x, y), align, text, egui::FontId::proportional(11.0), color);
+                }
+            },
+            audio::ScrollDirection::DTU | audio::ScrollDirection::UTD => {
+                let x = rect.min.x + norm_pos * rect.width();
+                let (start_y, end_y, align) = if dir == audio::ScrollDirection::DTU {
+                    (rect.max.y - tick_len, rect.max.y, egui::Align2::CENTER_BOTTOM)
+                } else {
+                    (rect.min.y, rect.min.y + tick_len, egui::Align2::CENTER_TOP)
+                };
+
+                painter.line_segment([egui::pos2(x, start_y), egui::pos2(x, end_y)], egui::Stroke::new(1.0, color));
+                if let Some(text) = label {
+                    let text_y = if dir == audio::ScrollDirection::DTU { start_y - 5.0 } else { end_y + 5.0 };
+                    painter.text(egui::pos2(x, text_y), align, text, egui::FontId::proportional(11.0), color);
+                }
+            }
+        }
+    }
+}
+
+// ----------------------------------------------------
+// Custom WGPU Resource Holder
+// ----------------------------------------------------
+
+struct CustomWgpuState {
+    pipeline: eframe::wgpu::RenderPipeline,
+    bind_group: eframe::wgpu::BindGroup,
+    uniform_buf: eframe::wgpu::Buffer,
+    ring_tex: eframe::wgpu::Texture,
+    colormap_tex: eframe::wgpu::Texture,
+    ymap_tex: eframe::wgpu::Texture,
+    mask_tex: eframe::wgpu::Texture, // The 1D Sparsity Mask!
+    current_freq_bins: usize,
+}
+
+impl CustomWgpuState {
+    fn new(cc: &eframe::CreationContext<'_>, freq_bins: usize) -> Self {
+        let wgpu_state = cc.wgpu_render_state.as_ref().unwrap();
+        let device = &wgpu_state.device;
+        let queue = &wgpu_state.queue;
+
+        let uniforms = ShaderUniforms { scroll_offset: 0.0, view_width_norm: 1.0, direction: 0, _padding: 0 };
+        let uniforms_bytes: &[u8] = unsafe { std::slice::from_raw_parts((&uniforms as *const ShaderUniforms) as *const u8, std::mem::size_of::<ShaderUniforms>()) };
+
+        let uniform_buf = device.create_buffer_init(&eframe::wgpu::util::BufferInitDescriptor {
+            label: Some("Uniform Buffer"), contents: uniforms_bytes, usage: eframe::wgpu::BufferUsages::UNIFORM | eframe::wgpu::BufferUsages::COPY_DST,
+        });
+
+        let ring_tex = device.create_texture(&eframe::wgpu::TextureDescriptor {
+            label: Some("Ring Buffer"),
+            size: eframe::wgpu::Extent3d { width: audio::MAX_HISTORY as u32, height: freq_bins as u32, depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1, dimension: eframe::wgpu::TextureDimension::D2,
+            format: eframe::wgpu::TextureFormat::R8Unorm,
+            usage: eframe::wgpu::TextureUsages::TEXTURE_BINDING | eframe::wgpu::TextureUsages::COPY_DST, view_formats: &[],
+        });
+        
+        let mask_tex = device.create_texture(&eframe::wgpu::TextureDescriptor {
+            label: Some("Mask Buffer"),
+            size: eframe::wgpu::Extent3d { width: audio::MAX_HISTORY as u32, height: 1, depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1, dimension: eframe::wgpu::TextureDimension::D2,
+            format: eframe::wgpu::TextureFormat::R8Unorm,
+            usage: eframe::wgpu::TextureUsages::TEXTURE_BINDING | eframe::wgpu::TextureUsages::COPY_DST, view_formats: &[],
+        });
+
+        let ring_sampler = device.create_sampler(&eframe::wgpu::SamplerDescriptor {
+            address_mode_u: eframe::wgpu::AddressMode::Repeat, address_mode_v: eframe::wgpu::AddressMode::ClampToEdge,
+            mag_filter: eframe::wgpu::FilterMode::Linear, min_filter: eframe::wgpu::FilterMode::Linear, ..Default::default()
+        });
+
+        let colormap_tex = device.create_texture(&eframe::wgpu::TextureDescriptor {
+            label: Some("Colormap"), size: eframe::wgpu::Extent3d { width: 256, height: 1, depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1, dimension: eframe::wgpu::TextureDimension::D2,
+            format: eframe::wgpu::TextureFormat::Rgba8Unorm, usage: eframe::wgpu::TextureUsages::TEXTURE_BINDING | eframe::wgpu::TextureUsages::COPY_DST, view_formats: &[],
+        });
+        let ymap_tex = device.create_texture(&eframe::wgpu::TextureDescriptor {
+            label: Some("YMap"), size: eframe::wgpu::Extent3d { width: 1024, height: 1, depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1, dimension: eframe::wgpu::TextureDimension::D2,
+            format: eframe::wgpu::TextureFormat::Rgba8Unorm, usage: eframe::wgpu::TextureUsages::TEXTURE_BINDING | eframe::wgpu::TextureUsages::COPY_DST, view_formats: &[],
+        });
+        
+        let map_sampler = device.create_sampler(&eframe::wgpu::SamplerDescriptor { mag_filter: eframe::wgpu::FilterMode::Linear, min_filter: eframe::wgpu::FilterMode::Linear, ..Default::default() });
+
+        queue.write_texture(
+            eframe::wgpu::TexelCopyTextureInfo { texture: &colormap_tex, mip_level: 0, origin: eframe::wgpu::Origin3d::ZERO, aspect: eframe::wgpu::TextureAspect::All },
+            &generate_colormap_bytes(audio::ColorMapType::Magma),
+            eframe::wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(256 * 4), rows_per_image: None },
+            eframe::wgpu::Extent3d { width: 256, height: 1, depth_or_array_layers: 1 }
+        );
+
+        queue.write_texture(
+            eframe::wgpu::TexelCopyTextureInfo { texture: &ymap_tex, mip_level: 0, origin: eframe::wgpu::Origin3d::ZERO, aspect: eframe::wgpu::TextureAspect::All },
+            &generate_y_mapping_bytes(audio::ScaleType::Logarithmic, true, audio::MAX_DISPLAY_FREQ, audio::SAMPLE_RATE as f32 / 2.0),
+            eframe::wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(1024 * 4), rows_per_image: None },
+            eframe::wgpu::Extent3d { width: 1024, height: 1, depth_or_array_layers: 1 }
+        );
+
+        let shader = device.create_shader_module(eframe::wgpu::ShaderModuleDescriptor {
+            label: Some("Spector WGSL"), source: eframe::wgpu::ShaderSource::Wgsl(SHADER_WGSL.into()),
+        });
+
+        let bind_group_layout = device.create_bind_group_layout(&eframe::wgpu::BindGroupLayoutDescriptor {
+            label: Some("BG Layout"),
+            entries: &[
+                eframe::wgpu::BindGroupLayoutEntry { binding: 0, visibility: eframe::wgpu::ShaderStages::FRAGMENT, ty: eframe::wgpu::BindingType::Texture { sample_type: eframe::wgpu::TextureSampleType::Float { filterable: true }, view_dimension: eframe::wgpu::TextureViewDimension::D2, multisampled: false }, count: None },
+                eframe::wgpu::BindGroupLayoutEntry { binding: 1, visibility: eframe::wgpu::ShaderStages::FRAGMENT, ty: eframe::wgpu::BindingType::Sampler(eframe::wgpu::SamplerBindingType::Filtering), count: None },
+                eframe::wgpu::BindGroupLayoutEntry { binding: 2, visibility: eframe::wgpu::ShaderStages::FRAGMENT, ty: eframe::wgpu::BindingType::Texture { sample_type: eframe::wgpu::TextureSampleType::Float { filterable: true }, view_dimension: eframe::wgpu::TextureViewDimension::D2, multisampled: false }, count: None },
+                eframe::wgpu::BindGroupLayoutEntry { binding: 3, visibility: eframe::wgpu::ShaderStages::FRAGMENT, ty: eframe::wgpu::BindingType::Sampler(eframe::wgpu::SamplerBindingType::Filtering), count: None },
+                eframe::wgpu::BindGroupLayoutEntry { binding: 4, visibility: eframe::wgpu::ShaderStages::FRAGMENT, ty: eframe::wgpu::BindingType::Texture { sample_type: eframe::wgpu::TextureSampleType::Float { filterable: true }, view_dimension: eframe::wgpu::TextureViewDimension::D2, multisampled: false }, count: None },
+                eframe::wgpu::BindGroupLayoutEntry { binding: 5, visibility: eframe::wgpu::ShaderStages::FRAGMENT, ty: eframe::wgpu::BindingType::Sampler(eframe::wgpu::SamplerBindingType::Filtering), count: None },
+                eframe::wgpu::BindGroupLayoutEntry { binding: 6, visibility: eframe::wgpu::ShaderStages::FRAGMENT, ty: eframe::wgpu::BindingType::Texture { sample_type: eframe::wgpu::TextureSampleType::Float { filterable: true }, view_dimension: eframe::wgpu::TextureViewDimension::D2, multisampled: false }, count: None },
+                eframe::wgpu::BindGroupLayoutEntry { binding: 7, visibility: eframe::wgpu::ShaderStages::FRAGMENT, ty: eframe::wgpu::BindingType::Buffer { ty: eframe::wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None },
+            ],
+        });
+
+        let bind_group = device.create_bind_group(&eframe::wgpu::BindGroupDescriptor {
+            label: Some("Bind Group"), layout: &bind_group_layout,
+            entries: &[
+                eframe::wgpu::BindGroupEntry { binding: 0, resource: eframe::wgpu::BindingResource::TextureView(&ring_tex.create_view(&eframe::wgpu::TextureViewDescriptor::default())) },
+                eframe::wgpu::BindGroupEntry { binding: 1, resource: eframe::wgpu::BindingResource::Sampler(&ring_sampler) },
+                eframe::wgpu::BindGroupEntry { binding: 2, resource: eframe::wgpu::BindingResource::TextureView(&colormap_tex.create_view(&eframe::wgpu::TextureViewDescriptor::default())) },
+                eframe::wgpu::BindGroupEntry { binding: 3, resource: eframe::wgpu::BindingResource::Sampler(&map_sampler) },
+                eframe::wgpu::BindGroupEntry { binding: 4, resource: eframe::wgpu::BindingResource::TextureView(&ymap_tex.create_view(&eframe::wgpu::TextureViewDescriptor::default())) },
+                eframe::wgpu::BindGroupEntry { binding: 5, resource: eframe::wgpu::BindingResource::Sampler(&map_sampler) },
+                eframe::wgpu::BindGroupEntry { binding: 6, resource: eframe::wgpu::BindingResource::TextureView(&mask_tex.create_view(&eframe::wgpu::TextureViewDescriptor::default())) },
+                eframe::wgpu::BindGroupEntry { binding: 7, resource: uniform_buf.as_entire_binding() },
+            ],
+        });
+
+        let pipeline_layout = device.create_pipeline_layout(&eframe::wgpu::PipelineLayoutDescriptor {
+            label: Some("Pipeline Layout"), bind_group_layouts: &[Some(&bind_group_layout)], immediate_size: 0,
+        });
+
+        let pipeline = device.create_render_pipeline(&eframe::wgpu::RenderPipelineDescriptor {
+            label: Some("Spector Pipeline"), layout: Some(&pipeline_layout),
+            vertex: eframe::wgpu::VertexState { 
+                module: &shader, entry_point: Some("vs_main"), buffers: &[], compilation_options: eframe::wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(eframe::wgpu::FragmentState {
+                module: &shader, entry_point: Some("fs_main"),
+                targets: &[Some(eframe::wgpu::ColorTargetState {
+                    format: wgpu_state.target_format, blend: Some(eframe::wgpu::BlendState::REPLACE), write_mask: eframe::wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: eframe::wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: eframe::wgpu::PrimitiveState::default(), depth_stencil: None, multisample: eframe::wgpu::MultisampleState::default(),
+            multiview_mask: None, cache: None,
+        });
+
+        Self { pipeline, bind_group, uniform_buf, ring_tex, colormap_tex, ymap_tex, mask_tex, current_freq_bins: freq_bins }
+    }
+}
+
+struct SpectorRenderCallback;
+
+impl eframe::egui_wgpu::CallbackTrait for SpectorRenderCallback {
+    fn prepare(
+        &self, _device: &eframe::wgpu::Device, _queue: &eframe::wgpu::Queue, _screen_descriptor: &eframe::egui_wgpu::ScreenDescriptor,
+        _egui_encoder: &mut eframe::wgpu::CommandEncoder, _callback_resources: &mut eframe::egui_wgpu::CallbackResources,
+    ) -> Vec<eframe::wgpu::CommandBuffer> { Vec::new() }
+
+    fn paint(
+        &self,
+        _info: eframe::egui::PaintCallbackInfo,
+        render_pass: &mut eframe::wgpu::RenderPass<'static>,
+        callback_resources: &eframe::egui_wgpu::CallbackResources,
+    ) {
+        let state = callback_resources.get::<CustomWgpuState>().unwrap();
+        render_pass.set_pipeline(&state.pipeline);
+        render_pass.set_bind_group(0, &state.bind_group, &[]);
+        render_pass.draw(0..3, 0..1);
+    }
+}
+
+// ----------------------------------------------------
+// Main App Structure
+// ----------------------------------------------------
+
+struct SpectorApp {
+    settings: Arc<Mutex<audio::AppSettings>>,
+    layers: Arc<Mutex<Vec<audio::SpectrogramLayer>>>,
+    
+    smooth_head_pos: f64,
+    last_uploaded_updates: u64,
+    last_uploaded_head: usize,
+    
+    current_colormap: audio::ColorMapType,
+    current_scale: audio::ScaleType,
+    current_is_cqt: bool,
+    
+    show_menu: bool,
+    drag_start_freq: Option<f32>,
+}
+
+impl eframe::App for SpectorApp {
+    #[allow(deprecated)]
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        
+        ctx.input(|i| {
+            if i.key_pressed(egui::Key::T) { self.show_menu = !self.show_menu; }
+            if let Ok(mut s) = self.settings.lock() {
+                if i.key_pressed(egui::Key::S) { s.scale_type = s.scale_type.cycle(); }
+                if i.key_pressed(egui::Key::C) { s.colormap = s.colormap.cycle(); }
+                if i.key_pressed(egui::Key::F) { s.dir = s.dir.cycle(); }
+                if i.key_pressed(egui::Key::R) { s.fft_idx = (s.fft_idx + 1) % (audio::RESOLUTIONS.len() as u32 + 1); }
+                if i.key_pressed(egui::Key::I) { s.iir_enabled = !s.iir_enabled; }
+                if i.key_pressed(egui::Key::A) { s.audio_source = s.audio_source.toggle(); }
+                if i.key_pressed(egui::Key::W) { 
+                    s.view_len = if s.view_len == audio::MAX_VIEW_LEN as u32 { (audio::MAX_VIEW_LEN / 2) as u32 } else { audio::MAX_VIEW_LEN as u32 };
+                }
+            }
+        });
+
+        let mut actual_fft_idx = 0;
+        let mut target_updates = 0;
+        let mut freq_bins = 0;
+        let mut local_settings = audio::AppSettings::default();
+        
+        if let Ok(s) = self.settings.lock() {
+            local_settings = *s;
+            actual_fft_idx = if s.fft_idx as usize == audio::RESOLUTIONS.len() {
+                if s.iir_enabled { audio::RESOLUTIONS.len() + 1 } else { audio::RESOLUTIONS.len() }
+            } else {
+                s.fft_idx as usize
+            };
+        }
+
+        // --- 1. MEMORY DELTA BATCHING (NOW WITH THE SPARSITY MASK!) ---
+        if let Ok(layers) = self.layers.lock() {
+            let layer = &layers[actual_fft_idx];
+            target_updates = layer.total_updates;
+            freq_bins = layer.freq_bins;
+
+            if target_updates > self.last_uploaded_updates {
+                let target_head = layer.head; 
+                let wgpu_state = frame.wgpu_render_state().unwrap();
+                let mut custom_state = wgpu_state.renderer.write();
+                let state = custom_state.callback_resources.get_mut::<CustomWgpuState>().unwrap();
+
+                if freq_bins != state.current_freq_bins {
+                    let ring_tex = wgpu_state.device.create_texture(&eframe::wgpu::TextureDescriptor {
+                        label: Some("Ring Buffer"),
+                        size: eframe::wgpu::Extent3d { width: audio::MAX_HISTORY as u32, height: freq_bins as u32, depth_or_array_layers: 1 },
+                        mip_level_count: 1, sample_count: 1, dimension: eframe::wgpu::TextureDimension::D2,
+                        format: eframe::wgpu::TextureFormat::R8Unorm,
+                        usage: eframe::wgpu::TextureUsages::TEXTURE_BINDING | eframe::wgpu::TextureUsages::COPY_DST, view_formats: &[],
+                    });
+                    
+                    let bind_group_layout = state.pipeline.get_bind_group_layout(0);
+                    let ring_sampler = wgpu_state.device.create_sampler(&eframe::wgpu::SamplerDescriptor {
+                        address_mode_u: eframe::wgpu::AddressMode::Repeat, address_mode_v: eframe::wgpu::AddressMode::ClampToEdge,
+                        mag_filter: eframe::wgpu::FilterMode::Linear, min_filter: eframe::wgpu::FilterMode::Linear, ..Default::default()
+                    });
+                    let map_sampler = wgpu_state.device.create_sampler(&eframe::wgpu::SamplerDescriptor { mag_filter: eframe::wgpu::FilterMode::Linear, min_filter: eframe::wgpu::FilterMode::Linear, ..Default::default() });
+
+                    state.bind_group = wgpu_state.device.create_bind_group(&eframe::wgpu::BindGroupDescriptor {
+                        label: Some("Bind Group"), layout: &bind_group_layout,
+                        entries: &[
+                            eframe::wgpu::BindGroupEntry { binding: 0, resource: eframe::wgpu::BindingResource::TextureView(&ring_tex.create_view(&eframe::wgpu::TextureViewDescriptor::default())) },
+                            eframe::wgpu::BindGroupEntry { binding: 1, resource: eframe::wgpu::BindingResource::Sampler(&ring_sampler) },
+                            eframe::wgpu::BindGroupEntry { binding: 2, resource: eframe::wgpu::BindingResource::TextureView(&state.colormap_tex.create_view(&eframe::wgpu::TextureViewDescriptor::default())) },
+                            eframe::wgpu::BindGroupEntry { binding: 3, resource: eframe::wgpu::BindingResource::Sampler(&map_sampler) },
+                            eframe::wgpu::BindGroupEntry { binding: 4, resource: eframe::wgpu::BindingResource::TextureView(&state.ymap_tex.create_view(&eframe::wgpu::TextureViewDescriptor::default())) },
+                            eframe::wgpu::BindGroupEntry { binding: 5, resource: eframe::wgpu::BindingResource::Sampler(&map_sampler) },
+                            eframe::wgpu::BindGroupEntry { binding: 6, resource: eframe::wgpu::BindingResource::TextureView(&state.mask_tex.create_view(&eframe::wgpu::TextureViewDescriptor::default())) },
+                            eframe::wgpu::BindGroupEntry { binding: 7, resource: state.uniform_buf.as_entire_binding() },
+                        ],
+                    });
+                    state.ring_tex = ring_tex;
+                    state.current_freq_bins = freq_bins;
+                    self.last_uploaded_head = 0;
+                }
+
+                // If audio went completely silent, the `pixels` array was untouched. We ONLY push the mask over PCIe!
+                // If audio played, we push both the new pixels and the mask byte over PCIe.
+                if target_head > self.last_uploaded_head {
+                    let width = target_head - self.last_uploaded_head;
+                    
+                    wgpu_state.queue.write_texture(
+                        eframe::wgpu::TexelCopyTextureInfo { texture: &state.mask_tex, mip_level: 0, origin: eframe::wgpu::Origin3d { x: self.last_uploaded_head as u32, y: 0, z: 0 }, aspect: eframe::wgpu::TextureAspect::All },
+                        &layer.mask[self.last_uploaded_head..target_head],
+                        eframe::wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(width as u32), rows_per_image: None },
+                        eframe::wgpu::Extent3d { width: width as u32, height: 1, depth_or_array_layers: 1 }
+                    );
+
+                    // Skip the heavy texture upload entirely if it's just silence (masking)
+                    if layer.mask[target_head.saturating_sub(1)] == 255 {
+                        wgpu_state.queue.write_texture(
+                            eframe::wgpu::TexelCopyTextureInfo { texture: &state.ring_tex, mip_level: 0, origin: eframe::wgpu::Origin3d { x: self.last_uploaded_head as u32, y: 0, z: 0 }, aspect: eframe::wgpu::TextureAspect::All },
+                            &layer.pixels,
+                            eframe::wgpu::TexelCopyBufferLayout { offset: self.last_uploaded_head as u64, bytes_per_row: Some(audio::MAX_HISTORY as u32), rows_per_image: None },
+                            eframe::wgpu::Extent3d { width: width as u32, height: freq_bins as u32, depth_or_array_layers: 1 }
+                        );
+                    }
+                } else if target_head < self.last_uploaded_head {
+                    let width1 = audio::MAX_HISTORY - self.last_uploaded_head;
+                    
+                    wgpu_state.queue.write_texture(
+                        eframe::wgpu::TexelCopyTextureInfo { texture: &state.mask_tex, mip_level: 0, origin: eframe::wgpu::Origin3d { x: self.last_uploaded_head as u32, y: 0, z: 0 }, aspect: eframe::wgpu::TextureAspect::All },
+                        &layer.mask[self.last_uploaded_head..audio::MAX_HISTORY],
+                        eframe::wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(width1 as u32), rows_per_image: None },
+                        eframe::wgpu::Extent3d { width: width1 as u32, height: 1, depth_or_array_layers: 1 }
+                    );
+
+                    if layer.mask[audio::MAX_HISTORY - 1] == 255 {
+                        wgpu_state.queue.write_texture(
+                            eframe::wgpu::TexelCopyTextureInfo { texture: &state.ring_tex, mip_level: 0, origin: eframe::wgpu::Origin3d { x: self.last_uploaded_head as u32, y: 0, z: 0 }, aspect: eframe::wgpu::TextureAspect::All },
+                            &layer.pixels,
+                            eframe::wgpu::TexelCopyBufferLayout { offset: self.last_uploaded_head as u64, bytes_per_row: Some(audio::MAX_HISTORY as u32), rows_per_image: None },
+                            eframe::wgpu::Extent3d { width: width1 as u32, height: freq_bins as u32, depth_or_array_layers: 1 }
+                        );
+                    }
+
+                    if target_head > 0 {
+                        wgpu_state.queue.write_texture(
+                            eframe::wgpu::TexelCopyTextureInfo { texture: &state.mask_tex, mip_level: 0, origin: eframe::wgpu::Origin3d { x: 0, y: 0, z: 0 }, aspect: eframe::wgpu::TextureAspect::All },
+                            &layer.mask[0..target_head],
+                            eframe::wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(target_head as u32), rows_per_image: None },
+                            eframe::wgpu::Extent3d { width: target_head as u32, height: 1, depth_or_array_layers: 1 }
+                        );
+
+                        if layer.mask[target_head - 1] == 255 {
+                            wgpu_state.queue.write_texture(
+                                eframe::wgpu::TexelCopyTextureInfo { texture: &state.ring_tex, mip_level: 0, origin: eframe::wgpu::Origin3d { x: 0, y: 0, z: 0 }, aspect: eframe::wgpu::TextureAspect::All },
+                                &layer.pixels,
+                                eframe::wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(audio::MAX_HISTORY as u32), rows_per_image: None },
+                                eframe::wgpu::Extent3d { width: target_head as u32, height: freq_bins as u32, depth_or_array_layers: 1 }
+                            );
+                        }
+                    }
+                }
+
+                self.last_uploaded_head = target_head;
+                self.last_uploaded_updates = target_updates;
+            }
+        }
+
+        // --- 2. UPDATE STATIC LUTS IF CHANGED ---
+        let is_cqt = actual_fft_idx >= audio::RESOLUTIONS.len();
+        if local_settings.colormap != self.current_colormap || local_settings.scale_type != self.current_scale || is_cqt != self.current_is_cqt {
+            self.current_colormap = local_settings.colormap;
+            self.current_scale = local_settings.scale_type;
+            self.current_is_cqt = is_cqt;
+
+            let wgpu_state = frame.wgpu_render_state().unwrap();
+            let mut custom_state = wgpu_state.renderer.write();
+            let state = custom_state.callback_resources.get_mut::<CustomWgpuState>().unwrap();
+
+            wgpu_state.queue.write_texture(
+                eframe::wgpu::TexelCopyTextureInfo { texture: &state.colormap_tex, mip_level: 0, origin: eframe::wgpu::Origin3d::ZERO, aspect: eframe::wgpu::TextureAspect::All },
+                &generate_colormap_bytes(self.current_colormap),
+                eframe::wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(256 * 4), rows_per_image: None },
+                eframe::wgpu::Extent3d { width: 256, height: 1, depth_or_array_layers: 1 }
+            );
+
+            wgpu_state.queue.write_texture(
+                eframe::wgpu::TexelCopyTextureInfo { texture: &state.ymap_tex, mip_level: 0, origin: eframe::wgpu::Origin3d::ZERO, aspect: eframe::wgpu::TextureAspect::All },
+                &generate_y_mapping_bytes(self.current_scale, self.current_is_cqt, audio::MAX_DISPLAY_FREQ, audio::SAMPLE_RATE as f32 / 2.0),
+                eframe::wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(1024 * 4), rows_per_image: None },
+                eframe::wgpu::Extent3d { width: 1024, height: 1, depth_or_array_layers: 1 }
+            );
+        }
+
+        // --- 3. ANIMATE FRACTIONAL SCROLL ---
+        let diff = (target_updates as f64) - self.smooth_head_pos;
+        let dt = ctx.input(|i| i.unstable_dt) as f64;
+        
+        self.smooth_head_pos += diff * (15.0 * dt).min(1.0);
+        if diff.abs() > 50.0 { self.smooth_head_pos = target_updates as f64; }
+        
+        if diff.abs() > 0.05 {
+            ctx.request_repaint();
+        }
+
+        // --- 4. BIND SHADER UNIFORMS ---
+        let rect = ctx.available_rect();
+        let ppp = ctx.pixels_per_point();
+        
+        let screen_time_dim = match local_settings.dir {
+            audio::ScrollDirection::RTL | audio::ScrollDirection::LTR => rect.width() * ppp,
+            audio::ScrollDirection::DTU | audio::ScrollDirection::UTD => rect.height() * ppp,
         };
+        
+        let scale_factor = TARGET_DISPLAY_WIDTH / (local_settings.view_len as f32);
+        let actual_source_columns = (screen_time_dim / scale_factor).min(local_settings.view_len as f32);
+        let dynamic_view_width_norm = actual_source_columns / (audio::MAX_HISTORY as f32);
 
-        if dir == ScrollDirection::RTL || dir == ScrollDirection::LTR {
-            let tick_len = if is_c { 15.0 } else { 5.0 };
-            let start_x = if dir == ScrollDirection::RTL { x - tick_len } else { x };
-            draw_line(start_x, y, start_x + tick_len, y, 1.0, WHITE);
+        {
+            let wgpu_state = frame.wgpu_render_state().unwrap();
+            let mut custom_state = wgpu_state.renderer.write();
+            let state = custom_state.callback_resources.get_mut::<CustomWgpuState>().unwrap();
+
+            let uniforms = ShaderUniforms {
+                scroll_offset: (self.smooth_head_pos.rem_euclid(audio::MAX_HISTORY as f64) / audio::MAX_HISTORY as f64) as f32,
+                view_width_norm: dynamic_view_width_norm,
+                direction: local_settings.dir as u32,
+                _padding: 0,
+            };
             
-            if let Some(text) = label {
-                // Adjust text 10px closer to the edge for non-C notes
-                let text_x = if dir == ScrollDirection::RTL { 
-                    x - if is_c { 32.0 } else { 16.0 } 
-                } else { 
-                    x + if is_c { 20.0 } else { 10.0 } 
-                };
-                draw_text(&text, text_x, y + 4.0, 15.0, WHITE);
-            }
-        } else {
-            let tick_len = if is_c { 15.0 } else { 5.0 };
-            let start_y = if dir == ScrollDirection::DTU { y - tick_len } else { y };
-            draw_line(x, start_y, x, start_y + tick_len, 1.0, WHITE);
+            let uniforms_bytes: &[u8] = unsafe { std::slice::from_raw_parts((&uniforms as *const ShaderUniforms) as *const u8, std::mem::size_of::<ShaderUniforms>()) };
+            wgpu_state.queue.write_buffer(&state.uniform_buf, 0, uniforms_bytes);
+        }
+
+        // --- 5. EGUI DRAWING ---
+        egui::CentralPanel::default()
+            .frame(egui::Frame::NONE)
+            .show(ctx, |ui| {
+                
+            let (rect, _response) = ui.allocate_exact_size(rect.size(), egui::Sense::hover());
             
-            if let Some(text) = label {
-                // Adjust text 10px closer to the edge for non-C notes
-                let text_y = if dir == ScrollDirection::DTU { 
-                    y - if is_c { 20.0 } else { 10.0 } 
-                } else { 
-                    y + if is_c { 30.0 } else { 20.0 } 
-                };
-                draw_text(&text, x - 5.0, text_y, 15.0, WHITE);
+            ui.painter().add(eframe::egui_wgpu::Callback::new_paint_callback(rect, SpectorRenderCallback));
+            draw_note_ruler(ui, rect, local_settings.scale_type, local_settings.dir);
+
+            if ctx.input(|i| i.pointer.primary_down()) == false { self.drag_start_freq = None; }
+
+            if let Some(mouse_pos) = ctx.pointer_hover_pos() {
+                if rect.contains(mouse_pos) {
+                    let norm_x = (mouse_pos.x - rect.min.x) / rect.width();
+                    let norm_y = (mouse_pos.y - rect.min.y) / rect.height();
+                    
+                    let norm_freq = match local_settings.dir {
+                        audio::ScrollDirection::RTL | audio::ScrollDirection::LTR => 1.0 - norm_y,
+                        audio::ScrollDirection::DTU | audio::ScrollDirection::UTD => norm_x,
+                    };
+                    
+                    let max_f = audio::MAX_DISPLAY_FREQ;
+                    let current_hz = match local_settings.scale_type {
+                        audio::ScaleType::Linear => norm_freq * max_f,
+                        audio::ScaleType::Mel => {
+                            let mel_max = 2595.0 * (1.0 + max_f / 700.0).log10();
+                            700.0 * (10.0f32.powf((norm_freq * mel_max) / 2595.0) - 1.0)
+                        },
+                        audio::ScaleType::Logarithmic => {
+                            let min_log = 20.0f32.log2();
+                            2.0f32.powf(min_log + norm_freq * (max_f.log2() - min_log))
+                        },
+                        audio::ScaleType::Bark => {
+                            let bark_max = 6.0 * (max_f / 600.0).asinh();
+                            600.0 * ((norm_freq * bark_max) / 6.0).sinh()
+                        }
+                    };
+
+                    if ctx.input(|i| i.pointer.primary_pressed()) { self.drag_start_freq = Some(current_hz); }
+
+                    let painter = ui.painter();
+                    
+                    // 1. Draw the live intersecting Crosshairs
+                    let crosshair_color = egui::Color32::from_white_alpha(100);
+                    painter.line_segment([egui::pos2(mouse_pos.x, rect.min.y), egui::pos2(mouse_pos.x, rect.max.y)], egui::Stroke::new(1.0, crosshair_color));
+                    painter.line_segment([egui::pos2(rect.min.x, mouse_pos.y), egui::pos2(rect.max.x, mouse_pos.y)], egui::Stroke::new(1.0, crosshair_color));
+
+                    // 2. Draw Drag Overlay Box and Static Start Line
+                    if let Some(f1) = self.drag_start_freq {
+                        let norm_start = freq_to_norm_pos(f1, local_settings.scale_type);
+                        if norm_start >= 0.0 && norm_start <= 1.0 {
+                            let drag_color = egui::Color32::from_rgba_unmultiplied(255, 204, 76, 200);
+                            let fill_color = egui::Color32::from_rgba_unmultiplied(255, 204, 76, 50);
+
+                            match local_settings.dir {
+                                audio::ScrollDirection::RTL | audio::ScrollDirection::LTR => {
+                                    let start_y = rect.max.y - norm_start * rect.height();
+                                    let min_y = start_y.min(mouse_pos.y);
+                                    let max_y = start_y.max(mouse_pos.y);
+                                    
+                                    painter.rect_filled(egui::Rect::from_x_y_ranges(rect.min.x..=rect.max.x, min_y..=max_y), 0.0, fill_color);
+                                    painter.line_segment([egui::pos2(rect.min.x, start_y), egui::pos2(rect.max.x, start_y)], egui::Stroke::new(1.0, drag_color));
+                                    painter.line_segment([egui::pos2(rect.min.x, mouse_pos.y), egui::pos2(rect.max.x, mouse_pos.y)], egui::Stroke::new(1.0, drag_color));
+                                },
+                                audio::ScrollDirection::DTU | audio::ScrollDirection::UTD => {
+                                    let start_x = rect.min.x + norm_start * rect.width();
+                                    let min_x = start_x.min(mouse_pos.x);
+                                    let max_x = start_x.max(mouse_pos.x);
+
+                                    painter.rect_filled(egui::Rect::from_x_y_ranges(min_x..=max_x, rect.min.y..=rect.max.y), 0.0, fill_color);
+                                    painter.line_segment([egui::pos2(start_x, rect.min.y), egui::pos2(start_x, rect.max.y)], egui::Stroke::new(1.0, drag_color));
+                                    painter.line_segment([egui::pos2(mouse_pos.x, rect.min.y), egui::pos2(mouse_pos.x, rect.max.y)], egui::Stroke::new(1.0, drag_color));
+                                }
+                            }
+                        }
+                    }
+
+                    let (note_name, _) = hz_to_pitch(current_hz);
+
+                    // Dynamic Tooltip
+                    let drawn_time_seconds = (actual_source_columns * audio::CQT_HOP_SIZE as f32) / audio::SAMPLE_RATE as f32;
+                    let time_ago = match local_settings.dir {
+                        audio::ScrollDirection::RTL => (1.0 - norm_x) * drawn_time_seconds,
+                        audio::ScrollDirection::LTR => norm_x * drawn_time_seconds,
+                        audio::ScrollDirection::DTU => (1.0 - norm_y) * drawn_time_seconds,
+                        audio::ScrollDirection::UTD => norm_y * drawn_time_seconds,
+                    };
+
+                    if let Some(f1) = self.drag_start_freq {
+                        let f2 = current_hz;
+                        let raw_semitones = 12.0 * (f2 / f1).log2();
+                        let diff_hz = (f2 - f1).abs();
+                        let sign_str = if raw_semitones >= 0.0 { "+" } else { "" };
+                        
+                        let tooltip = format!("-{:.2}s | {}{:.2} st ({}) | {}{:.1} Hz", time_ago, sign_str, raw_semitones, get_interval_name(raw_semitones), sign_str, diff_hz);
+                        let layer_id = egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("drag_tooltip_layer"));
+                        egui::show_tooltip_at_pointer(ctx, layer_id, egui::Id::new("drag_tooltip"), |ui| { ui.label(tooltip); });
+                    } else {
+                        let tooltip = format!("-{:.2}s | {:.1} Hz | {}", time_ago, current_hz, note_name);
+                        let layer_id = egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("hover_tooltip_layer"));
+                        egui::show_tooltip_at_pointer(ctx, layer_id, egui::Id::new("hover_tooltip"), |ui| { ui.label(tooltip); });
+                    }
+                }
             }
+
+            // --- 6. MANUAL MACROQUAD-STYLE HUD BAR ---
+            let ui_painter = ui.painter();
+            
+            let (bg_x, bg_y, bg_w, bg_h, is_vertical) = match local_settings.dir {
+                audio::ScrollDirection::RTL | audio::ScrollDirection::LTR => (0.0, 0.0, rect.width(), 35.0, false),
+                _ => (rect.width() - 220.0, 0.0, 220.0, 205.0, true),
+            };
+
+            ui_painter.rect_filled(
+                egui::Rect::from_min_size(rect.min + egui::vec2(bg_x, bg_y), egui::vec2(bg_w, bg_h)),
+                0.0,
+                egui::Color32::from_black_alpha(153),
+            );
+
+            let mut cursor_x = rect.min.x + bg_x + 10.0;
+            let mut cursor_y = rect.min.y + bg_y + 10.0;
+            let font_id = egui::FontId::proportional(11.0);
+
+            let res_str = if local_settings.fft_idx as usize == audio::RESOLUTIONS.len() {
+                "CQT (HD)".to_string()
+            } else {
+                format!("{} bins", freq_bins)
+            };
+
+            let stats = [
+                ("Scale", format!("{:?}", local_settings.scale_type), egui::Color32::from_rgb(255, 165, 0)),
+                ("Colour", format!("{:?}", local_settings.colormap), egui::Color32::YELLOW),
+                ("Flow", format!("{:?}", local_settings.dir), egui::Color32::LIGHT_BLUE),
+                ("Resolution", res_str, egui::Color32::from_rgb(238, 130, 238)),
+                ("Window", local_settings.view_len.to_string(), egui::Color32::LIGHT_RED),
+                ("Audio Src", format!("{:?}", local_settings.audio_source), egui::Color32::GREEN),
+                ("IIR Bass", if local_settings.iir_enabled { "On".to_string() } else { "Off".to_string() }, egui::Color32::LIGHT_GREEN),
+                ("Tweaks", if self.show_menu { "Visible".to_string() } else { "Hidden".to_string() }, egui::Color32::WHITE),
+            ];
+
+            for (label, val, color) in &stats {
+                let full_label = format!("{}:", label);
+                let label_galley = ui_painter.layout_no_wrap(full_label.clone(), font_id.clone(), egui::Color32::WHITE);
+                let first_char_galley = ui_painter.layout_no_wrap(label.chars().next().unwrap().to_string(), font_id.clone(), egui::Color32::WHITE);
+
+                if is_vertical {
+                    ui_painter.galley(egui::pos2(cursor_x, cursor_y), label_galley.clone(), egui::Color32::WHITE);
+                    ui_painter.line_segment([
+                        egui::pos2(cursor_x, cursor_y + first_char_galley.size().y + 1.0),
+                        egui::pos2(cursor_x + first_char_galley.size().x, cursor_y + first_char_galley.size().y + 1.0)
+                    ], egui::Stroke::new(1.0, egui::Color32::WHITE));
+
+                    let val_galley = ui_painter.layout_no_wrap(val.clone(), font_id.clone(), *color);
+                    ui_painter.galley(egui::pos2(cursor_x + label_galley.size().x + 10.0, cursor_y), val_galley, *color);
+                    cursor_y += 18.0;
+                } else {
+                    ui_painter.galley(egui::pos2(cursor_x, cursor_y), label_galley.clone(), egui::Color32::WHITE);
+                    ui_painter.line_segment([
+                        egui::pos2(cursor_x, cursor_y + first_char_galley.size().y + 1.0),
+                        egui::pos2(cursor_x + first_char_galley.size().x, cursor_y + first_char_galley.size().y + 1.0)
+                    ], egui::Stroke::new(1.0, egui::Color32::WHITE));
+
+                    let val_galley = ui_painter.layout_no_wrap(val.clone(), font_id.clone(), *color);
+                    ui_painter.galley(egui::pos2(cursor_x + label_galley.size().x + 5.0, cursor_y), val_galley.clone(), *color);
+                    cursor_x += label_galley.size().x + val_galley.size().x + 25.0;
+                }
+            }
+        });
+
+        if self.show_menu {
+            egui::Window::new("DSP Tweaks")
+                .frame(egui::Frame::window(&ctx.global_style()).fill(egui::Color32::from_black_alpha(200)))
+                .show(ctx, |ui| {
+                    if let Ok(mut s) = self.settings.lock() {
+                        ui.label(egui::RichText::new("Signal Pipeline").color(egui::Color32::from_rgb(255, 165, 0)));
+                        ui.add(egui::Slider::new(&mut s.dsp_config.pink_noise_tilt, -6.0..=6.0).text("Pink Noise Tilt (dB/Oct)"));
+                        ui.checkbox(&mut s.dsp_config.psd_normalization, "PSD Normalization");
+                        ui.add(egui::Slider::new(&mut s.dsp_config.peak_density_dampening, 0.0..=2.0).text("Density Dampening"));
+                        
+                        ui.add_space(10.0);
+                        ui.label(egui::RichText::new("Dynamics & Decay").color(egui::Color32::from_rgb(255, 165, 0)));
+                        ui.add(egui::Slider::new(&mut s.dsp_config.peak_weight, 0.0..=1.0).text("Peak Weight"));
+                        ui.add(egui::Slider::new(&mut s.dsp_config.rms_weight, 0.0..=1.0).text("RMS Weight"));
+                        ui.add(egui::Slider::new(&mut s.dsp_config.decay_low, 0.0..=0.1).text("Phosphor Decay (Bass)"));
+                        ui.add(egui::Slider::new(&mut s.dsp_config.decay_high, 0.0..=0.1).text("Phosphor Decay (Treble)"));
+
+                        ui.add_space(10.0);
+                        ui.label(egui::RichText::new("CQT Kernel Splatting").color(egui::Color32::from_rgb(255, 165, 0)));
+                        ui.add(egui::Slider::new(&mut s.dsp_config.splat_low, 0.0..=10.0).text("Splat Spread (Bass)"));
+                        ui.add(egui::Slider::new(&mut s.dsp_config.splat_high, 0.0..=5.0).text("Splat Spread (Treble)"));
+                        ui.add(egui::Slider::new(&mut s.dsp_config.halo_raw, 0.0..=10.0).text("Halo Raw Blend"));
+                        ui.add(egui::Slider::new(&mut s.dsp_config.halo_sharp, 0.0..=10.0).text("Halo Sharp Blend"));
+
+                        ui.add_space(10.0);
+                        ui.label(egui::RichText::new("Makeup Gains").color(egui::Color32::from_rgb(255, 165, 0)));
+                        ui.add(egui::Slider::new(&mut s.dsp_config.stft_boost, 1.0..=20.0).text("STFT Boost Gain"));
+                        ui.add(egui::Slider::new(&mut s.dsp_config.iir_boost, 1.0..=20.0).text("IIR Boost Gain"));
+                    }
+                });
         }
     }
-}
-struct UiStat {
-    label: &'static str,
-    hotkey: Option<char>,
-    value: String,
-    color: Color,
+
+    fn ui(&mut self, _ui: &mut eframe::egui::Ui, _frame: &mut eframe::Frame) {}
 }
 
-fn draw_ui_overlay(settings: &AppSettings, show_tweaks: bool) {
-    let scale_str = format!("{:?}", settings.scale_type);
-    let map_str = format!("{:?}", settings.colormap); 
-    let dir_str = match settings.dir {
-        ScrollDirection::RTL => "RTL", 
-        ScrollDirection::LTR => "LTR",
-        ScrollDirection::DTU => "Fire", 
-        ScrollDirection::UTD => "Rain",
-    };
+fn setup_custom_fonts(ctx: &egui::Context) {
+    let fonts = egui::FontDefinitions::default();
+    ctx.set_fonts(fonts);
     
-    let res_str = if settings.fft_idx as usize == RESOLUTIONS.len() {
-        "CQT (HD)".to_string()
-    } else {
-        let actual_fft = if SPECTRAL_OVERSAMPLING { OVERSAMPLE_TARGET.max(RESOLUTIONS[settings.fft_idx as usize]) } else { RESOLUTIONS[settings.fft_idx as usize] };
-        if SPECTRAL_OVERSAMPLING && actual_fft > RESOLUTIONS[settings.fft_idx as usize] {
-            format!("{} bins (x{} Pad)", actual_fft / 2, actual_fft / RESOLUTIONS[settings.fft_idx as usize])
-        } else {
-            format!("{} bins", actual_fft / 2)
-        }
-    };
-    
-    let hist_str = format!("{}", settings.view_len);
-    let src_str = match settings.audio_source {
-        AudioSource::SinkMonitor => "Sink",
-        AudioSource::Microphone => "Mic",
-    };
-    let iir_str = if settings.iir_enabled { "On" } else { "Off" };
-    let tweaks_str = if show_tweaks { "Visible" } else { "Hidden" };
-
-    let stats = vec![
-        UiStat { label: "Scale",  hotkey: Some('S'), value: scale_str.to_string(), color: ORANGE },
-        UiStat { label: "Colour", hotkey: Some('C'), value: map_str,               color: YELLOW },
-        UiStat { label: "Flow",   hotkey: Some('F'), value: dir_str.to_string(),   color: SKYBLUE },
-        UiStat { label: "Resolution",    hotkey: Some('R'), value: res_str,               color: VIOLET },
-        UiStat { label: "Window",    hotkey: Some('W'), value: hist_str,              color: PINK },
-        UiStat { label: "Audio Src",     hotkey: Some('A'), value: src_str.to_string(),   color: GREEN },
-        UiStat { label: "IIR Bass",     hotkey: Some('I'), value: iir_str.to_string(),   color: LIME },
-        UiStat { label: "Tweaks",       hotkey: Some('T'), value: tweaks_str.to_string(), color: WHITE },
-    ];
-
-    let (bg_x, bg_y, bg_w, bg_h, is_vertical) = match settings.dir {
-        ScrollDirection::RTL | ScrollDirection::LTR => (0.0, 0.0, screen_width(), 35.0, false),
-        _ => (screen_width() - 220.0, 0.0, 220.0, 205.0, true),
-    };
-
-    draw_rectangle(bg_x, bg_y, bg_w, bg_h, Color::new(0.0, 0.0, 0.0, 0.6));
-
-    let mut cursor_x = bg_x + 10.0;
-    let mut cursor_y = bg_y + 20.0;
-
-    for stat in stats {
-        let full_label = format!("{}:", stat.label);
-        
-        draw_text(&full_label, cursor_x, cursor_y, 20.0, WHITE);
-        
-        if let Some(c) = stat.hotkey {
-            let char_dims = measure_text(&c.to_string(), None, 20, 1.0);
-            draw_line(cursor_x, cursor_y + 2.0, cursor_x + char_dims.width, cursor_y + 2.0, 1.0, WHITE);
-        }
-
-        let label_width = measure_text(&full_label, None, 20, 1.0).width;
-        let val_width = measure_text(&stat.value, None, 20, 1.0).width;
-
-        if is_vertical {
-            draw_text(&stat.value, cursor_x + label_width + 10.0, cursor_y, 20.0, stat.color);
-            cursor_y += 22.0;
-        } else {
-            draw_text(&stat.value, cursor_x + label_width + 5.0, cursor_y, 20.0, stat.color);
-            cursor_x += label_width + val_width + 25.0; 
-        }
+    let mut style = (*ctx.global_style()).clone();
+    for (_text_style, font_id) in style.text_styles.iter_mut() {
+        font_id.size *= 0.85; 
     }
+    ctx.set_global_style(style);
+}
+
+fn main() -> eframe::Result<()> {
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default().with_inner_size([1024.0, 768.0]),
+        ..Default::default()
+    };
+
+    eframe::run_native(
+        "Spector (Native wgpu)",
+        options,
+        Box::new(|cc| {
+            setup_custom_fonts(&cc.egui_ctx);
+            
+            let mut style = (*cc.egui_ctx.global_style()).clone();
+            style.visuals.window_fill = egui::Color32::from_black_alpha(180);
+            style.visuals.panel_fill = egui::Color32::TRANSPARENT;
+            style.visuals.window_corner_radius = egui::CornerRadius::ZERO;
+            cc.egui_ctx.set_global_style(style);
+
+            let (settings, layers) = audio::start_audio_engine(cc.egui_ctx.clone());
+            let wgpu_state = CustomWgpuState::new(cc, 1200);
+            cc.wgpu_render_state.as_ref().unwrap().renderer.write().callback_resources.insert(wgpu_state);
+
+            Ok(Box::new(SpectorApp {
+                settings, layers,
+                smooth_head_pos: 0.0, last_uploaded_updates: 0, last_uploaded_head: 0,
+                current_colormap: audio::ColorMapType::Magma, current_scale: audio::ScaleType::Logarithmic, current_is_cqt: true,
+                show_menu: false, drag_start_freq: None,
+            }))
+        }),
+    )
 }
