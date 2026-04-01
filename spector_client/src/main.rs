@@ -62,7 +62,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let map_val = textureSample(ymap_tex, ymap_sampler, vec2<f32>(1.0 - freq_uv, 0.5));
     let mapped_y = map_val.r + map_val.g / 256.0;
 
-    let intensity = textureSample(ring_tex, ring_sampler, vec2<f32>(sample_u, mapped_y)).r;
+    let intensity = textureSample(ring_tex, ring_sampler, vec2<f32>(mapped_y, sample_u)).r;
     return textureSample(colormap_tex, colormap_sampler, vec2<f32>(intensity, 0.5));
 }
 "#;
@@ -292,7 +292,7 @@ impl CustomWgpuState {
 
         let ring_tex = device.create_texture(&eframe::wgpu::TextureDescriptor {
             label: Some("Ring Buffer"),
-            size: eframe::wgpu::Extent3d { width: MAX_HISTORY as u32, height: freq_bins as u32, depth_or_array_layers: 1 },
+            size: eframe::wgpu::Extent3d { width: freq_bins as u32, height: MAX_HISTORY as u32, depth_or_array_layers: 1 },
             mip_level_count: 1, sample_count: 1, dimension: eframe::wgpu::TextureDimension::D2,
             format: eframe::wgpu::TextureFormat::R8Unorm,
             usage: eframe::wgpu::TextureUsages::TEXTURE_BINDING | eframe::wgpu::TextureUsages::COPY_DST, view_formats: &[],
@@ -307,7 +307,7 @@ impl CustomWgpuState {
         });
 
         let ring_sampler = device.create_sampler(&eframe::wgpu::SamplerDescriptor {
-            address_mode_u: eframe::wgpu::AddressMode::Repeat, address_mode_v: eframe::wgpu::AddressMode::ClampToEdge,
+            address_mode_u: eframe::wgpu::AddressMode::ClampToEdge, address_mode_v: eframe::wgpu::AddressMode::Repeat,
             mag_filter: eframe::wgpu::FilterMode::Linear, min_filter: eframe::wgpu::FilterMode::Linear, ..Default::default()
         });
 
@@ -503,7 +503,7 @@ impl eframe::App for SpectorApp {
             if freq_bins != state.current_freq_bins {
                 let ring_tex = wgpu_state.device.create_texture(&eframe::wgpu::TextureDescriptor {
                     label: Some("Ring Buffer"),
-                    size: eframe::wgpu::Extent3d { width: MAX_HISTORY as u32, height: freq_bins as u32, depth_or_array_layers: 1 },
+                    size: eframe::wgpu::Extent3d { width: freq_bins as u32, height: MAX_HISTORY as u32, depth_or_array_layers: 1 },
                     mip_level_count: 1, sample_count: 1, dimension: eframe::wgpu::TextureDimension::D2,
                     format: eframe::wgpu::TextureFormat::R8Unorm,
                     usage: eframe::wgpu::TextureUsages::TEXTURE_BINDING | eframe::wgpu::TextureUsages::COPY_DST, view_formats: &[],
@@ -511,7 +511,7 @@ impl eframe::App for SpectorApp {
                 
                 let bind_group_layout = state.pipeline.get_bind_group_layout(0);
                 let ring_sampler = wgpu_state.device.create_sampler(&eframe::wgpu::SamplerDescriptor {
-                    address_mode_u: eframe::wgpu::AddressMode::Repeat, address_mode_v: eframe::wgpu::AddressMode::ClampToEdge,
+                    address_mode_u: eframe::wgpu::AddressMode::ClampToEdge, address_mode_v: eframe::wgpu::AddressMode::Repeat,
                     mag_filter: eframe::wgpu::FilterMode::Linear, min_filter: eframe::wgpu::FilterMode::Linear, ..Default::default()
                 });
                 let map_sampler = wgpu_state.device.create_sampler(&eframe::wgpu::SamplerDescriptor { mag_filter: eframe::wgpu::FilterMode::Linear, min_filter: eframe::wgpu::FilterMode::Linear, ..Default::default() });
@@ -546,10 +546,10 @@ impl eframe::App for SpectorApp {
 
                 if layer.mask[target_head.saturating_sub(1)] == 255 {
                     wgpu_state.queue.write_texture(
-                        eframe::wgpu::TexelCopyTextureInfo { texture: &state.ring_tex, mip_level: 0, origin: eframe::wgpu::Origin3d { x: self.last_uploaded_head as u32, y: 0, z: 0 }, aspect: eframe::wgpu::TextureAspect::All },
-                        &layer.pixels[.. MAX_HISTORY * freq_bins],
-                        eframe::wgpu::TexelCopyBufferLayout { offset: self.last_uploaded_head as u64, bytes_per_row: Some(MAX_HISTORY as u32), rows_per_image: None },
-                        eframe::wgpu::Extent3d { width: width as u32, height: freq_bins as u32, depth_or_array_layers: 1 }
+                        eframe::wgpu::TexelCopyTextureInfo { texture: &state.ring_tex, mip_level: 0, origin: eframe::wgpu::Origin3d { x: 0, y: self.last_uploaded_head as u32, z: 0 }, aspect: eframe::wgpu::TextureAspect::All },
+                        &layer.pixels[self.last_uploaded_head * MAX_FREQ_BINS .. target_head * MAX_FREQ_BINS],
+                        eframe::wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(MAX_FREQ_BINS as u32), rows_per_image: None },
+                        eframe::wgpu::Extent3d { width: freq_bins as u32, height: width as u32, depth_or_array_layers: 1 }
                     );
                 }
             } else if target_head < self.last_uploaded_head {
@@ -564,10 +564,10 @@ impl eframe::App for SpectorApp {
 
                 if layer.mask[MAX_HISTORY - 1] == 255 {
                     wgpu_state.queue.write_texture(
-                        eframe::wgpu::TexelCopyTextureInfo { texture: &state.ring_tex, mip_level: 0, origin: eframe::wgpu::Origin3d { x: self.last_uploaded_head as u32, y: 0, z: 0 }, aspect: eframe::wgpu::TextureAspect::All },
-                        &layer.pixels[.. MAX_HISTORY * freq_bins],
-                        eframe::wgpu::TexelCopyBufferLayout { offset: self.last_uploaded_head as u64, bytes_per_row: Some(MAX_HISTORY as u32), rows_per_image: None },
-                        eframe::wgpu::Extent3d { width: width1 as u32, height: freq_bins as u32, depth_or_array_layers: 1 }
+                        eframe::wgpu::TexelCopyTextureInfo { texture: &state.ring_tex, mip_level: 0, origin: eframe::wgpu::Origin3d { x: 0, y: self.last_uploaded_head as u32, z: 0 }, aspect: eframe::wgpu::TextureAspect::All },
+                        &layer.pixels[self.last_uploaded_head * MAX_FREQ_BINS .. MAX_HISTORY * MAX_FREQ_BINS],
+                        eframe::wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(MAX_FREQ_BINS as u32), rows_per_image: None },
+                        eframe::wgpu::Extent3d { width: freq_bins as u32, height: width1 as u32, depth_or_array_layers: 1 }
                     );
                 }
 
@@ -582,9 +582,9 @@ impl eframe::App for SpectorApp {
                     if layer.mask[target_head - 1] == 255 {
                         wgpu_state.queue.write_texture(
                             eframe::wgpu::TexelCopyTextureInfo { texture: &state.ring_tex, mip_level: 0, origin: eframe::wgpu::Origin3d { x: 0, y: 0, z: 0 }, aspect: eframe::wgpu::TextureAspect::All },
-                            &layer.pixels[.. MAX_HISTORY * freq_bins],
-                            eframe::wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(MAX_HISTORY as u32), rows_per_image: None },
-                            eframe::wgpu::Extent3d { width: target_head as u32, height: freq_bins as u32, depth_or_array_layers: 1 }
+                            &layer.pixels[0 .. target_head * MAX_FREQ_BINS],
+                            eframe::wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(MAX_FREQ_BINS as u32), rows_per_image: None },
+                            eframe::wgpu::Extent3d { width: freq_bins as u32, height: target_head as u32, depth_or_array_layers: 1 }
                         );
                     }
                 }

@@ -496,10 +496,19 @@ fn main() {
 
         let mut scratch_cols: Vec<Vec<u8>> = (0..NUM_LAYERS).map(|i| {
             let size = if i < RESOLUTIONS.len() { stft_states[i].fft_size / 2 } else { CQT_BINS };
-            vec![0u8; size] 
+            vec![0u8; size]
         }).collect();
 
+        // Pre-allocate DSP Buffers to avoid heap allocations in the hot loop
+        let mut raw_cqt_power = vec![0.0f32; CQT_BINS];
+        let mut raw_cqt_peak = vec![0.0f32; CQT_BINS];
+        let mut sharp_cqt_power = vec![0.0f32; CQT_BINS];
+        let mut sharp_cqt_peak = vec![0.0f32; CQT_BINS];
+        let mut stft_amplitudes = vec![0.0f32; CQT_BINS];
+        let mut iir_amplitudes = vec![0.0f32; CQT_BINS];
+
         let rebuild_dsp_caches = |config: &DspConfig, stft_states: &mut Vec<StftState>, tilt_curves: &mut Vec<Vec<f32>>, cqt_decays: &mut Vec<f32>, splat_kernels: &mut Vec<SplatKernel>, stft_cqt_map: &mut Vec<CqtInstruction>| {
+
             for (i, state) in stft_states.iter_mut().enumerate() {
                 let half_size = state.fft_size / 2;
                 let min_log = 20.0f32.log2();
@@ -788,9 +797,10 @@ fn main() {
                     let min_stft_weight_sum = stft_cqt_map.first().map(|inst| inst.weight_sum).unwrap_or(1.0);
                     let min_iir_bw = iir_filters.first().map(|&(_, _, bw)| bw).unwrap_or(1.0);
 
-                    let mut raw_cqt_power = vec![0.0f32; CQT_BINS]; let mut raw_cqt_peak = vec![0.0f32; CQT_BINS];
-                    let mut sharp_cqt_power = vec![0.0f32; CQT_BINS]; let mut sharp_cqt_peak = vec![0.0f32; CQT_BINS];
-                    let mut stft_amplitudes = vec![0.0f32; CQT_BINS]; let mut iir_amplitudes = vec![0.0f32; CQT_BINS];
+                    // Reset pre-allocated buffers
+                    raw_cqt_power.fill(0.0); raw_cqt_peak.fill(0.0);
+                    sharp_cqt_power.fill(0.0); sharp_cqt_peak.fill(0.0);
+                    stft_amplitudes.fill(0.0); iir_amplitudes.fill(0.0);
                     
                     if iir_samples_accum > 0 {
                         let inv_samples = 1.0 / iir_samples_accum as f32;
@@ -891,9 +901,10 @@ fn main() {
                             
                             layer.mask[head] = 255; 
                             let active_bins = layer.active_freq_bins;
-                            for y in 0..active_bins {
-                                layer.pixels[y * MAX_HISTORY + head] = scratch_cols[i][y];
-                            }
+
+                            // CONTIGUOUS WRITE: The new layout [time][freq] makes this a single memcpy
+                            let offset = head * MAX_FREQ_BINS;
+                            layer.pixels[offset .. offset + active_bins].copy_from_slice(&scratch_cols[i][0..active_bins]);
                             
                             local_heads[i] = (head + 1) % MAX_HISTORY;
                             local_updates[i] += 1;

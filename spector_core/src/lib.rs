@@ -164,7 +164,7 @@ pub struct SharedLayer {
     // 1D Sparsity mask (1 = valid audio, 0 = pure silence)
     pub mask: [u8; MAX_HISTORY],
     
-    // The raw intensity pixels: [freq_y * MAX_HISTORY + time_x]
+    // The raw intensity pixels: [time_x * MAX_FREQ_BINS + freq_y]
     pub pixels: [u8; MAX_HISTORY * MAX_FREQ_BINS],
 }
 
