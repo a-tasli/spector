@@ -1,0 +1,14 @@
+[package]
+name = "spector_daemon"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[dependencies]
+spector_core = { path = "../spector_core" }
+memmap2.workspace = true
+bytemuck.workspace = true
+rustfft.workspace = true
+libpulse-binding.workspace = true
+libpulse-simple-binding.workspace = true
+pipewire.workspace = true

@@ -1,35 +1,24 @@
-use rustfft::{FftPlanner, num_complex::Complex};
-use std::sync::{Arc, Mutex};
+use rustfft::{num_complex::Complex, FftPlanner};
+use spector_core::*;
+use std::collections::VecDeque;
+use std::fs::OpenOptions;
+use std::io::Read;
+use std::os::unix::net::UnixListener;
+use std::sync::atomic::Ordering;
+use std::sync::{mpsc::sync_channel, Arc, Mutex};
 use std::thread;
 use std::time::Duration;
-use std::net::UdpSocket;
-use std::sync::mpsc::sync_channel;
-use std::collections::VecDeque;
 
 // PulseAudio bindings
-use libpulse_binding::sample::{Spec, Format};
-use libpulse_binding::stream::Direction;
 use libpulse_binding::def::BufferAttr;
+use libpulse_binding::sample::{Format, Spec};
+use libpulse_binding::stream::Direction;
 use libpulse_simple_binding::Simple;
 
-use eframe::egui::Context;
-
-// --- CONFIG ---
-pub const BASE_SAMPLE_RATE: u32 = 48000;
-pub const SR_MULT: u32 = 2;
-pub const SAMPLE_RATE: u32 = BASE_SAMPLE_RATE * SR_MULT;
-
-pub const MAX_DISPLAY_FREQ: f32 = 22050.0;
-pub const MIN_HOP_SIZE: usize = 128;
-pub const CQT_HOP_SIZE: usize = (256 * SR_MULT) as usize;
+// --- INTERNAL DSP CONFIG ---
 const USE_PHASE_CONFIDENCE_FILTER: bool = false;
-
 const SPECTRAL_OVERSAMPLING: bool = false;
 const OVERSAMPLE_TARGET: usize = 16384;
-
-pub const RESOLUTIONS: [usize; 4] = [2*1024, 1*4096, 2*4096, 3*4096];
-pub const HOP_SIZES: [usize; 4] = [256, 256, 128, 128];
-
 const MANUAL_STFT_MAPPING: bool = true;
 
 struct ManualMapping {
@@ -44,190 +33,10 @@ const MANUAL_MAPPINGS: [ManualMapping; 4] = [
     ManualMapping { max_freq: MAX_DISPLAY_FREQ, res_idx: 0 },
 ];
 
-pub const CQT_BINS: usize = 1200;
 const IIR_CROSSOVER_LOWER_HZ: f32 = 65.4;
 const IIR_CROSSOVER_UPPER_HZ: f32 = 261.5;
 
-pub const MAX_VIEW_LEN: usize = 2520;
-pub const MAX_HISTORY: usize = 2800;
-
-#[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum ColorMapType { Magma, Inferno, Viridis, Plasma, Turbo, Cubehelix, Cividis, Warm, Cool, Sinebow, Greys, InvertedGreys, InvertedMagma }
-
-impl ColorMapType {
-    pub fn cycle(self) -> Self {
-        match self {
-            ColorMapType::Magma => ColorMapType::Inferno,
-            ColorMapType::Inferno => ColorMapType::Viridis,
-            ColorMapType::Viridis => ColorMapType::Plasma,
-            ColorMapType::Plasma => ColorMapType::Turbo,
-            ColorMapType::Turbo => ColorMapType::Cubehelix,
-            ColorMapType::Cubehelix => ColorMapType::Cividis,
-            ColorMapType::Cividis => ColorMapType::Warm,
-            ColorMapType::Warm => ColorMapType::Cool,
-            ColorMapType::Cool => ColorMapType::Sinebow,
-            ColorMapType::Sinebow => ColorMapType::Greys,
-            ColorMapType::Greys => ColorMapType::InvertedGreys,
-            ColorMapType::InvertedGreys => ColorMapType::InvertedMagma,
-            ColorMapType::InvertedMagma => ColorMapType::Magma,
-        }
-    }
-}
-
-#[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum ScrollDirection { RTL, LTR, DTU, UTD }
-
-impl ScrollDirection {
-    pub fn cycle(self) -> Self {
-        match self {
-            ScrollDirection::RTL => ScrollDirection::LTR,
-            ScrollDirection::LTR => ScrollDirection::DTU,
-            ScrollDirection::DTU => ScrollDirection::UTD,
-            ScrollDirection::UTD => ScrollDirection::RTL,
-        }
-    }
-}
-
-#[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum AudioSource { SinkMonitor, Microphone }
-
-impl AudioSource {
-    pub fn toggle(self) -> Self {
-        match self {
-            AudioSource::SinkMonitor => AudioSource::Microphone,
-            AudioSource::Microphone => AudioSource::SinkMonitor,
-        }
-    }
-}
-
-#[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum ScaleType { Linear, Mel, Logarithmic, Bark }
-
-impl ScaleType {
-    pub fn cycle(self) -> Self {
-        match self {
-            ScaleType::Linear => ScaleType::Mel,
-            ScaleType::Mel => ScaleType::Bark,
-            ScaleType::Bark => ScaleType::Logarithmic,
-            ScaleType::Logarithmic => ScaleType::Linear,
-        }
-    }
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, PartialEq)]
-pub struct DspConfig {
-    pub pink_noise_tilt: f32,
-    pub peak_weight: f32,
-    pub rms_weight: f32,
-    pub psd_normalization: bool,
-    pub peak_density_dampening: f32,
-    pub decay_low: f32,
-    pub decay_high: f32,
-    pub splat_low: f32,
-    pub splat_high: f32,
-    pub halo_raw: f32,
-    pub halo_sharp: f32,
-    pub stft_boost: f32,
-    pub iir_boost: f32,
-}
-
-impl Default for DspConfig {
-    fn default() -> Self {
-        Self {
-            pink_noise_tilt: 0.0,
-            peak_weight: 0.5,
-            rms_weight: 0.5,
-            psd_normalization: true,
-            peak_density_dampening: 1.0,
-            decay_low: 0.0,
-            decay_high: 0.0,
-            splat_low: 3.0,
-            splat_high: 0.0,
-            halo_raw: 0.0,
-            halo_sharp: 1.0,
-            stft_boost: 5.0,
-            iir_boost: 1.0,
-        }
-    }
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, PartialEq)]
-pub struct AppSettings {
-    pub scale_type: ScaleType,
-    pub colormap: ColorMapType,
-    pub audio_source: AudioSource,
-    pub dir: ScrollDirection,
-    pub iir_enabled: bool,
-    pub fft_idx: u32,
-    pub view_len: u32,
-    pub dsp_config: DspConfig,
-}
-
-impl Default for AppSettings {
-    fn default() -> Self {
-        Self {
-            scale_type: ScaleType::Logarithmic,
-            colormap: ColorMapType::Magma,
-            audio_source: AudioSource::SinkMonitor,
-            dir: ScrollDirection::RTL,
-            iir_enabled: true,
-            fft_idx: RESOLUTIONS.len() as u32,
-            view_len: MAX_VIEW_LEN as u32,
-            dsp_config: DspConfig::default(),
-        }
-    }
-}
-
-pub fn to_bytes(settings: &AppSettings) -> &[u8] {
-    unsafe {
-        std::slice::from_raw_parts(
-            (settings as *const AppSettings) as *const u8,
-            std::mem::size_of::<AppSettings>(),
-        )
-    }
-}
-
-pub fn from_bytes(bytes: &[u8]) -> Option<AppSettings> {
-    if bytes.len() == std::mem::size_of::<AppSettings>() {
-        let mut settings: AppSettings = unsafe { std::mem::zeroed() };
-        unsafe {
-            std::ptr::copy_nonoverlapping(bytes.as_ptr(), (&mut settings as *mut AppSettings) as *mut u8, bytes.len());
-        }
-        Some(settings)
-    } else {
-        None
-    }
-}
-
-pub struct SpectrogramLayer {
-    pub freq_bins: usize,
-    pub pixels: Vec<u8>,
-    pub mask: Vec<u8>, // NEW: Data Sparsity Mask (1 byte per column)
-    pub head: usize,
-    pub total_updates: u64,
-}
-
-impl SpectrogramLayer {
-    fn new(freq_bins: usize) -> Self {
-        Self {
-            freq_bins,
-            pixels: vec![0u8; MAX_HISTORY * freq_bins],
-            mask: vec![0u8; MAX_HISTORY],
-            head: 0,
-            total_updates: 0,
-        }
-    }
-}
-
-// ----------------------------------------------------
-// DSP Helpers
-// ----------------------------------------------------
+// --- DSP HELPERS ---
 
 struct IntensityLut { table: Vec<u8> }
 impl IntensityLut {
@@ -390,45 +199,59 @@ fn compute_column_colors(col_buffer: &mut [u8], data: &[f32], freq_bins: usize, 
     }
 }
 
-// ----------------------------------------------------
-// Core Audio Engine Initialization
-// ----------------------------------------------------
+// --- MAIN DAEMON ---
 
-pub fn start_audio_engine(ctx: Context) -> (Arc<Mutex<AppSettings>>, Arc<Mutex<Vec<SpectrogramLayer>>>) {
-    let mut layers = Vec::new();
-    for &size in RESOLUTIONS.iter() {
-        let actual_fft = if SPECTRAL_OVERSAMPLING { OVERSAMPLE_TARGET.max(size) } else { size };
-        layers.push(SpectrogramLayer::new(actual_fft / 2));
-    }
-    layers.push(SpectrogramLayer::new(CQT_BINS)); 
-    layers.push(SpectrogramLayer::new(CQT_BINS)); 
+fn main() {
+    println!("Spector Daemon Starting...");
 
-    let shared_settings = Arc::new(Mutex::new(AppSettings::default()));
-    let shared_layers = Arc::new(Mutex::new(layers));
-
-    let shared_settings_recv = shared_settings.clone();
+    // 1. Initialize Shared Memory
+    let shm_path = format!("/dev/shm/{}", SHM_PATH);
+    let file = OpenOptions::new().read(true).write(true).create(true).open(&shm_path)
+        .expect("Failed to create shared memory file in /dev/shm/");
     
-    for p in 44101..=44110 {
-        if let Ok(socket) = UdpSocket::bind(format!("127.0.0.1:{}", p)) {
-            socket.set_nonblocking(false).ok();
-            thread::spawn(move || {
-                let mut buf = [0u8; 1024];
-                loop {
-                    if let Ok((len, _)) = socket.recv_from(&mut buf) {
-                        if let Some(new_settings) = from_bytes(&buf[..len]) {
-                            if let Ok(mut s) = shared_settings_recv.lock() { *s = new_settings; }
+    file.set_len(std::mem::size_of::<SharedMemoryBlock>() as u64)
+        .expect("Failed to set SHM file size");
+    
+    let mut mmap = unsafe { memmap2::MmapMut::map_mut(&file).expect("Failed to map shared memory") };
+
+    // Zero out the block cleanly on startup
+    unsafe { (*(mmap.as_mut_ptr() as *mut SharedMemoryBlock)).init_zeroed() };
+    println!("Shared memory initialized at {}", shm_path);
+
+    // 2. Shared Control State
+    let initial_state = DaemonControlMessage {
+        dsp_config: DspConfig::default(),
+        audio_source: AudioSource::SinkMonitor as u32,
+    };
+    let control_state = Arc::new(Mutex::new(initial_state));
+
+    // 3. IPC UDS Listener (Client -> Daemon)
+    let ctrl_state_clone = control_state.clone();
+    thread::spawn(move || {
+        let _ = std::fs::remove_file(CTRL_SOCK_PATH);
+        let listener = UnixListener::bind(CTRL_SOCK_PATH).expect("Failed to bind UDS");
+        println!("Listening for UI controls on {}", CTRL_SOCK_PATH);
+
+        for stream in listener.incoming() {
+            if let Ok(mut stream) = stream {
+                let mut buf = [0u8; std::mem::size_of::<DaemonControlMessage>()];
+                if let Ok(len) = stream.read(&mut buf) {
+                    if len == std::mem::size_of::<DaemonControlMessage>() {
+                        let msg: &DaemonControlMessage = bytemuck::from_bytes(&buf);
+                        if let Ok(mut state) = ctrl_state_clone.lock() {
+                            *state = *msg;
                         }
                     }
                 }
-            });
-            break;
+            }
         }
-    }
+    });
 
+    // 4. Audio Capture Thread (PulseAudio)
     let (audio_tx, audio_rx) = sync_channel::<Vec<f32>>(100);
     let (recycle_tx, recycle_rx) = sync_channel::<Vec<f32>>(100);
+    let audio_ctrl_state = control_state.clone();
 
-    let shared_settings_recorder = shared_settings.clone();
     thread::spawn(move || {
         let mut current_source = AudioSource::SinkMonitor;
         let get_device_name = |source: AudioSource| -> Option<String> {
@@ -453,16 +276,17 @@ pub fn start_audio_engine(ctx: Context) -> (Arc<Mutex<AppSettings>>, Arc<Mutex<V
             let attr = BufferAttr {
                 maxlength: frag_size * 4, tlength: u32::MAX, prebuf: u32::MAX, minreq: u32::MAX, fragsize: frag_size,
             };
-            Simple::new(None, "spector-egui", Direction::Record, device_name.map(|s| s.as_str()), "Recorder", &spec, None, Some(&attr)).ok()
+            Simple::new(None, "spector-daemon", Direction::Record, device_name.map(|s| s.as_str()), "Recorder", &spec, None, Some(&attr)).ok()
         };
 
         let mut stream = open_stream(cached_device_name.as_ref());
         let mut buf = [0u8; 4096];
 
         loop {
-            if let Ok(settings) = shared_settings_recorder.try_lock() {
-                if settings.audio_source != current_source {
-                    current_source = settings.audio_source;
+            if let Ok(settings) = audio_ctrl_state.try_lock() {
+                let target_source = AudioSource::from_u32(settings.audio_source);
+                if target_source != current_source {
+                    current_source = target_source;
                     cached_device_name = get_device_name(current_source);
                     stream = open_stream(cached_device_name.as_ref());
                 }
@@ -484,10 +308,8 @@ pub fn start_audio_engine(ctx: Context) -> (Arc<Mutex<AppSettings>>, Arc<Mutex<V
         }
     });
 
-    let layers_ref = shared_layers.clone();
-    let settings_ref = shared_settings.clone();
-    
-    thread::spawn(move || {
+    // 5. DSP Thread (Heavy Math)
+    let dsp_thread = thread::spawn(move || {
         let max_fft = *RESOLUTIONS.iter().max().unwrap();
         let mut rolling_audio = vec![0.0; max_fft * 2];
         let mut audio_head = 0; 
@@ -518,7 +340,7 @@ pub fn start_audio_engine(ctx: Context) -> (Arc<Mutex<AppSettings>>, Arc<Mutex<V
         let mut local_cqt_col_no_iir = vec![0.0; CQT_BINS];
         let mut local_cqt_col_with_iir = vec![0.0; CQT_BINS];
 
-        let mut tilt_curves: Vec<Vec<f32>> = (0..=RESOLUTIONS.len() + 1).map(|i| {
+        let mut tilt_curves: Vec<Vec<f32>> = (0..NUM_LAYERS).map(|i| {
             let size = if i < RESOLUTIONS.len() { stft_states[i].fft_size / 2 } else { CQT_BINS };
             vec![1.0f32; size]
         }).collect();
@@ -527,7 +349,7 @@ pub fn start_audio_engine(ctx: Context) -> (Arc<Mutex<AppSettings>>, Arc<Mutex<V
         let mut splat_kernels = build_splat_kernels(local_dsp_config.splat_low, local_dsp_config.splat_high);
         let (mut stft_cqt_map, mut iir_filters) = build_cqt_map(SAMPLE_RATE, &stft_specs, local_dsp_config.peak_density_dampening);
 
-        let mut scratch_cols: Vec<Vec<u8>> = (0..=RESOLUTIONS.len() + 1).map(|i| {
+        let mut scratch_cols: Vec<Vec<u8>> = (0..NUM_LAYERS).map(|i| {
             let size = if i < RESOLUTIONS.len() { stft_states[i].fft_size / 2 } else { CQT_BINS };
             vec![0u8; size] 
         }).collect();
@@ -592,10 +414,21 @@ pub fn start_audio_engine(ctx: Context) -> (Arc<Mutex<AppSettings>>, Arc<Mutex<V
         let mut consecutive_black_hops: u64 = 0;
         let mut cqt_max_sample = 0.0f32;
 
+        // Local tracking of updates so we can atomic store later
+        let mut local_heads = [0usize; NUM_LAYERS];
+        let mut local_updates = [0u64; NUM_LAYERS];
+
+        // Move mmap into this thread to keep it alive and get the pointer safely
+        let mut mmap = mmap;
+
+        // Access the shared memory!
+        let shm_block = unsafe { &mut *(mmap.as_mut_ptr() as *mut SharedMemoryBlock) };
+
         loop {
-            if let Ok(s) = settings_ref.lock() {
-                if s.dsp_config != local_dsp_config {
-                    local_dsp_config = s.dsp_config;
+            // 1. Check for control settings updates
+            if let Ok(state) = control_state.try_lock() {
+                if state.dsp_config != local_dsp_config {
+                    local_dsp_config = state.dsp_config;
                     rebuild_dsp_caches(&local_dsp_config, &mut stft_states, &mut tilt_curves, &mut cqt_decays, &mut splat_kernels, &mut stft_cqt_map);
                 }
             }
@@ -614,27 +447,26 @@ pub fn start_audio_engine(ctx: Context) -> (Arc<Mutex<AppSettings>>, Arc<Mutex<V
                             let hops_to_push = std::cmp::min(missed_hops, (MAX_HISTORY as u64).saturating_sub(consecutive_black_hops));
                             
                             if hops_to_push > 0 {
-                                if let Ok(mut layers) = layers_ref.lock() {
-                                    for layer in layers.iter_mut() {
-                                        let h = layer.head;
-                                        let h_push = hops_to_push as usize;
-                                        
-                                        // --- DATA SPARSITY (THE SHADER TRICK) ---
-                                        // We DO NOT write black to the massive 3.3MB `pixels` array!
-                                        // We just execute a hyper-fast 1D memset to zero out the mask!
-                                        if h + h_push <= MAX_HISTORY {
-                                            layer.mask[h .. h + h_push].fill(0);
-                                        } else {
-                                            let chunk1 = MAX_HISTORY - h;
-                                            layer.mask[h .. MAX_HISTORY].fill(0);
-                                            layer.mask[0 .. (h_push - chunk1)].fill(0);
-                                        }
-
-                                        layer.head = (layer.head + hops_to_push as usize) % MAX_HISTORY;
-                                        layer.total_updates += hops_to_push; 
+                                // SPARSITY MASK FAST-FORWARD (SHM Version)
+                                for i in 0..NUM_LAYERS {
+                                    let layer = &mut shm_block.layers[i];
+                                    let h = local_heads[i];
+                                    let h_push = hops_to_push as usize;
+                                    
+                                    if h + h_push <= MAX_HISTORY {
+                                        layer.mask[h .. h + h_push].fill(0);
+                                    } else {
+                                        let chunk1 = MAX_HISTORY - h;
+                                        layer.mask[h .. MAX_HISTORY].fill(0);
+                                        layer.mask[0 .. (h_push - chunk1)].fill(0);
                                     }
+
+                                    local_heads[i] = (h + h_push) % MAX_HISTORY;
+                                    local_updates[i] += hops_to_push;
+                                    
+                                    layer.head.store(local_heads[i], Ordering::Release);
+                                    layer.total_updates.store(local_updates[i], Ordering::Release);
                                 }
-                                ctx.request_repaint();
                                 consecutive_black_hops += hops_to_push;
                             }
                             
@@ -653,9 +485,76 @@ pub fn start_audio_engine(ctx: Context) -> (Arc<Mutex<AppSettings>>, Arc<Mutex<V
                 last_recv_time = std::time::Instant::now(); 
             }
 
-            let mut pushed_audio = false;
-
             while pending_buffer.len() >= MIN_HOP_SIZE {
+                let is_sleeping = consecutive_black_hops >= MAX_HISTORY as u64;
+
+                if is_sleeping {
+                    // Check if the next chunk has any valid sound before we skip the math
+                    let mut wake_up = false;
+                    for i in 0..MIN_HOP_SIZE {
+                        if pending_buffer[i].abs() >= 1e-5 {
+                            wake_up = true;
+                            break;
+                        }
+                    }
+
+                    if !wake_up {
+                        // FAST-FORWARD: Consume the silent audio without doing heavy DSP
+                        for _ in 0..MIN_HOP_SIZE {
+                            pending_buffer.pop_front();
+                        }
+                        
+                        // Keep the timing grids aligned so STFTs and CQT stay in phase relative to each other
+                        iir_samples_accum += MIN_HOP_SIZE;
+                        for state in stft_states.iter_mut() {
+                            state.samples_since_last += MIN_HOP_SIZE;
+                            if state.samples_since_last >= state.hop_size {
+                                state.samples_since_last -= state.hop_size;
+                            }
+                        }
+                        
+                        cqt_samples_since_last += MIN_HOP_SIZE;
+                        if cqt_samples_since_last >= CQT_HOP_SIZE {
+                            cqt_samples_since_last -= CQT_HOP_SIZE;
+                            // Cap to prevent overflow, we are already past MAX_HISTORY anyway
+                            if consecutive_black_hops < u64::MAX - 100 {
+                                consecutive_black_hops += 1;
+                            }
+                        }
+                        continue; // Bypass the heavy math loop!
+                    } else {
+                        // WAKE-UP SEQUENCE!
+                        consecutive_black_hops = 0;
+                        
+                        // Edge Case 1: Wipe the audio ring buffer. 
+                        // Prevents any microscopic dither/noise frozen 15 seconds ago from leaking into the new STFT window.
+                        rolling_audio.fill(0.0);
+                        
+                        // Edge Case 2: Zero the IIR delay lines.
+                        // Prevents the filters from applying an old, microscopic state to a huge new transient (prevents math clicks).
+                        for (_, biquad, _) in iir_filters.iter_mut() {
+                            biquad.z1 = 0.0;
+                            biquad.z2 = 0.0;
+                        }
+                        iir_power_accum.fill(0.0);
+                        iir_peak_accum.fill(0.0);
+                        
+                        // Edge Case 3: Zero the phase trackers.
+                        // Prevents a massive, incorrect phase differential calculation from jumping across 15 seconds of missing time.
+                        for state in stft_states.iter_mut() {
+                            state.prev_phases.fill(0.0);
+                            state.last_mags.fill(0.0);
+                            state.last_true_freqs.fill(0.0);
+                            state.display_mags.fill(0.0);
+                        }
+                        
+                        prev_cqt_col_no_iir.fill(0.0);
+                        prev_cqt_col_with_iir.fill(0.0);
+                        local_cqt_col_no_iir.fill(0.0);
+                        local_cqt_col_with_iir.fill(0.0);
+                    }
+                }
+
                 for _ in 0..MIN_HOP_SIZE {
                     let sample = pending_buffer.pop_front().unwrap();
                     cqt_max_sample = cqt_max_sample.max(sample.abs());
@@ -736,7 +635,7 @@ pub fn start_audio_engine(ctx: Context) -> (Arc<Mutex<AppSettings>>, Arc<Mutex<V
                     if iir_samples_accum > 0 {
                         let inv_samples = 1.0 / iir_samples_accum as f32;
                         for &(bin, _, bw) in iir_filters.iter() {
-                            let norm_factor = if local_dsp_config.psd_normalization { bw / min_iir_bw } else { 1.0 };
+                            let norm_factor = if local_dsp_config.psd_normalization == 1 { bw / min_iir_bw } else { 1.0 };
                             let rms = ((iir_power_accum[bin] * inv_samples) / norm_factor).sqrt();
                             iir_amplitudes[bin] = ((iir_peak_accum[bin] * local_dsp_config.peak_weight) + (rms * local_dsp_config.rms_weight)) * local_dsp_config.iir_boost; 
                         }
@@ -748,7 +647,7 @@ pub fn start_audio_engine(ctx: Context) -> (Arc<Mutex<AppSettings>>, Arc<Mutex<V
 
                     for inst in stft_cqt_map.iter() {
                         let state = &stft_states[inst.fft_idx];
-                        let norm_factor = if local_dsp_config.psd_normalization { inst.weight_sum / min_stft_weight_sum } else { 1.0 };
+                        let norm_factor = if local_dsp_config.psd_normalization == 1 { inst.weight_sum / min_stft_weight_sum } else { 1.0 };
                         let resolution_comp = state.window_size as f32 / 2048.0;
                         let comp_mag_factor = resolution_comp.sqrt();
                         
@@ -798,12 +697,12 @@ pub fn start_audio_engine(ctx: Context) -> (Arc<Mutex<AppSettings>>, Arc<Mutex<V
                         prev_cqt_col_with_iir[bin] = local_cqt_col_with_iir[bin];
                     }
 
-                    for i in 0..=RESOLUTIONS.len() + 1 {
+                    for i in 0..NUM_LAYERS {
                         let data_source = if i < RESOLUTIONS.len() { &stft_states[i].display_mags } else if i == RESOLUTIONS.len() { &local_cqt_col_no_iir } else { &local_cqt_col_with_iir };
                         compute_column_colors(&mut scratch_cols[i], data_source, if i < RESOLUTIONS.len() { stft_states[i].fft_size / 2 } else { CQT_BINS }, &tilt_curves[i], &lut);
                     }
 
-                    if cqt_max_sample < 1e-6 {
+                    if cqt_max_sample < 1e-5 {
                         consecutive_black_hops += 1;
                     } else {
                         consecutive_black_hops = 0;
@@ -811,33 +710,33 @@ pub fn start_audio_engine(ctx: Context) -> (Arc<Mutex<AppSettings>>, Arc<Mutex<V
                     cqt_max_sample = 0.0;
 
                     if consecutive_black_hops < MAX_HISTORY as u64 {
-                        if let Ok(mut layers) = layers_ref.lock() {
-                            for i in 0..=RESOLUTIONS.len() + 1 {
-                                let layer = &mut layers[i];
-                                let head = layer.head;
-                                
-                                layer.mask[head] = 255; // Valid audio marker
-                                
-                                for y in 0..layer.freq_bins {
-                                    layer.pixels[y * MAX_HISTORY + head] = scratch_cols[i][y];
-                                }
-                                
-                                layer.head = (layer.head + 1) % MAX_HISTORY;
-                                layer.total_updates += 1;
+                        // --- WRITE TO SHARED MEMORY ---
+                        for i in 0..NUM_LAYERS {
+                            let layer = &mut shm_block.layers[i];
+                            let head = local_heads[i];
+                            
+                            layer.mask[head] = 255; // Valid audio marker
+                            
+                            // Unroll writes to the massive flat pixel array
+                            let active_bins = layer.active_freq_bins;
+                            for y in 0..active_bins {
+                                layer.pixels[y * MAX_HISTORY + head] = scratch_cols[i][y];
                             }
+                            
+                            local_heads[i] = (head + 1) % MAX_HISTORY;
+                            local_updates[i] += 1;
+                            
+                            // Atomic publish to the UI clients
+                            layer.head.store(local_heads[i], Ordering::Release);
+                            layer.total_updates.store(local_updates[i], Ordering::Release);
                         }
-                        pushed_audio = true;
                     }
                     
                     cqt_samples_since_last -= CQT_HOP_SIZE;
                 }
             }
-            
-            if pushed_audio {
-                ctx.request_repaint();
-            }
         }
     });
 
-    (shared_settings, shared_layers)
+    dsp_thread.join().unwrap();
 }

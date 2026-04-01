@@ -1,30 +1,28 @@
-[package]
-name = "spector"
+[workspace]
+members = [
+    "spector_core",
+    "spector_daemon",
+    "spector_client"
+]
+resolver = "2"
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
-default-run = "spector"
+authors = ["Spector Developer"]
 
-[[bin]]
-name = "spector"
-path = "src/main.rs"
-
-[[bin]]
-name = "spector-bg"
-path = "src/main.rs"
-required-features = ["bg"]
-
-[dependencies]
+[workspace.dependencies]
+# UI / Graphics (Used by Client)
 eframe = "0.34.1"
 wgpu = "29"
-macroquad = "0.4"          # The Game Engine
-#egui-macroquad = "0.17"
-ringbuf = "0.3"            # Thread Bridge
-spectrum-analyzer = "1.5"  # FFT Math
-rustfft = "6.1"
-colorous = "1.0"           # Pro Colormaps
-libpulse-binding = "2.28"  # Audio Driver
-libpulse-simple-binding = "2.28"
+colorous = "1.0"
 
-[features]
-default = []
-bg = []
+# DSP / Audio (Used by Daemon)
+rustfft = "6.1"
+libpulse-binding = "2.28"
+libpulse-simple-binding = "2.28"
+pipewire = "0.9.2"
+
+# IPC & Memory (Used by both)
+memmap2 = "0.9.3"
+bytemuck = { version = "1.14", features = ["derive"] }

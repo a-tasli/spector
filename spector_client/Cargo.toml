@@ -1,0 +1,14 @@
+[package]
+name = "spector_client"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+default-run = "spector_client"
+
+[dependencies]
+spector_core = { path = "../spector_core" }
+eframe.workspace = true
+wgpu.workspace = true
+colorous.workspace = true
+memmap2.workspace = true
+bytemuck.workspace = true
