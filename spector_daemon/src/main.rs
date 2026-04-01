@@ -9,17 +9,25 @@ use std::sync::{mpsc::sync_channel, Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-// PulseAudio bindings
-use libpulse_binding::def::BufferAttr;
-use libpulse_binding::sample::{Format, Spec};
-use libpulse_binding::stream::Direction;
-use libpulse_simple_binding::Simple;
+// --- PIPEWIRE 0.9.2 NATIVE IMPORTS ---
+use pipewire::main_loop::MainLoopRc;
+use pipewire::context::ContextBox;
+use pipewire::stream::{StreamBox, StreamFlags};
+use pipewire::spa::utils::Direction;
+use pipewire::properties::properties;
+
+// Format negotiation imports based on libspa documentation
+use pipewire::spa::param::audio::{AudioInfoRaw, AudioFormat};
+use pipewire::spa::pod::{Pod, Value, Object};
+use pipewire::spa::pod::serialize::PodSerializer;
+use pipewire::spa::sys::{SPA_TYPE_OBJECT_Format, SPA_PARAM_EnumFormat};
 
 // --- INTERNAL DSP CONFIG ---
-const USE_PHASE_CONFIDENCE_FILTER: bool = false;
+const USE_PHASE_CONFIDENCE_FILTER: bool = true;
 const SPECTRAL_OVERSAMPLING: bool = false;
 const OVERSAMPLE_TARGET: usize = 16384;
 const MANUAL_STFT_MAPPING: bool = true;
+const IIR_DECIMATION_FACTOR: usize = 16; // Downsample 48kHz to 3kHz for low-freq IIR filters
 
 struct ManualMapping {
     max_freq: f32,
@@ -74,6 +82,20 @@ impl Biquad {
         let alpha = w0.sin() / (2.0 * q);
         let a0 = 1.0 + alpha;
         Self { b0: alpha / a0, b1: 0.0, b2: -alpha / a0, a1: (-2.0 * w0.cos()) / a0, a2: (1.0 - alpha) / a0, z1: 0.0, z2: 0.0 }
+    }
+    fn lowpass(fs: f32, f0: f32, q: f32) -> Self {
+        let w0 = 2.0 * std::f32::consts::PI * f0 / fs;
+        let alpha = w0.sin() / (2.0 * q);
+        let a0 = 1.0 + alpha;
+        Self { 
+            b0: ((1.0 - w0.cos()) / 2.0) / a0, 
+            b1: (1.0 - w0.cos()) / a0, 
+            b2: ((1.0 - w0.cos()) / 2.0) / a0, 
+            a1: (-2.0 * w0.cos()) / a0, 
+            a2: (1.0 - alpha) / a0, 
+            z1: 0.0, 
+            z2: 0.0 
+        }
     }
     #[inline(always)]
     fn process(&mut self, x: f32) -> f32 {
@@ -130,7 +152,8 @@ fn build_cqt_map(sample_rate: u32, stft_specs: &[(usize, usize)], peak_damp_amou
 
         if freq < IIR_CROSSOVER_UPPER_HZ {
             let q_factor = freq / bw_hz;
-            iir_filters.push((bin, Biquad::bandpass(sample_rate as f32, freq, q_factor), bw_hz));
+            let dec_sample_rate = sample_rate as f32 / IIR_DECIMATION_FACTOR as f32;
+            iir_filters.push((bin, Biquad::bandpass(dec_sample_rate, freq, q_factor), bw_hz));
         }
         
         let (max_win_size, _) = stft_specs[stft_specs.len() - 1];
@@ -190,6 +213,7 @@ struct StftState {
     bin_freqs: Vec<f32>, expected_advances: Vec<f32>, prev_phases: Vec<f32>,
     last_mags: Vec<f32>, display_mags: Vec<f32>, last_true_freqs: Vec<f32>, decays: Vec<f32>, 
     fft: Arc<dyn rustfft::Fft<f32>>, window: Vec<f32>, scratch_buffer: Vec<Complex<f32>>, 
+    cqt_target_bins: Vec<f32>, cqt_bin_derivatives: Vec<f32>,
 }
 
 #[inline(always)]
@@ -204,6 +228,8 @@ fn compute_column_colors(col_buffer: &mut [u8], data: &[f32], freq_bins: usize, 
 fn main() {
     println!("Spector Daemon Starting...");
 
+    pipewire::init();
+
     // 1. Initialize Shared Memory
     let shm_path = format!("/dev/shm/{}", SHM_PATH);
     let file = OpenOptions::new().read(true).write(true).create(true).open(&shm_path)
@@ -213,8 +239,6 @@ fn main() {
         .expect("Failed to set SHM file size");
     
     let mut mmap = unsafe { memmap2::MmapMut::map_mut(&file).expect("Failed to map shared memory") };
-
-    // Zero out the block cleanly on startup
     unsafe { (*(mmap.as_mut_ptr() as *mut SharedMemoryBlock)).init_zeroed() };
     println!("Shared memory initialized at {}", shm_path);
 
@@ -225,13 +249,13 @@ fn main() {
     };
     let control_state = Arc::new(Mutex::new(initial_state));
 
-    // 3. IPC UDS Listener (Client -> Daemon)
+    // 3. IPC UDS Listener
     let ctrl_state_clone = control_state.clone();
     thread::spawn(move || {
         let _ = std::fs::remove_file(CTRL_SOCK_PATH);
         let listener = UnixListener::bind(CTRL_SOCK_PATH).expect("Failed to bind UDS");
         println!("Listening for UI controls on {}", CTRL_SOCK_PATH);
-
+        
         for stream in listener.incoming() {
             if let Ok(mut stream) = stream {
                 let mut buf = [0u8; std::mem::size_of::<DaemonControlMessage>()];
@@ -247,64 +271,164 @@ fn main() {
         }
     });
 
-    // 4. Audio Capture Thread (PulseAudio)
+    // 4. Audio Capture Thread (Native PipeWire 0.9.2)
     let (audio_tx, audio_rx) = sync_channel::<Vec<f32>>(100);
     let (recycle_tx, recycle_rx) = sync_channel::<Vec<f32>>(100);
+    
+    // We wrap the receiver in an Arc<Mutex> so it can be safely handed to the callback
+    let recycle_rx_arc = Arc::new(Mutex::new(recycle_rx));
     let audio_ctrl_state = control_state.clone();
 
     thread::spawn(move || {
         let mut current_source = AudioSource::SinkMonitor;
-        let get_device_name = |source: AudioSource| -> Option<String> {
-            match source {
-                AudioSource::SinkMonitor => {
-                    if let Ok(output) = std::process::Command::new("pactl").arg("get-default-sink").output() {
-                        Some(format!("{}.monitor", String::from_utf8_lossy(&output.stdout).trim()))
-                    } else { None }
-                },
-                AudioSource::Microphone => {
-                    if let Ok(output) = std::process::Command::new("pactl").arg("get-default-source").output() {
-                        Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
-                    } else { None }
-                }
-            }
-        };
-
-        let mut cached_device_name = get_device_name(current_source);
-        let open_stream = |device_name: Option<&String>| -> Option<Simple> {
-            let spec = Spec { format: Format::F32le, channels: 1, rate: SAMPLE_RATE };
-            let frag_size = (SAMPLE_RATE as u32 * 4 * 15) / 1000; 
-            let attr = BufferAttr {
-                maxlength: frag_size * 4, tlength: u32::MAX, prebuf: u32::MAX, minreq: u32::MAX, fragsize: frag_size,
-            };
-            Simple::new(None, "spector-daemon", Direction::Record, device_name.map(|s| s.as_str()), "Recorder", &spec, None, Some(&attr)).ok()
-        };
-
-        let mut stream = open_stream(cached_device_name.as_ref());
-        let mut buf = [0u8; 4096];
 
         loop {
             if let Ok(settings) = audio_ctrl_state.try_lock() {
-                let target_source = AudioSource::from_u32(settings.audio_source);
-                if target_source != current_source {
-                    current_source = target_source;
-                    cached_device_name = get_device_name(current_source);
-                    stream = open_stream(cached_device_name.as_ref());
-                }
+                current_source = AudioSource::from_u32(settings.audio_source);
             }
 
-            if let Some(ref s) = stream {
-                if let Ok(_) = s.read(&mut buf) {
-                    let floats: &[f32] = unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const f32, buf.len() / 4) };
-                    let mut chunk = recycle_rx.try_recv().unwrap_or_else(|_| Vec::with_capacity(1024));
-                    chunk.clear(); chunk.extend_from_slice(floats);
-                    let _ = audio_tx.send(chunk);
-                } else {
-                    thread::sleep(Duration::from_millis(50));
-                }
+            // MainLoop is an Rc so it can be cloned, but Context and Stream stay as Box variants
+            let mainloop = MainLoopRc::new(None).expect("Failed to create PipeWire Mainloop");
+            let context = ContextBox::new(&mainloop.loop_(), None).expect("Failed to create PipeWire Context");
+            let core = context.connect(None).expect("Failed to connect to PipeWire Core");
+
+            let mut props = properties! {
+                "media.type" => "Audio",
+                "media.category" => "Capture",
+                "media.role" => "Music",
+                "media.class" => "Stream/Input/Audio", 
+                "node.name" => "spector_daemon",
+                "node.description" => "Spector Audio Capture",
+                "audio.format" => "F32LE",
+                "audio.rate" => SAMPLE_RATE.to_string(),
+                "audio.channels" => "2",
+                "audio.position" => "FL,FR",
+                // Explicit quantum size request - saves battery by doing large batches!
+                "node.latency" => "8192/48000", 
+            };
+
+            // This single property handles the auto-routing between sink and source
+            if current_source == AudioSource::SinkMonitor {
+                props.insert("stream.capture.sink", "true");
+                println!("[DEBUG] PW Thread: Configured to capture SinkMonitor.");
             } else {
-                thread::sleep(Duration::from_millis(100));
-                stream = open_stream(cached_device_name.as_ref());
+                println!("[DEBUG] PW Thread: Configured to capture Source.");
             }
+
+            // Zero generics used for the stream constructor
+            let stream = StreamBox::new(&core, "Spector Capture", props)
+                .expect("Failed to create PipeWire Stream");
+
+            let audio_tx_clone = audio_tx.clone();
+            let rx_arc = recycle_rx_arc.clone();
+            let mut pw_frame_count = 0u64;
+
+            let _listener = stream
+                .add_local_listener::<()>() // Explicitly default the user data
+                .process(move |stream, _data| {
+                    pw_frame_count += 1;
+                    if let Some(mut buffer) = stream.dequeue_buffer() {
+                        let datas = buffer.datas_mut();
+                        if !datas.is_empty() {
+                            let data = &mut datas[0];
+                            
+                            // Extract chunk properties BEFORE taking the mutable slice
+                            let offset = data.chunk().offset() as usize;
+                            let size = data.chunk().size() as usize;
+                            
+                            if let Some(slice) = data.data() {
+                                if size > 0 && offset + size <= slice.len() {
+                                    let valid_bytes = &slice[offset .. offset + size];
+                                    let valid_len = valid_bytes.len() - (valid_bytes.len() % 4);
+                                    
+                                    if valid_len > 0 {
+                                        // Zero-copy cast directly from the hardware DMA-BUF
+                                        let floats: &[f32] = bytemuck::cast_slice(&valid_bytes[..valid_len]);
+
+                                        // EARLY SILENCE GATE
+                                        // If the slice is entirely zeroes (or below noise floor), abort instantly.
+                                        // Avoids all float math, MPSC locking, and keeps the DSP thread sleeping.
+                                        if !floats.iter().any(|&val| val.abs() >= 1e-5) {
+                                            return; 
+                                        }
+                                        
+                                        if pw_frame_count % 100 == 0 {
+                                            println!("[DEBUG] PW Thread: Captured frame {}. Valid floats: {}", pw_frame_count, floats.len());
+                                        }
+
+                                        let mut chunk_vec = if let Ok(guard) = rx_arc.try_lock() {
+                                            guard.try_recv().unwrap_or_else(|_| Vec::with_capacity(1024))
+                                        } else {
+                                            Vec::with_capacity(1024)
+                                        };
+                                        
+                                        chunk_vec.clear();
+                                        
+                                        // Downmix the guaranteed 2-channel interleaved audio to Mono for the DSP
+                                        for chunk in floats.chunks_exact(2) {
+                                            chunk_vec.push((chunk[0] + chunk[1]) * 0.5);
+                                        }
+                                        
+                                        if let Err(_) = audio_tx_clone.try_send(chunk_vec) {
+                                            println!("[DEBUG] PW Thread: WARNING - audio_tx channel FULL! Dropping chunk!");
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                })
+                .register()
+                .expect("Failed to register stream listener");
+
+            // 1. Define the Raw Audio Info
+            let mut audio_info = AudioInfoRaw::new();
+            audio_info.set_format(AudioFormat::F32LE);
+            audio_info.set_rate(SAMPLE_RATE);
+            audio_info.set_channels(2);
+
+            // 2. Serialize into a byte vector using the exact documentation method
+            let values: Vec<u8> = PodSerializer::serialize(
+                std::io::Cursor::new(Vec::new()),
+                &Value::Object(Object {
+                    type_: SPA_TYPE_OBJECT_Format,
+                    id: SPA_PARAM_EnumFormat,
+                    properties: audio_info.into(),
+                })
+            ).expect("Failed to serialize pod").0.into_inner();
+
+            // 3. Reconstruct the Pod from bytes
+            let mut params = [Pod::from_bytes(&values).expect("Failed to parse pod")];
+
+            // 4. Pass the params array to connect
+            stream.connect(
+                Direction::Input,
+                None, 
+                StreamFlags::AUTOCONNECT | StreamFlags::MAP_BUFFERS | StreamFlags::RT_PROCESS,
+                &mut params,
+            ).expect("Failed to connect PipeWire stream");
+
+            let quit_loop = mainloop.clone();
+            let state_clone = audio_ctrl_state.clone();
+            let capture_source = current_source;
+
+            let _timer = mainloop.loop_().add_timer(move |_expirations| {
+                if let Ok(settings) = state_clone.try_lock() {
+                    if AudioSource::from_u32(settings.audio_source) != capture_source {
+                        quit_loop.quit();
+                    }
+                }
+            });
+            
+            // Poll the IPC state safely on the Mainloop
+            let _ = _timer.update_timer(
+                Some(Duration::from_millis(50)), 
+                Some(Duration::from_millis(50))
+            );
+
+            println!("[DEBUG] PW Thread: Starting Mainloop run...");
+            // Sleep safely!
+            mainloop.run();
         }
     });
 
@@ -323,17 +447,38 @@ fn main() {
         }).collect();
 
         let mut planner = FftPlanner::new();
+        
+        let taylor_min_log_f = 20.0f32.log2();
+        let taylor_log_range_inv = 1.0 / (MAX_DISPLAY_FREQ.log2() - taylor_min_log_f);
+        let taylor_bins_sub_1 = (CQT_BINS - 1) as f32;
+        let taylor_ln2_inv = 1.0 / std::f32::consts::LN_2;
+
         let mut stft_states: Vec<StftState> = stft_specs.iter().zip(HOP_SIZES.iter()).map(|(&(win_size, fft_size), &hop_size)| {
             let freq_res = SAMPLE_RATE as f32 / fft_size as f32;
             let hop_advance = 2.0 * std::f32::consts::PI * hop_size as f32 / fft_size as f32;
+            
+            let mut bin_freqs = Vec::with_capacity(fft_size / 2);
+            let mut cqt_target_bins = vec![0.0; fft_size / 2];
+            let mut cqt_bin_derivatives = vec![0.0; fft_size / 2];
+
+            for b in 0..fft_size / 2 {
+                let f = b as f32 * freq_res;
+                bin_freqs.push(f);
+                let f_safe = f.max(0.001);
+                if f_safe >= 20.0 {
+                    cqt_target_bins[b] = (f_safe.log2() - taylor_min_log_f) * taylor_log_range_inv * taylor_bins_sub_1;
+                    cqt_bin_derivatives[b] = (1.0 / f_safe) * taylor_ln2_inv * taylor_log_range_inv * taylor_bins_sub_1;
+                }
+            }
+
             StftState {
                 window_size: win_size, fft_size, hop_size, samples_since_last: hop_size,
-                bin_freqs: (0..fft_size / 2).map(|b| b as f32 * freq_res).collect(),
-                expected_advances: (0..fft_size / 2).map(|b| b as f32 * hop_advance).collect(),
+                bin_freqs, expected_advances: (0..fft_size / 2).map(|b| b as f32 * hop_advance).collect(),
                 prev_phases: vec![0.0; fft_size / 2], last_mags: vec![0.0; fft_size / 2],
                 display_mags: vec![0.0; fft_size / 2], last_true_freqs: vec![0.0; fft_size / 2], decays: vec![0.0; fft_size / 2], 
                 fft: planner.plan_fft_forward(fft_size), window: generate_hann_window(win_size),
                 scratch_buffer: vec![Complex { re: 0.0, im: 0.0 }; fft_size],
+                cqt_target_bins, cqt_bin_derivatives,
             }
         }).collect();
 
@@ -357,12 +502,11 @@ fn main() {
         let rebuild_dsp_caches = |config: &DspConfig, stft_states: &mut Vec<StftState>, tilt_curves: &mut Vec<Vec<f32>>, cqt_decays: &mut Vec<f32>, splat_kernels: &mut Vec<SplatKernel>, stft_cqt_map: &mut Vec<CqtInstruction>| {
             for (i, state) in stft_states.iter_mut().enumerate() {
                 let half_size = state.fft_size / 2;
-                let freq_res = SAMPLE_RATE as f32 / state.fft_size as f32;
                 let min_log = 20.0f32.log2();
                 let log_range_stft = (SAMPLE_RATE as f32 / 2.0).log2() - min_log; 
                 
                 for bin in 0..half_size {
-                    let freq = bin as f32 * freq_res;
+                    let freq = state.bin_freqs[bin];
                     let norm = if freq >= 20.0 { ((freq.log2() - min_log) / log_range_stft).clamp(0.0, 1.0) } else { 0.0 };
                     state.decays[bin] = config.decay_low + (config.decay_high - config.decay_low) * norm;
                     if freq > 20.0 { tilt_curves[i][bin] = 10.0f32.powf((norm * log_range_stft * config.pink_noise_tilt) / 20.0); } 
@@ -404,9 +548,6 @@ fn main() {
         let mut prev_cqt_col_no_iir = vec![0.0f32; CQT_BINS];
         let mut prev_cqt_col_with_iir = vec![0.0f32; CQT_BINS];
 
-        let min_log_f = 20.0f32.log2();
-        let log_range_f = MAX_DISPLAY_FREQ.log2() - min_log_f;
-        let log_range_inv = 1.0 / log_range_f;
         let two_pi = 2.0 * std::f32::consts::PI;
 
         let mut last_recv_time = std::time::Instant::now();
@@ -414,15 +555,19 @@ fn main() {
         let mut consecutive_black_hops: u64 = 0;
         let mut cqt_max_sample = 0.0f32;
 
-        // Local tracking of updates so we can atomic store later
         let mut local_heads = [0usize; NUM_LAYERS];
         let mut local_updates = [0u64; NUM_LAYERS];
+        
+        let mut dsp_sleep_log_count = 0u64;
+        let mut dsp_active_log_count = 0u64;
+        let mut timeout_log_count = 0u64;
 
-        // Move mmap into this thread to keep it alive and get the pointer safely
         let mut mmap = mmap;
-
-        // Access the shared memory!
         let shm_block = unsafe { &mut *(mmap.as_mut_ptr() as *mut SharedMemoryBlock) };
+
+        // Lowpass filter at ~500 Hz to prevent aliasing before we decimate by 16
+        let mut iir_decimation_lpf = Biquad::lowpass(SAMPLE_RATE as f32, IIR_CROSSOVER_UPPER_HZ * 2.0, 0.707);
+        let mut decimation_counter = 0;
 
         loop {
             // 1. Check for control settings updates
@@ -441,6 +586,11 @@ fn main() {
                         last_recv_time = std::time::Instant::now();
                     }
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        if timeout_log_count % 20 == 0 {
+                            println!("[DEBUG] DSP Thread: TIMEOUT waiting for audio. PipeWire isn't sending data.");
+                        }
+                        timeout_log_count += 1;
+                        
                         let elapsed = last_recv_time.elapsed();
                         if elapsed >= cqt_hop_duration {
                             let missed_hops = (elapsed.as_secs_f32() / cqt_hop_duration.as_secs_f32()) as u64;
@@ -489,7 +639,6 @@ fn main() {
                 let is_sleeping = consecutive_black_hops >= MAX_HISTORY as u64;
 
                 if is_sleeping {
-                    // Check if the next chunk has any valid sound before we skip the math
                     let mut wake_up = false;
                     for i in 0..MIN_HOP_SIZE {
                         if pending_buffer[i].abs() >= 1e-5 {
@@ -499,13 +648,16 @@ fn main() {
                     }
 
                     if !wake_up {
-                        // FAST-FORWARD: Consume the silent audio without doing heavy DSP
+                        if dsp_sleep_log_count % 50 == 0 {
+                            println!("[DEBUG] DSP Thread: SLEEPING. Audio below 1e-5 threshold. Black hops: {}", consecutive_black_hops);
+                        }
+                        dsp_sleep_log_count += 1;
+                        
                         for _ in 0..MIN_HOP_SIZE {
                             pending_buffer.pop_front();
                         }
                         
-                        // Keep the timing grids aligned so STFTs and CQT stay in phase relative to each other
-                        iir_samples_accum += MIN_HOP_SIZE;
+                        iir_samples_accum += MIN_HOP_SIZE / IIR_DECIMATION_FACTOR;
                         for state in stft_states.iter_mut() {
                             state.samples_since_last += MIN_HOP_SIZE;
                             if state.samples_since_last >= state.hop_size {
@@ -516,31 +668,32 @@ fn main() {
                         cqt_samples_since_last += MIN_HOP_SIZE;
                         if cqt_samples_since_last >= CQT_HOP_SIZE {
                             cqt_samples_since_last -= CQT_HOP_SIZE;
-                            // Cap to prevent overflow, we are already past MAX_HISTORY anyway
                             if consecutive_black_hops < u64::MAX - 100 {
                                 consecutive_black_hops += 1;
                             }
                         }
-                        continue; // Bypass the heavy math loop!
+                        continue; 
                     } else {
-                        // WAKE-UP SEQUENCE!
-                        consecutive_black_hops = 0;
+                        if dsp_active_log_count % 50 == 0 {
+                            println!("[DEBUG] DSP Thread: WAKING UP! Found valid audio data > 1e-5.");
+                        }
+                        dsp_active_log_count += 1;
                         
-                        // Edge Case 1: Wipe the audio ring buffer. 
-                        // Prevents any microscopic dither/noise frozen 15 seconds ago from leaking into the new STFT window.
+                        consecutive_black_hops = 0;
                         rolling_audio.fill(0.0);
                         
-                        // Edge Case 2: Zero the IIR delay lines.
-                        // Prevents the filters from applying an old, microscopic state to a huge new transient (prevents math clicks).
+                        iir_decimation_lpf.z1 = 0.0;
+                        iir_decimation_lpf.z2 = 0.0;
+                        decimation_counter = 0;
+                        
                         for (_, biquad, _) in iir_filters.iter_mut() {
                             biquad.z1 = 0.0;
                             biquad.z2 = 0.0;
                         }
                         iir_power_accum.fill(0.0);
                         iir_peak_accum.fill(0.0);
+                        iir_samples_accum = 0;
                         
-                        // Edge Case 3: Zero the phase trackers.
-                        // Prevents a massive, incorrect phase differential calculation from jumping across 15 seconds of missing time.
                         for state in stft_states.iter_mut() {
                             state.prev_phases.fill(0.0);
                             state.last_mags.fill(0.0);
@@ -559,17 +712,24 @@ fn main() {
                     let sample = pending_buffer.pop_front().unwrap();
                     cqt_max_sample = cqt_max_sample.max(sample.abs());
 
-                    for (bin_idx, biquad, _) in iir_filters.iter_mut() {
-                        let filtered = biquad.process(sample);
-                        iir_power_accum[*bin_idx] += filtered * filtered;
-                        let abs_f = filtered.abs();
-                        if abs_f > iir_peak_accum[*bin_idx] { iir_peak_accum[*bin_idx] = abs_f; }
+                    // Decimation block: Lowpass the signal to prevent aliasing, then drop 15 out of 16 samples.
+                    let lpf_sample = iir_decimation_lpf.process(sample);
+                    decimation_counter += 1;
+                    if decimation_counter >= IIR_DECIMATION_FACTOR {
+                        decimation_counter = 0;
+                        for (bin_idx, biquad, _) in iir_filters.iter_mut() {
+                            let filtered = biquad.process(lpf_sample);
+                            iir_power_accum[*bin_idx] += filtered * filtered;
+                            let abs_f = filtered.abs();
+                            if abs_f > iir_peak_accum[*bin_idx] { iir_peak_accum[*bin_idx] = abs_f; }
+                        }
+                        iir_samples_accum += 1;
                     }
+
                     rolling_audio[audio_head] = sample;
                     rolling_audio[audio_head + max_fft] = sample;
                     audio_head = (audio_head + 1) % max_fft;
                 }
-                iir_samples_accum += MIN_HOP_SIZE;
                 
                 for state in stft_states.iter_mut() {
                     state.samples_since_last += MIN_HOP_SIZE;
@@ -654,14 +814,29 @@ fn main() {
                         let start = inst.b_start;
                         let end = start + inst.weights.len();
                         
-                        for ((&mag, &true_freq), &w) in state.last_mags[start..end].iter().zip(&state.last_true_freqs[start..end]).zip(&inst.weights) {
+                        let mag_slice = &state.last_mags[start..end];
+                        let freq_slice = &state.last_true_freqs[start..end];
+                        let bin_freq_slice = &state.bin_freqs[start..end];
+                        let base_target_slice = &state.cqt_target_bins[start..end];
+                        let derivative_slice = &state.cqt_bin_derivatives[start..end];
+                        
+                        for (((((&mag, &true_freq), &bin_freq), &base_target), &derivative), &w) in mag_slice.iter()
+                            .zip(freq_slice)
+                            .zip(bin_freq_slice)
+                            .zip(base_target_slice)
+                            .zip(derivative_slice)
+                            .zip(&inst.weights) 
+                        {
                             let energy = (((mag * mag) * w) / norm_factor) * resolution_comp;
                             raw_cqt_power[inst.cqt_bin_idx] += energy; 
                             let comp_mag = (mag * comp_mag_factor) * inst.peak_dampening; 
                             if comp_mag > raw_cqt_peak[inst.cqt_bin_idx] { raw_cqt_peak[inst.cqt_bin_idx] = comp_mag; }
                             
                             if true_freq >= 20.0 {
-                                let target_bin = (((true_freq.log2() - min_log_f) * log_range_inv) * (CQT_BINS - 1) as f32).round() as isize;
+                                // First-Order Taylor Expansion completely avoids expensive .log2() math
+                                let offset_hz = true_freq - bin_freq;
+                                let target_bin = (base_target + offset_hz * derivative).round() as isize;
+                                
                                 if target_bin >= 0 && target_bin < CQT_BINS as isize {
                                     let splat = &splat_kernels[target_bin as usize];
                                     for ((s, &s_w), &s_w_sqrt) in (-splat.half_width..=splat.half_width).zip(&splat.weights).zip(&splat.weights_sqrt) {
@@ -710,14 +885,11 @@ fn main() {
                     cqt_max_sample = 0.0;
 
                     if consecutive_black_hops < MAX_HISTORY as u64 {
-                        // --- WRITE TO SHARED MEMORY ---
                         for i in 0..NUM_LAYERS {
                             let layer = &mut shm_block.layers[i];
                             let head = local_heads[i];
                             
-                            layer.mask[head] = 255; // Valid audio marker
-                            
-                            // Unroll writes to the massive flat pixel array
+                            layer.mask[head] = 255; 
                             let active_bins = layer.active_freq_bins;
                             for y in 0..active_bins {
                                 layer.pixels[y * MAX_HISTORY + head] = scratch_cols[i][y];
@@ -726,7 +898,6 @@ fn main() {
                             local_heads[i] = (head + 1) % MAX_HISTORY;
                             local_updates[i] += 1;
                             
-                            // Atomic publish to the UI clients
                             layer.head.store(local_heads[i], Ordering::Release);
                             layer.total_updates.store(local_updates[i], Ordering::Release);
                         }
